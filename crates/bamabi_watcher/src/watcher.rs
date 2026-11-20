@@ -1139,9 +1139,14 @@ BAM_EXPORT void bamabi_shutdown(BamInstance* instance) {{
             assert_eq!(report.loaded[0].0, "base_mod");
             assert_eq!(report.loaded[1].0, "addon_mod");
 
+            // Allow OS filesystem event streams (notably macOS FSEvents) to flush initial
+            // fixture-creation events before starting the watcher and before recording deltas.
+            std::thread::sleep(Duration::from_millis(300));
             app.add_plugins(
                 ModHotReloadPlugin::new(&mods_dir).with_debounce(Duration::from_millis(50)),
             );
+            std::thread::sleep(Duration::from_millis(200));
+            app.update();
 
             let mut unload_cursor = MessageCursor::<ModUnloaded>::default();
             let mut load_cursor = MessageCursor::<ModLoaded>::default();
@@ -1150,6 +1155,11 @@ BAM_EXPORT void bamabi_shutdown(BamInstance* instance) {{
                 let _ = unload_cursor.read(msgs_u).count();
                 let msgs_l = app.world().resource::<Messages<ModLoaded>>();
                 let _ = load_cursor.read(msgs_l).count();
+                app.world_mut()
+                    .resource_mut::<ModHotReloadHistory>()
+                    .outcomes
+                    .clear();
+                app.world_mut().resource_mut::<WatchCounter>().value = 0;
             }
 
             app.update();
