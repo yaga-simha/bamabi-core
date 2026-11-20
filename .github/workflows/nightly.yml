@@ -1,0 +1,133 @@
+name: Nightly Deep Verification (TSan, Big-Endian Miri, Randomize-Layout)
+
+on:
+  schedule:
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================================================
+  # 1. ThreadSanitizer (`-Zsanitizer=thread -Zbuild-std`) + `loom` Concurrency Model
+  # ============================================================================
+  tsan-and-loom:
+    name: ThreadSanitizer & Loom Concurrency Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install nightly Rust with `rust-src`
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: tsan-loom
+
+      - name: Run `loom` drop-trampoline publish/reclaim model tests
+        run: cargo +nightly test -p bamabi_host_sys --test loom_drop_trampoline --release
+
+      - name: Stage uninstrumented guest fixtures before enabling TSan
+        run: |
+          mkdir -p target/fixtures
+          cargo +nightly build --manifest-path tests/asymmetric_rust_mod/Cargo.toml
+          cp tests/asymmetric_rust_mod/target/debug/libasymmetric_rust_mod.so \
+             target/fixtures/libasymmetric_rust_mod.so
+          cargo +nightly build --manifest-path tests/fixtures/panic_abort_mod/Cargo.toml
+          cp tests/fixtures/panic_abort_mod/target/debug/libpanic_abort_mod.so \
+             target/fixtures/libpanic_abort_mod.so
+          cargo +nightly test -p bamabi_host --test ffi test_c99_shared_library_mutates_rust_components_via_vtable
+          for src in tests/fixtures/c_mods/*.c; do
+            stem="$(basename "$src" .c)"
+            cc -std=c99 -O2 -shared -fPIC -I target/include "$src" -o "target/fixtures/lib${stem}.so"
+          done
+
+      - name: Run multi-threaded scheduler & lifecycle suites under ThreadSanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+          BAM_FIXTURE_DIR: "${{ github.workspace }}/target/fixtures"
+        run: |
+          cargo +nightly test \
+            -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            -p bamabi_host \
+            --test scheduling --test lifecycle
+
+  # ============================================================================
+  # 2. Big-Endian (`s390x-unknown-linux-gnu`) Cross-Target Miri
+  # ============================================================================
+  miri-big-endian:
+    name: Miri Big-Endian (s390x-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    env:
+      MIRIFLAGS: "-Zmiri-tree-borrows"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install nightly Rust with Miri & `rust-src`
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - name: Setup Miri sysroot for `s390x-unknown-linux-gnu`
+        run: cargo +nightly miri setup --target s390x-unknown-linux-gnu
+
+      - name: Cache Miri s390x artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-s390x
+
+      - name: Run `bamabi_host_sys` endianness & FFI unit tests on `s390x`
+        run: |
+          cargo +nightly miri test --target s390x-unknown-linux-gnu \
+            -p bamabi_host_sys --lib
+
+  # ============================================================================
+  # 3. Randomized Rust Struct Layout (`-Zrandomize-layout`) + Long Proptest Parity
+  # ============================================================================
+  randomize-layout-and-proptest:
+    name: Randomized Rust Layout & Extended Differential Proptest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-randomize-layout
+
+      - name: Build guest fixtures with default layout
+        run: |
+          mkdir -p target/fixtures
+          cargo +nightly build --manifest-path tests/asymmetric_rust_mod/Cargo.toml
+          cp tests/asymmetric_rust_mod/target/debug/libasymmetric_rust_mod.so \
+             target/fixtures/libasymmetric_rust_mod.so
+          cargo +nightly build --manifest-path tests/fixtures/panic_abort_mod/Cargo.toml
+          cp tests/fixtures/panic_abort_mod/target/debug/libpanic_abort_mod.so \
+             target/fixtures/libpanic_abort_mod.so
+          cargo +nightly test -p bamabi_host --test ffi test_c99_shared_library_mutates_rust_components_via_vtable
+          for src in tests/fixtures/c_mods/*.c; do
+            stem="$(basename "$src" .c)"
+            cc -std=c99 -O2 -shared -fPIC -I target/include "$src" -o "target/fixtures/lib${stem}.so"
+          done
+
+      - name: Run host suites under `-Zrandomize-layout`
+        env:
+          RUSTFLAGS: "-Zrandomize-layout"
+          PROPTEST_CASES: "2048"
+          BAM_FIXTURE_DIR: "${{ github.workspace }}/target/fixtures"
+        run: |
+          cargo +nightly test -p bamabi_host_sys --lib
+          cargo +nightly test -p bamabi_host_sys --lib --features signature-verification
+          cargo +nightly test -p bamabi_host

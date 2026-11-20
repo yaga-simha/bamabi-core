@@ -1,0 +1,449 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================================================
+  # 1. Quality Gates (Formatting, Typos, Deny, Isolation, Clippy, Rustdoc)
+  # ============================================================================
+  quality-gates:
+    name: Quality Gates & Static Audits
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Spellcheck repository (`typos`)
+        uses: crate-ci/typos@v1.31.1
+
+      - name: Install `cargo-deny`
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Audit advisories, licenses, bans & sources (`cargo-deny`)
+        run: cargo deny --all-features check advisories licenses bans sources
+
+      - name: Formatting, forbid(unsafe_code), headless isolation & Bevy idiom audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+
+          for safe_lib in \
+            crates/bamabi_host/src/lib.rs \
+            crates/bamabi_watcher/src/lib.rs; do
+            if ! grep -q '#!\[forbid(unsafe_code)\]' "$safe_lib"; then
+              echo "ERROR: $safe_lib is missing required #![forbid(unsafe_code)] declaration!"
+              exit 1
+            fi
+          done
+
+          for cmd in \
+            "cargo tree -p bamabi_host --edges normal --all-features" \
+            "cargo tree -p bamabi_host --all-features"; do
+            if $cmd | grep -E 'bevy_render|bevy_reflect|bevy_scene|bevy_asset|\bnotify\b|bevy_winit|bevy_window|wgpu|glutin'; then
+              echo "ERROR: bamabi_host leaked forbidden heavy Bevy or notify dependency via '$cmd'!"
+              exit 1
+            fi
+          done
+
+          if grep -E '"(bevy_render|bevy_winit|bevy_window|wgpu|glutin|bevy_scene|bevy_asset)"' Cargo.lock; then
+            echo "ERROR: Forbidden heavy Bevy/window/render crate found in bamabi-core/Cargo.lock!"
+            exit 1
+          fi
+
+          if grep -rn '&mut ResMut<' crates/bamabi_host/src crates/bamabi_watcher/src; then
+            echo "ERROR: Found '&mut ResMut<' anti-pattern in Layer 2 sources!"
+            exit 1
+          fi
+
+      - name: Clippy across default, signature-verification, and all-features
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy -p bamabi_host_sys -p bamabi_host --features signature-verification --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Rustdoc build (default and all-features)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          cargo doc --workspace --no-deps
+          cargo doc --workspace --no-deps --all-features
+
+      - name: Check excluded guest fixtures
+        run: |
+          cargo check --manifest-path tests/asymmetric_rust_mod/Cargo.toml
+          cargo check --manifest-path tests/fixtures/panic_abort_mod/Cargo.toml
+
+  # ============================================================================
+  # 2. Cross-OS Test Matrix & Linux 10k Soak
+  # ============================================================================
+  test-matrix:
+    name: Test Matrix (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Free disk space on Linux runner
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Initialize MSVC Developer Environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Layer 2 workspace, feature, doc, and 10k soak suites
+        shell: bash
+        env:
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          set -euo pipefail
+          if [ -n "${VCToolsInstallDir:-}" ] && command -v cygpath >/dev/null 2>&1; then
+            MSVC_BIN="$(cygpath -u "${VCToolsInstallDir}bin/Hostx64/x64")"
+            if [ -x "${MSVC_BIN}/link.exe" ]; then
+              export PATH="${MSVC_BIN}:${PATH}"
+            fi
+          fi
+          cargo test --workspace
+          cargo test -p bamabi_host_sys -p bamabi_host --features signature-verification
+          cargo test --workspace --all-features
+          cargo test --doc --all-features
+          if [ "${RUNNER_OS:-}" = "Linux" ]; then
+            BAM_SOAK_CYCLES=10000 cargo test -p bamabi_host --test soak_10k_reloads --release
+          fi
+
+  # ============================================================================
+  # 3. True Rust Asymmetry Matrix: MSRV 1.95 / Stable / Nightly x O0/O3 x Unwind/Abort
+  # ============================================================================
+  asymmetry-rust:
+    name: Asymmetric Rust Matrix (MSRV 1.95, ${{ matrix.guest_toolchain }}, opt=${{ matrix.opt_level }}, panic=${{ matrix.panic_mode }})
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - guest_toolchain: "1.95.0"
+            opt_level: "0"
+            panic_mode: "unwind"
+          - guest_toolchain: "1.95.0"
+            opt_level: "3"
+            panic_mode: "unwind"
+          - guest_toolchain: "stable"
+            opt_level: "0"
+            panic_mode: "unwind"
+          - guest_toolchain: "stable"
+            opt_level: "3"
+            panic_mode: "abort"
+          - guest_toolchain: "nightly"
+            opt_level: "0"
+            panic_mode: "unwind"
+          - guest_toolchain: "nightly"
+            opt_level: "3"
+            panic_mode: "abort"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install stable host toolchain + ${{ matrix.guest_toolchain }} guest toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install "${{ matrix.guest_toolchain }}" --profile minimal
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: asym-rust-${{ matrix.guest_toolchain }}-o${{ matrix.opt_level }}-${{ matrix.panic_mode }}
+
+      - name: Build asymmetric Rust guests with ${{ matrix.guest_toolchain }} (opt=${{ matrix.opt_level }}, panic=${{ matrix.panic_mode }})
+        env:
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ matrix.opt_level }}
+          CARGO_PROFILE_RELEASE_PANIC: ${{ matrix.panic_mode }}
+        run: |
+          mkdir -p target/fixtures
+          cargo "+${{ matrix.guest_toolchain }}" build \
+            --manifest-path tests/asymmetric_rust_mod/Cargo.toml \
+            --release
+          cp tests/asymmetric_rust_mod/target/release/libasymmetric_rust_mod.so \
+             target/fixtures/libasymmetric_rust_mod.so
+          if [ "${{ matrix.panic_mode }}" = "abort" ]; then
+            cargo "+${{ matrix.guest_toolchain }}" build \
+              --manifest-path tests/fixtures/panic_abort_mod/Cargo.toml \
+              --release
+            cp tests/fixtures/panic_abort_mod/target/release/libpanic_abort_mod.so \
+               target/fixtures/libpanic_abort_mod.so
+          fi
+
+      - name: Load asymmetric Rust guest into stable host & execute integration suites
+        env:
+          BAM_FIXTURE_DIR: "${{ github.workspace }}/target/fixtures"
+        run: |
+          if [ "${{ matrix.panic_mode }}" = "unwind" ]; then
+            cargo +stable test -p bamabi_host
+          else
+            cargo +stable test -p bamabi_host --test ffi
+            cargo +stable test -p bamabi_host --test scheduling -- --skip test_cross_runtime_panic_containment
+            cargo +stable test -p bamabi_host --test lifecycle panic_abort_guest_terminates_subprocess
+          fi
+
+  # ============================================================================
+  # 4. Cross-OS C99 / C11 Compiler Matrix
+  # ============================================================================
+  asymmetry-c:
+    name: Asymmetric C99/C11 Matrix (${{ matrix.os }}, ${{ matrix.cc }})
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+          - os: ubuntu-latest
+            cc: clang
+          - os: macos-latest
+            cc: clang
+          - os: windows-latest
+            cc: gcc
+          - os: windows-latest
+            cc: cl.exe
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Initialize MSVC Developer Environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: asym-c-${{ matrix.os }}-${{ matrix.cc }}
+
+      - name: Compile C99/C11 fixtures (`${{ matrix.cc }}`), test ABI layout & run FFI/E2E suites
+        shell: bash
+        env:
+          CC: ${{ matrix.cc }}
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          set -euo pipefail
+          if [ -n "${VCToolsInstallDir:-}" ] && command -v cygpath >/dev/null 2>&1; then
+            MSVC_BIN="$(cygpath -u "${VCToolsInstallDir}bin/Hostx64/x64")"
+            if [ -x "${MSVC_BIN}/link.exe" ]; then
+              export PATH="${MSVC_BIN}:${PATH}"
+            fi
+          fi
+          cargo test -p bamabi_host --test ffi --test e2e
+          if [ "${{ matrix.cc }}" = "cl.exe" ]; then
+            cl.exe /nologo /LD /TC /std:c11 /W4 /WX /I target/include \
+              /Fo:target/ /Fe:target/asymmetric_c_mod_cl.dll tests/asymmetric_c_mod/mod.c
+            cl.exe /nologo /TC /std:c11 /W4 /WX /I target/include \
+              /Fo:target/ /Fe:target/test_abi_layout.exe tests/asymmetric_c_mod/test_abi_layout.c
+            ./target/test_abi_layout.exe
+          else
+            if command -v make >/dev/null 2>&1; then
+              make -C tests/asymmetric_c_mod clean all
+            else
+              "${CC}" -std=c99 -Wall -Wextra -Werror -O3 -I target/include -shared tests/asymmetric_c_mod/mod.c -o target/asymmetric_c_mod_cc.dll
+            fi
+            "${CC}" -std=c99 -Wall -Wextra -Werror -I target/include \
+              tests/asymmetric_c_mod/test_abi_layout.c -o target/test_abi_layout
+            ./target/test_abi_layout
+          fi
+
+  # ============================================================================
+  # 5. Benchmark Smoke Gate (`chunk_throughput -- --test`)
+  # ============================================================================
+  benchmark-gate:
+    name: Benchmark Smoke Gate (chunk_throughput)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-gate
+
+      - name: Pre-stage external asymmetric mods & run `chunk_throughput -- --test`
+        run: |
+          mkdir -p target/fixtures
+          cargo test -p bamabi_host --test ffi test_c99_shared_library_mutates_rust_components_via_vtable
+          cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release
+          cp tests/asymmetric_rust_mod/target/release/libasymmetric_rust_mod.so \
+             target/fixtures/libasymmetric_rust_mod.so
+          make -C tests/asymmetric_c_mod
+          cp tests/asymmetric_c_mod/libasymmetric_c_mod.so \
+             target/fixtures/libasymmetric_c_mod.so
+          BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
+            cargo bench -p bamabi_host --bench chunk_throughput -- --test
+
+  # ============================================================================
+  # 6. Line Coverage Gate (`>= 85%` on `ffi/` and `system/`)
+  # ============================================================================
+  coverage:
+    name: Coverage Gate (>=85% ffi/ & system/)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust with `llvm-tools-preview`
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install `cargo-llvm-cov`
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: llvm-cov
+
+      - name: Enforce >= 85% line coverage on `ffi/` and `system/`
+        run: |
+          cargo llvm-cov --no-report --all-features \
+            -p bamabi_host_sys -p bamabi_host -p bamabi_watcher
+          cargo llvm-cov report \
+            --ignore-filename-regex '(crates/bamabi_host_sys/src/(drop_trampoline|handle_header|lib|loader|registry|schedule|sync_ptr|ffi/validation)|crates/bamabi_(host|watcher)/|(tests|examples|xtask|benches)/|\.cargo/)' \
+            --fail-under-lines 85
+
+  # ============================================================================
+  # 7. Miri Soundness (`-Zmiri-tree-borrows`)
+  # ============================================================================
+  miri:
+    name: Miri (-Zmiri-tree-borrows)
+    runs-on: ubuntu-latest
+    env:
+      MIRIFLAGS: "-Zmiri-tree-borrows"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install nightly Rust with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Setup Miri sysroot
+        run: cargo +nightly miri setup
+
+      - name: Cache Cargo & Miri artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-tree-borrows
+
+      - name: Run Miri on `bamabi_host_sys` unit tests
+        run: cargo +nightly miri test -p bamabi_host_sys --lib
+
+  # ============================================================================
+  # 8. Loom Atomic Concurrency Verification
+  # ============================================================================
+  loom:
+    name: Loom Atomic Concurrency Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: loom-concurrency
+
+      - name: Verify `DROP_PAGES` generation/epoch atomics under Loom
+        run: cargo test -p bamabi_host_sys --test loom_drop_trampoline --release
+
+  # ============================================================================
+  # 9. UBSan C99 Verification
+  # ============================================================================
+  sanitizers:
+    name: UBSan C99 Verification
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build UBSan-instrumented C99 guest mod & run host integration suites
+        env:
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+        run: |
+          mkdir -p target/fixtures
+          cargo test -p bamabi_host --test ffi test_c99_shared_library_mutates_rust_components_via_vtable
+          clang -std=c99 -Wall -Wextra -Werror -O1 -g -fno-omit-frame-pointer \
+            -fsanitize=undefined -fno-sanitize-recover=all \
+            -I target/include -shared -fPIC \
+            tests/asymmetric_c_mod/mod.c \
+            -o target/fixtures/libasymmetric_c_mod.so
+          BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
+            cargo test -p bamabi_host

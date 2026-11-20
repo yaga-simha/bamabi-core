@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bamabi_host_sys",
+    "crates/bamabi_host",
+    "crates/bamabi_watcher",
+]
+exclude = [
+    "tests/asymmetric_rust_mod",
+    "tests/fixtures/panic_abort_mod",
+]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+authors = ["bamabi authors"]
+repository = "https://github.com/yaga-simha/bamabi-core"
+keywords = ["bevy", "ecs", "ffi", "modding", "plugin"]
+categories = ["game-development", "api-bindings"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+improper_ctypes_definitions = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+ptr_as_ptr = "warn"
+cast_ptr_alignment = "warn"
+transmute_ptr_to_ptr = "warn"
+needless_pass_by_ref_mut = "warn"
+redundant_clone = "warn"
+match_same_arms = "warn"
+
+[workspace.dependencies]
+bamabi_sys = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+bamabi_macros = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+bamabi_sdk_gen = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+bamabi_trust = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-tools.git", branch = "main" }
+bamabi_manifest = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-tools.git", branch = "main" }
+bamabi_host_sys = { version = "0.3.0", path = "crates/bamabi_host_sys" }
+bamabi_host = { version = "0.3.0", path = "crates/bamabi_host" }
+bamabi_watcher = { version = "0.3.0", path = "crates/bamabi_watcher" }
+bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
+bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_platform = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_tasks = { version = "0.20.1", default-features = false, features = ["multi_threaded"] }
+bevy_diagnostic = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_reflect = { version = "0.20.1", default-features = false, features = ["std"] }
+toml = "0.8"
+semver = "1"
+notify-debouncer-full = "0.7"
+libloading = "0.8"
+nonmax = "0.5"
+arc-swap = "1.7"
+thiserror = "2"
+tracing = "0.1"
+loom = "0.7"
+proptest = "1"
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519"] }

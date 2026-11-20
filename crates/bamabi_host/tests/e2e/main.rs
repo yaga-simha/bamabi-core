@@ -1,0 +1,18 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    clippy::default_constructed_unit_structs,
+    unreachable_pub
+)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(improper_ctypes_definitions)]
+
+//! End-to-End Integration Test Binary (`e2e`):
+//! - Asymmetric Rust & ISO C99 shared-library integration and hot-reload suites
+
+#[path = "../support/helpers.rs"]
+mod support;
+
+pub mod asymmetric_mods;

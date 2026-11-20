@@ -1,0 +1,43 @@
+[package]
+name = "bamabi_host_sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Low-level host FFI engine, CoW registry, chunk/sparse iterators, command arena, and dynamic loader for `bamabi`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+strict-ffi-checks = []
+test-utils = []
+diagnostics = []
+signature-verification = ["dep:bamabi_trust"]
+bridge-reflect = ["dep:bevy_reflect", "bevy_ecs/bevy_reflect"]
+
+[dependencies]
+bamabi_sys = { workspace = true }
+bamabi_trust = { workspace = true, optional = true }
+bevy_ecs = { workspace = true }
+bevy_app = { workspace = true }
+bevy_platform = { workspace = true }
+bevy_tasks = { workspace = true }
+bevy_reflect = { workspace = true, optional = true }
+libloading = { workspace = true }
+nonmax = { workspace = true }
+arc-swap = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bamabi_macros = { workspace = true }
+bamabi_sdk_gen = { workspace = true }
+loom = { workspace = true }
+proptest = { workspace = true }
+ssh-key = { workspace = true, features = ["getrandom"] }

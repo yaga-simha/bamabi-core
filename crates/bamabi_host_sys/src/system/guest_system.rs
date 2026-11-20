@@ -1,0 +1,1766 @@
+//! `GuestSystem` implementation of Bevy's `System` trait and `HostSystemCtx` (`BamSystemCtx`).
+
+use crate::ffi::commands::{CommandQuotaLimits, HostCommands, HostCommandsStorage};
+use crate::ffi::iter::{HostIter, QueryPlan};
+#[cfg(feature = "diagnostics")]
+use crate::handle_header::lock_unpoison;
+use crate::handle_header::{
+    HandleHeader, HostContext, SYS_CTX_MAGIC, decode_live_entity, ffi_try, validate_sys_ctx_mut,
+    validate_sys_ctx_ref,
+};
+use crate::loader::{ModHost, ModId};
+use crate::registry::{ModRegistry, RegistrySnapshot};
+use crate::schedule::ModSystemSet;
+use crate::sync_ptr::{GuestFnPtr, GuestUserData};
+use crate::system::access_builder::initialize_query_groups_in_world;
+use crate::system::error_policy::{
+    ActiveGuestFaultGuard, GuestSystemRunMetrics, ModBudgetRuntime, ModErrorPolicy,
+    ModErrorPolicyConfig, ModQuarantine, ModSystemError, ModSystemFaulted, SystemInitError,
+    dispatch_mod_fault_to_fallback_handler,
+};
+use crate::system::query_group::{BamQuerySpecOwned, CachedQueryGroup, MAX_SYSTEM_QUERIES};
+use bamabi_sys::{
+    AccessMode, BamChangeTicks, BamCommands, BamComponent, BamHostCtx, BamIter, BamRunIfFn,
+    BamSystemCtx, BamSystemFn, BamSystemSet, FfiEntity, FfiResult, ScheduleId,
+};
+use bevy_ecs::archetype::ArchetypeId;
+use bevy_ecs::change_detection::{CheckChangeTicks, Tick};
+use bevy_ecs::entity::Entity;
+use bevy_ecs::message::Messages;
+#[cfg(feature = "diagnostics")]
+use bevy_ecs::prelude::Resource;
+use bevy_ecs::schedule::{InternedSystemSet, SystemSet};
+use bevy_ecs::storage::TableId;
+use bevy_ecs::system::{RunSystemError, System, SystemAccess, SystemIn, SystemStateFlags};
+use bevy_ecs::utils::DebugName;
+use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
+use bevy_ecs::world::{CommandQueue, DeferredWorld, World};
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+#[cfg(feature = "diagnostics")]
+use std::sync::Mutex;
+
+/// Snapshot of a single guest system execution recorded when the `diagnostics` feature is enabled.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Debug)]
+pub struct ModDiagnosticsSample {
+    /// Owning [`ModId`], if associated with a loaded mod.
+    pub mod_id: Option<ModId>,
+    /// Canonical mod namespace (`BamManifest::name` or `"unscoped"`).
+    pub mod_name: Arc<str>,
+    /// Guest system name.
+    pub system_name: Arc<str>,
+    /// Wall-clock CPU duration of the foreign `extern "C"` callback in microseconds.
+    pub cpu_time_us: f64,
+    /// Number of deferred commands queued during this system invocation.
+    pub commands_queued: usize,
+    /// Whether this invocation faulted or caught a guest panic.
+    pub faulted: bool,
+}
+
+/// World resource buffering [`ModDiagnosticsSample`]s from parallel [`GuestSystem`] executions
+/// until flushed into Bevy's `DiagnosticsStore`.
+#[cfg(feature = "diagnostics")]
+#[derive(Resource, Default)]
+pub struct ModDiagnosticsCollector {
+    samples: Mutex<Vec<ModDiagnosticsSample>>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl ModDiagnosticsCollector {
+    /// Creates an empty [`ModDiagnosticsCollector`].
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends a single execution sample from a `GuestSystem` run.
+    pub fn push(&self, sample: ModDiagnosticsSample) {
+        if let Ok(mut guard) = self.samples.lock() {
+            guard.push(sample);
+        }
+    }
+
+    /// Drains all buffered samples accumulated since the last flush.
+    pub fn drain(&self) -> Vec<ModDiagnosticsSample> {
+        core::mem::take(&mut *lock_unpoison(&self.samples))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RandomQueryView<'w> {
+    pub(crate) plan: &'w QueryPlan,
+    pub(crate) is_dense: bool,
+    pub(crate) matched_tables: &'w [TableId],
+    pub(crate) matched_archetypes: &'w [ArchetypeId],
+    pub(crate) has_query_state: bool,
+}
+
+/// Concrete `#[repr(C)]` system invocation context backing opaque [`BamSystemCtx`].
+#[repr(C)]
+pub struct HostSystemCtx<'w> {
+    /// Leading handle validation header (`SYS_CTX_MAGIC`) at byte offset `0`.
+    pub header: HandleHeader,
+    host_ctx: HostContext,
+    iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES],
+    query_views: [Option<RandomQueryView<'w>>; MAX_SYSTEM_QUERIES],
+    query_count: usize,
+    commands_ptr: *mut BamCommands,
+    world: Option<UnsafeWorldCell<'w>>,
+    last_run: Tick,
+    this_run: Tick,
+}
+
+const _: () = assert!(core::mem::offset_of!(HostSystemCtx<'_>, header) == 0);
+
+impl<'w> HostSystemCtx<'w> {
+    /// Creates an active stack-scoped [`HostSystemCtx`] for one `GuestSystem` callback invocation.
+    pub fn new(
+        snapshot: Arc<RegistrySnapshot>,
+        mod_namespace: Option<Arc<str>>,
+        error_buf: String,
+        iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES],
+        query_count: usize,
+        commands_ptr: *mut BamCommands,
+    ) -> Self {
+        Self {
+            header: HandleHeader::new(SYS_CTX_MAGIC),
+            host_ctx: HostContext::with_error_buffer(snapshot, error_buf)
+                .with_namespace(mod_namespace),
+            iter_ptrs,
+            query_views: [None; MAX_SYSTEM_QUERIES],
+            query_count,
+            commands_ptr,
+            world: None,
+            last_run: Tick::new(0),
+            this_run: Tick::new(0),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn with_world_and_queries(
+        mut self,
+        world: UnsafeWorldCell<'w>,
+        query_views: [Option<RandomQueryView<'w>>; MAX_SYSTEM_QUERIES],
+        last_run: Tick,
+        this_run: Tick,
+    ) -> Self {
+        self.world = Some(world);
+        self.query_views = query_views;
+        self.last_run = last_run;
+        self.this_run = this_run;
+        self
+    }
+
+    /// Reclaims the internal diagnostic `String` capacity for zero-allocation reuse across frames.
+    #[inline]
+    pub fn reclaim_error_buffer(&mut self) -> String {
+        self.host_ctx.reclaim_error_buffer()
+    }
+
+    /// Casts `&mut self` to an opaque `*mut BamSystemCtx` FFI pointer.
+    #[inline]
+    pub fn as_ffi_ptr(&mut self) -> *mut BamSystemCtx {
+        (self as *mut Self).cast::<BamSystemCtx>()
+    }
+
+    /// Returns the opaque [`BamHostCtx`] pointer for this invocation's embedded [`HostContext`].
+    #[inline]
+    pub(crate) fn host_ctx_ffi_ptr(&self) -> *const BamHostCtx {
+        self.host_ctx.as_ffi_ptr()
+    }
+
+    /// Borrows the system's active [`RegistrySnapshot`] and [`UnsafeWorldCell`].
+    #[inline]
+    pub(crate) fn snapshot_and_world(&self) -> (&RegistrySnapshot, Option<UnsafeWorldCell<'w>>) {
+        (self.host_ctx.snapshot(), self.world)
+    }
+
+    /// Returns `true` if any declared query in this system holds entity-column read/write access
+    /// (`READ`, `WRITE`, `OPTIONAL_READ`, `OPTIONAL_WRITE`, `CHANGED`, or `ADDED`) on `component_id`.
+    #[inline]
+    pub(crate) fn has_component_read_access(
+        &self,
+        component_id: bevy_ecs::component::ComponentId,
+    ) -> bool {
+        self.query_views[..self.query_count]
+            .iter()
+            .flatten()
+            .any(|view| {
+                view.plan.terms.iter().any(|term| {
+                    !term.is_resource()
+                        && !term.is_message()
+                        && term.component_id == component_id
+                        && term.mode.has_entity_column_data()
+                })
+            })
+    }
+}
+
+impl Drop for HostSystemCtx<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.header.poison();
+    }
+}
+
+/// Obtains the world-scoped [`BamHostCtx`] pointer from an active [`BamSystemCtx`].
+///
+/// # Safety
+/// `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+pub unsafe extern "C" fn host_sys_host_ctx(sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(ctx) = (unsafe { validate_sys_ctx_ref(sys_ctx) }) else {
+        return core::ptr::null();
+    };
+    ctx.host_ctx.as_ffi_ptr()
+}
+
+/// Borrows the [`BamIter`] handle for declared query `query_index` (`0..query_count`).
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+/// - `out_iter` must point to writable `*mut BamIter` storage, or null.
+pub unsafe extern "C" fn host_sys_query(
+    sys_ctx: *mut BamSystemCtx,
+    query_index: usize,
+    out_iter: *mut *mut BamIter,
+) -> FfiResult {
+    if out_iter.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let ctx = ffi_try!(unsafe { validate_sys_ctx_mut(sys_ctx) });
+    if query_index >= ctx.query_count {
+        return FfiResult::OUT_OF_RANGE;
+    }
+    // SAFETY: `out_iter` is non-null and writable.
+    unsafe {
+        *out_iter = ctx.iter_ptrs[query_index];
+    }
+    FfiResult::OK
+}
+
+/// Borrows the per-system [`BamCommands`] deferred command buffer from `sys_ctx`.
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+/// - `out_commands` must point to writable `*mut BamCommands` storage, or null.
+pub unsafe extern "C" fn host_sys_commands(
+    sys_ctx: *mut BamSystemCtx,
+    out_commands: *mut *mut BamCommands,
+) -> FfiResult {
+    if out_commands.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let ctx = ffi_try!(unsafe { validate_sys_ctx_mut(sys_ctx) });
+    // SAFETY: `out_commands` is non-null and writable.
+    unsafe {
+        *out_commands = ctx.commands_ptr;
+    }
+    FfiResult::OK
+}
+
+fn entity_matches_random_query_view<'w>(
+    world: UnsafeWorldCell<'w>,
+    view: &RandomQueryView<'_>,
+    entity: Entity,
+    last_run: Tick,
+    this_run: Tick,
+) -> Option<bevy_ecs::world::unsafe_world_cell::UnsafeEntityCell<'w>> {
+    if !view.has_query_state {
+        return None;
+    }
+    let entity_cell = world
+        .get_entity_with_ticks(entity, last_run, this_run)
+        .ok()?;
+    let location = entity_cell.location();
+    let archetype_matched = if view.is_dense {
+        view.matched_tables.contains(&location.table_id)
+    } else {
+        view.matched_archetypes.contains(&location.archetype_id)
+    };
+    if !archetype_matched {
+        return None;
+    }
+    if !view.plan.tick_filters.is_empty() {
+        // SAFETY: `FilteredAccessSet` declared read/write access on every tick-filter component in `view.plan`.
+        let storages = unsafe { world.storages() };
+        for tf in &view.plan.tick_filters {
+            let tick = if tf.is_sparse {
+                let ss = storages.sparse_sets.get(tf.component_id)?;
+                let cell = if tf.is_added {
+                    ss.get_added_tick(entity)?
+                } else {
+                    ss.get_changed_tick(entity)?
+                };
+                // SAFETY: Shared tick access declared in `FilteredAccessSet`.
+                unsafe { *cell.get() }
+            } else {
+                let table = storages.tables.get(location.table_id)?;
+                let col = table.get_column(tf.component_id)?;
+                let table_len = table.entity_count() as usize;
+                let row = location.table_row.index();
+                if row >= table_len {
+                    return None;
+                }
+                let slice = if tf.is_added {
+                    // SAFETY: `table_len == table.entity_count() as usize`.
+                    unsafe { col.get_added_ticks_slice(table_len) }
+                } else {
+                    // SAFETY: `table_len == table.entity_count() as usize`.
+                    unsafe { col.get_changed_ticks_slice(table_len) }
+                };
+                // SAFETY: `row < table_len == slice.len()`.
+                unsafe { *slice.get_unchecked(row).get() }
+            };
+            if !tick.is_newer_than(last_run, this_run) {
+                return None;
+            }
+        }
+    }
+    Some(entity_cell)
+}
+
+#[inline]
+fn resolve_random_entity_cell<'w>(
+    ctx: &HostSystemCtx<'w>,
+    query_index: usize,
+    entity: FfiEntity,
+    term_index: usize,
+    mutable: bool,
+) -> Option<(
+    bevy_ecs::world::unsafe_world_cell::UnsafeEntityCell<'w>,
+    bevy_ecs::component::ComponentId,
+)> {
+    if query_index >= ctx.query_count {
+        return None;
+    }
+    let bevy_entity = decode_live_entity(entity).ok()?;
+    let view = ctx.query_views[query_index].as_ref()?;
+    let term = view.plan.terms.get(term_index)?;
+    if term.is_resource() || term.is_message() {
+        return None;
+    }
+    if mutable {
+        if (term.mode != AccessMode::WRITE && term.mode != AccessMode::OPTIONAL_WRITE)
+            || term.is_immutable()
+        {
+            return None;
+        }
+    } else if !term.mode.has_entity_column_data() {
+        return None;
+    }
+    let world = ctx.world?;
+    let entity_cell =
+        entity_matches_random_query_view(world, view, bevy_entity, ctx.last_run, ctx.this_run)?;
+    Some((entity_cell, term.component_id))
+}
+
+/// Random `O(1)` read-only component lookup on `entity` using the access declared by
+/// `(query_index, term_index)` in `FilteredAccessSet`.
+///
+/// Strictly verifies both that `term_index` declared component data read/write access and that
+/// `entity`'s archetype matches `query_index`'s `With`/`Without`/tick filters so Bevy's parallel
+/// scheduler aliasing invariants remain sound.
+///
+/// # Safety
+/// `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+pub unsafe extern "C" fn host_sys_entity_get(
+    sys_ctx: *const BamSystemCtx,
+    query_index: usize,
+    entity: FfiEntity,
+    term_index: usize,
+) -> *const u8 {
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(ctx) = (unsafe { validate_sys_ctx_ref(sys_ctx) }) else {
+        return core::ptr::null();
+    };
+    let Some((entity_cell, comp_id)) =
+        resolve_random_entity_cell(ctx, query_index, entity, term_index, false)
+    else {
+        return core::ptr::null();
+    };
+    // SAFETY: `resolve_random_entity_cell` verified `entity`'s archetype match and declared read/write access.
+    match unsafe { entity_cell.get_by_id(comp_id) } {
+        Some(ptr) => ptr.as_ptr(),
+        None => core::ptr::null(),
+    }
+}
+
+/// Random `O(1)` mutable component lookup on `entity` using the `WRITE` / `OPTIONAL_WRITE` access
+/// declared by `(query_index, term_index)` in `FilteredAccessSet`, marking `entity`'s
+/// component change tick on success.
+///
+/// # Safety
+/// `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+pub unsafe extern "C" fn host_sys_entity_get_mut(
+    sys_ctx: *mut BamSystemCtx,
+    query_index: usize,
+    entity: FfiEntity,
+    term_index: usize,
+) -> *mut u8 {
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(ctx) = (unsafe { validate_sys_ctx_mut(sys_ctx) }) else {
+        return core::ptr::null_mut();
+    };
+    let Some((entity_cell, comp_id)) =
+        resolve_random_entity_cell(ctx, query_index, entity, term_index, true)
+    else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: `resolve_random_entity_cell` verified `entity`'s archetype match and declared exclusive write access.
+    match unsafe { entity_cell.get_mut_by_id(comp_id) } {
+        Ok(mut_untyped) => mut_untyped.into_inner().as_ptr(),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Shared lookup for `host_sys_res_ptr` / `host_sys_res_mut_ptr`, optionally writing prior
+/// `BamChangeTicks` into `out_ticks`.
+///
+/// # Safety
+/// If `out_ticks` is non-null, it must point to writable [`BamChangeTicks`] storage.
+unsafe fn resolve_resource_entity<'w>(
+    ctx: &HostSystemCtx<'w>,
+    component: BamComponent,
+    out_ticks: *mut BamChangeTicks,
+    mutable: bool,
+) -> Option<(
+    UnsafeWorldCell<'w>,
+    Entity,
+    bevy_ecs::component::ComponentId,
+)> {
+    let op = if mutable {
+        "sys_res_mut_ptr"
+    } else {
+        "sys_res_ptr"
+    };
+    if !out_ticks.is_null() && !out_ticks.is_aligned() {
+        ctx.host_ctx
+            .set_last_error(format!("{op}: misaligned out_ticks pointer"));
+        return None;
+    }
+    let Some(term) = ctx
+        .query_views
+        .iter()
+        .take(ctx.query_count)
+        .flatten()
+        .flat_map(|v| v.plan.terms.iter())
+        .find(|t| {
+            t.component == component
+                && t.is_resource()
+                && if mutable {
+                    t.mode == AccessMode::RESOURCE_WRITE
+                } else {
+                    t.mode.is_resource()
+                }
+        })
+    else {
+        ctx.host_ctx.set_last_error(if mutable {
+            "sys_res_mut_ptr: resource handle was not declared with ResourceWrite in this system"
+        } else {
+            "sys_res_ptr: resource handle was not declared with ResourceRead or ResourceWrite in any query of this system"
+        });
+        return None;
+    };
+    if mutable && term.is_immutable() {
+        ctx.host_ctx
+            .set_last_error("sys_res_mut_ptr: resource is immutable");
+        return None;
+    }
+    let world = ctx.world?;
+    // SAFETY: `RESOURCE_READ` or `RESOURCE_WRITE` on `term.component_id` was declared in `FilteredAccessSet`.
+    let entity = unsafe { world.resource_entities() }.get(term.component_id)?;
+    if !out_ticks.is_null()
+        && let Ok(read_cell) = world.get_entity(entity)
+        && let Some(ticks) =
+            // SAFETY: Declared read/write access; reading change ticks before any mutable borrow.
+            unsafe { read_cell.get_change_ticks_by_id(term.component_id) }
+    {
+        // SAFETY: `out_ticks` is non-null, aligned, and exclusively writable per caller contract.
+        unsafe {
+            *out_ticks = BamChangeTicks {
+                added: ticks.added.get(),
+                changed: ticks.changed.get(),
+                last_run: ctx.last_run.get(),
+                this_run: ctx.this_run.get(),
+            };
+        }
+    }
+    Some((world, entity, term.component_id))
+}
+
+/// Looks up a singleton read-only `Resource` by its pre-resolved [`BamComponent`] handle
+/// (`host_sys_res_ptr`) across this system's declared queries, optionally writing its Bevy
+/// change-detection ticks into `out_ticks` (nullable).
+///
+/// Returns null if `sys_ctx` is invalid, `component` was not declared with `RESOURCE_READ` or
+/// `RESOURCE_WRITE` in this system, `out_ticks` is non-null and misaligned, or the resource is absent.
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+/// - If `out_ticks` is non-null, it must point to aligned writable [`BamChangeTicks`] storage.
+pub unsafe extern "C" fn host_sys_res_ptr(
+    sys_ctx: *const BamSystemCtx,
+    component: BamComponent,
+    out_ticks: *mut BamChangeTicks,
+) -> *const u8 {
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(ctx) = (unsafe { validate_sys_ctx_ref(sys_ctx) }) else {
+        return core::ptr::null();
+    };
+    // SAFETY: Caller upholds `out_ticks` writability when non-null.
+    let Some((world, entity, comp_id)) =
+        (unsafe { resolve_resource_entity(ctx, component, out_ticks, false) })
+    else {
+        return core::ptr::null();
+    };
+    let Ok(entity_cell) = world.get_entity(entity) else {
+        return core::ptr::null();
+    };
+    // SAFETY: Shared read access to `comp_id` was declared in `FilteredAccessSet`.
+    match unsafe { entity_cell.get_by_id(comp_id) } {
+        Some(ptr) => ptr.as_ptr(),
+        None => core::ptr::null(),
+    }
+}
+
+/// Looks up an exclusive mutable singleton `Resource` by its pre-resolved [`BamComponent`] handle
+/// (`host_sys_res_mut_ptr`), optionally writing its prior Bevy change-detection ticks into
+/// `out_ticks` (nullable) and stamping `changed = this_run`.
+///
+/// Returns null if `sys_ctx` is invalid, `component` was not declared with `RESOURCE_WRITE` in
+/// this system (or is immutable), `out_ticks` is non-null and misaligned, or the resource is absent.
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+/// - If `out_ticks` is non-null, it must point to aligned writable [`BamChangeTicks`] storage.
+pub unsafe extern "C" fn host_sys_res_mut_ptr(
+    sys_ctx: *mut BamSystemCtx,
+    component: BamComponent,
+    out_ticks: *mut BamChangeTicks,
+) -> *mut u8 {
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(ctx) = (unsafe { validate_sys_ctx_mut(sys_ctx) }) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: Caller upholds `out_ticks` writability when non-null.
+    let Some((world, entity, comp_id)) =
+        (unsafe { resolve_resource_entity(ctx, component, out_ticks, true) })
+    else {
+        return core::ptr::null_mut();
+    };
+    let Ok(entity_cell) = world.get_entity_with_ticks(entity, ctx.last_run, ctx.this_run) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: Exclusive mutable access to this resource component is guaranteed by Bevy's scheduler.
+    match unsafe { entity_cell.get_mut_by_id(comp_id) } {
+        Ok(mut_untyped) => mut_untyped.into_inner().as_ptr(),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Host-side Bevy [`System`] wrapping a unified ABI v0.2 [`BamSystemFn`] callback.
+pub struct GuestSystem {
+    name: Arc<str>,
+    debug_name: DebugName,
+    query_groups: Vec<CachedQueryGroup>,
+
+    access: SystemAccess,
+    self_conflict: bool,
+    init_error: Option<SystemInitError>,
+    last_run: Tick,
+    this_run: Tick,
+
+    callback: GuestFnPtr<BamSystemFn>,
+    user_data: GuestUserData,
+    run_if: Option<(GuestFnPtr<BamRunIfFn>, GuestUserData)>,
+
+    mod_id: Option<ModId>,
+    mod_namespace: Option<Arc<str>>,
+    mod_generation: u64,
+    mod_generation_explicit: bool,
+    schedule: ScheduleId,
+    is_main_thread: bool,
+    after_systems: Vec<String>,
+    before_systems: Vec<String>,
+    after_weak_systems: Vec<String>,
+    before_weak_systems: Vec<String>,
+    in_sets: Vec<String>,
+    mounted_schedule_sets: Vec<BamSystemSet>,
+    ambiguous_with_systems: Vec<String>,
+    ambiguous_with_all: bool,
+    error_policy: ModErrorPolicy,
+    error_policy_explicit: bool,
+
+    enabled_flag: Arc<AtomicBool>,
+    is_active: Arc<AtomicBool>,
+    commands_storage: HostCommandsStorage,
+    fault_queue: CommandQueue,
+    last_error_buf: String,
+    init_count: u64,
+
+    registry: ModRegistry,
+    cached_registry_gen: u64,
+    snapshot: Arc<RegistrySnapshot>,
+    budget_runtime_id: Option<bevy_ecs::component::ComponentId>,
+    #[cfg(feature = "diagnostics")]
+    diagnostics_collector_id: Option<bevy_ecs::component::ComponentId>,
+}
+
+impl GuestSystem {
+    /// Creates a unified ABI v0.2 [`GuestSystem`] over `0..=MAX_SYSTEM_QUERIES` query clauses.
+    pub fn new(
+        name: impl Into<Arc<str>>,
+        query_specs: Vec<BamQuerySpecOwned>,
+        callback: BamSystemFn,
+        user_data: *mut c_void,
+        registry: ModRegistry,
+    ) -> Self {
+        let name_arc: Arc<str> = name.into();
+        let debug_name = DebugName::owned(name_arc.to_string());
+        let query_groups = query_specs.into_iter().map(CachedQueryGroup::new).collect();
+        let cached_registry_gen = registry.generation();
+        let snapshot = registry.snapshot_arc();
+
+        Self {
+            name: name_arc,
+            debug_name,
+            query_groups,
+            access: SystemAccess::None,
+            self_conflict: false,
+            init_error: None,
+            last_run: Tick::new(0),
+            this_run: Tick::new(0),
+            callback: GuestFnPtr(callback),
+            user_data: GuestUserData::new(user_data),
+            run_if: None,
+            mod_id: None,
+            mod_namespace: None,
+            mod_generation: 0,
+            mod_generation_explicit: false,
+            schedule: ScheduleId::UPDATE,
+            is_main_thread: false,
+            after_systems: Vec::new(),
+            before_systems: Vec::new(),
+            after_weak_systems: Vec::new(),
+            before_weak_systems: Vec::new(),
+            in_sets: Vec::new(),
+            mounted_schedule_sets: Vec::new(),
+            ambiguous_with_systems: Vec::new(),
+            ambiguous_with_all: false,
+            error_policy: ModErrorPolicy::Quarantine,
+            error_policy_explicit: false,
+            enabled_flag: Arc::new(AtomicBool::new(true)),
+            is_active: Arc::new(AtomicBool::new(true)),
+            commands_storage: HostCommandsStorage::new(),
+            fault_queue: CommandQueue::default(),
+            last_error_buf: String::new(),
+            init_count: 0,
+            registry,
+            cached_registry_gen,
+            snapshot,
+            budget_runtime_id: None,
+            #[cfg(feature = "diagnostics")]
+            diagnostics_collector_id: None,
+        }
+    }
+
+    /// Returns the guest system's registered name.
+    #[inline]
+    pub fn system_name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns an `Arc<str>` clone of the guest system's registered name.
+    #[inline]
+    pub fn system_name_arc(&self) -> Arc<str> {
+        Arc::clone(&self.name)
+    }
+
+    /// Returns a clone of the shared atomic enablement flag used by [`crate::ModQuarantine`].
+    #[inline]
+    pub fn enabled_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.enabled_flag)
+    }
+
+    /// Returns `true` if the system is currently enabled (not quarantined).
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled_flag.load(Ordering::Acquire)
+    }
+
+    /// Enables or disables execution of this system.
+    #[inline]
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled_flag.store(enabled, Ordering::Release);
+    }
+
+    /// Replaces the [`ModRegistry`] handle used by this system.
+    pub(crate) fn set_registry(&mut self, registry: ModRegistry) {
+        self.cached_registry_gen = registry.generation();
+        self.snapshot = registry.snapshot_arc();
+        self.registry = registry;
+    }
+
+    /// Returns `true` if the system was permanently disabled due to internal query borrow conflicts.
+    #[inline]
+    pub const fn has_self_conflict(&self) -> bool {
+        self.self_conflict
+    }
+
+    /// Returns the structured [`SystemInitError`] recorded if `System::initialize` failed.
+    #[inline]
+    pub fn init_error(&self) -> Option<&SystemInitError> {
+        self.init_error.as_ref()
+    }
+
+    /// Validates that every `BamComponent` handle referenced in `query_groups` exists in `registry`.
+    pub fn validate_against_registry(&self, registry: &ModRegistry) -> Result<(), Vec<String>> {
+        let snap = registry.snapshot();
+        let mut missing = Vec::new();
+        for group in &self.query_groups {
+            for term in &group.spec.terms {
+                if snap.get_by_handle(term.component).is_none() {
+                    let label = format!("BamComponent({})", term.component.0);
+                    if !missing.contains(&label) {
+                        missing.push(label);
+                    }
+                }
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(missing)
+        }
+    }
+
+    /// Returns the [`ModId`] associated with this system, if any.
+    #[inline]
+    pub const fn mod_id(&self) -> Option<ModId> {
+        self.mod_id
+    }
+
+    /// Associates this system with a [`ModId`] so it joins [`ModSystemSet::Mod`].
+    #[inline]
+    pub fn set_mod_id(&mut self, mod_id: ModId) {
+        self.mod_id = Some(mod_id);
+    }
+
+    /// Returns the canonical module namespace (`BamManifest::name`), if attached.
+    #[inline]
+    pub fn mod_namespace(&self) -> Option<&str> {
+        self.mod_namespace.as_deref()
+    }
+
+    /// Sets the canonical module namespace (`BamManifest::name`) attached to `BamHostCtx`.
+    #[inline]
+    pub fn set_mod_namespace(&mut self, namespace: Option<Arc<str>>) {
+        self.mod_namespace = namespace;
+    }
+
+    /// Builder helper to attach the canonical module namespace (`BamManifest::name`).
+    #[inline]
+    pub fn with_mod_namespace(mut self, namespace: impl Into<Arc<str>>) -> Self {
+        self.mod_namespace = Some(namespace.into());
+        self
+    }
+
+    /// Returns the reload generation associated with this system's owning module.
+    #[inline]
+    pub const fn mod_generation(&self) -> u64 {
+        self.mod_generation
+    }
+
+    /// Explicitly sets the reload generation associated with this system's owning module.
+    #[inline]
+    pub fn set_mod_generation(&mut self, generation: u64) {
+        self.mod_generation = generation;
+        self.mod_generation_explicit = true;
+    }
+
+    /// Builder helper to set the reload generation associated with this system's owning module.
+    #[inline]
+    pub const fn with_mod_generation(mut self, generation: u64) -> Self {
+        self.mod_generation = generation;
+        self.mod_generation_explicit = true;
+        self
+    }
+
+    /// Returns how many times `System::initialize` has been invoked on this `GuestSystem`.
+    #[inline]
+    pub const fn initialize_count(&self) -> u64 {
+        self.init_count
+    }
+
+    /// Returns the most recent diagnostic / fault message recorded on `BamHostCtx` during this
+    /// system's last run, if non-empty.
+    #[inline]
+    pub fn last_error(&self) -> Option<&str> {
+        (!self.last_error_buf.is_empty()).then_some(self.last_error_buf.as_str())
+    }
+
+    /// Builder helper to associate this system with a [`ModId`].
+    #[inline]
+    pub fn with_mod_id(mut self, mod_id: ModId) -> Self {
+        self.mod_id = Some(mod_id);
+        self
+    }
+
+    /// Returns the target [`ScheduleId`] requested for this system.
+    #[inline]
+    pub const fn schedule(&self) -> ScheduleId {
+        self.schedule
+    }
+
+    /// Sets the target [`ScheduleId`] for this system.
+    #[inline]
+    pub fn set_schedule(&mut self, schedule: ScheduleId) {
+        self.schedule = schedule;
+    }
+
+    /// Builder helper to set the target [`ScheduleId`] for this system.
+    #[inline]
+    pub const fn with_schedule(mut self, schedule: ScheduleId) -> Self {
+        self.schedule = schedule;
+        self
+    }
+
+    /// Returns `true` if `BAM_SYSTEM_FLAG_MAIN_THREAD` was set (`SystemStateFlags::NON_SEND`).
+    #[inline]
+    pub const fn is_main_thread(&self) -> bool {
+        self.is_main_thread
+    }
+
+    /// Pins or unpins this system onto Bevy's main thread.
+    #[inline]
+    pub fn set_main_thread(&mut self, main_thread: bool) {
+        self.is_main_thread = main_thread;
+    }
+
+    /// Builder helper to pin this system onto Bevy's main thread.
+    #[inline]
+    pub const fn with_main_thread(mut self, main_thread: bool) -> Self {
+        self.is_main_thread = main_thread;
+        self
+    }
+
+    /// Builder helper to configure explicit `after` and `before` ordering target names.
+    pub fn with_ordering(mut self, after: Vec<String>, before: Vec<String>) -> Self {
+        self.after_systems = after;
+        self.before_systems = before;
+        self
+    }
+
+    /// System-set target names declared in `BamSystemDesc::after`.
+    #[inline]
+    pub fn after_systems(&self) -> &[String] {
+        &self.after_systems
+    }
+
+    /// System-set target names declared in `BamSystemDesc::before`.
+    #[inline]
+    pub fn before_systems(&self) -> &[String] {
+        &self.before_systems
+    }
+
+    /// Builder helper to configure weak `after_weak` and `before_weak` ordering target names.
+    pub fn with_weak_ordering(mut self, after_weak: Vec<String>, before_weak: Vec<String>) -> Self {
+        self.after_weak_systems = after_weak;
+        self.before_weak_systems = before_weak;
+        self
+    }
+
+    /// System-set target names declared in `BamSystemDesc::after_weak`.
+    #[inline]
+    pub fn after_weak_systems(&self) -> &[String] {
+        &self.after_weak_systems
+    }
+
+    /// System-set target names declared in `BamSystemDesc::before_weak`.
+    #[inline]
+    pub fn before_weak_systems(&self) -> &[String] {
+        &self.before_weak_systems
+    }
+
+    /// Configures explicit `in_sets` membership target names (`"host::<set>"` or named sets).
+    pub fn with_in_sets(mut self, in_sets: Vec<String>) -> Self {
+        self.in_sets = in_sets;
+        self
+    }
+
+    /// System-set membership target names declared in `BamSystemDesc::in_sets`.
+    #[inline]
+    pub fn in_sets(&self) -> &[String] {
+        &self.in_sets
+    }
+
+    /// Appends a target system-set name to `in_sets` if not already present.
+    pub fn add_in_set(&mut self, set_name: impl Into<String>) {
+        let name = set_name.into();
+        if !self.in_sets.iter().any(|existing| existing == &name) {
+            self.in_sets.push(name);
+        }
+    }
+
+    /// Removes a target system-set name from `in_sets`.
+    pub fn remove_in_set(&mut self, set_name: &str) {
+        self.in_sets.retain(|existing| existing != set_name);
+    }
+
+    /// Configured ABI `0.3` [`BamSystemSet`] handles this system was mounted into via
+    /// `host_mount_system_in_schedule`.
+    #[inline]
+    pub fn mounted_schedule_sets(&self) -> &[BamSystemSet] {
+        &self.mounted_schedule_sets
+    }
+
+    /// Records a [`BamSystemSet`] handle into which this system has been mounted.
+    pub fn add_mounted_schedule_set(&mut self, set: BamSystemSet) {
+        if set.is_valid() && !self.mounted_schedule_sets.contains(&set) {
+            self.mounted_schedule_sets.push(set);
+        }
+    }
+
+    /// Clears recorded [`BamSystemSet`] mounts (used when remounting across schedules).
+    pub fn clear_mounted_schedule_sets(&mut self) {
+        self.mounted_schedule_sets.clear();
+    }
+
+    /// Configures explicit `ambiguous_with` target names (`BamSystemDesc::ambiguous_with`).
+    pub fn with_ambiguous_with(mut self, ambiguous_with: Vec<String>) -> Self {
+        self.ambiguous_with_systems = ambiguous_with;
+        self
+    }
+
+    /// System-set target names declared in `BamSystemDesc::ambiguous_with`.
+    #[inline]
+    pub fn ambiguous_with_systems(&self) -> &[String] {
+        &self.ambiguous_with_systems
+    }
+
+    /// Configures `BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL` (`.ambiguous_with_all()`).
+    #[inline]
+    pub const fn with_ambiguous_with_all(mut self, ambiguous_with_all: bool) -> Self {
+        self.ambiguous_with_all = ambiguous_with_all;
+        self
+    }
+
+    /// Returns `true` if `BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL` was set on this system.
+    #[inline]
+    pub const fn is_ambiguous_with_all(&self) -> bool {
+        self.ambiguous_with_all
+    }
+
+    /// Returns the [`ModErrorPolicy`] governing faults in this system.
+    #[inline]
+    pub const fn error_policy(&self) -> ModErrorPolicy {
+        self.error_policy
+    }
+
+    /// Overrides the [`ModErrorPolicy`] for this system.
+    #[inline]
+    pub fn set_error_policy(&mut self, policy: ModErrorPolicy) {
+        self.error_policy = policy;
+        self.error_policy_explicit = true;
+    }
+
+    /// Builder helper to override the [`ModErrorPolicy`] for this system.
+    #[inline]
+    pub const fn with_error_policy(mut self, policy: ModErrorPolicy) -> Self {
+        self.error_policy = policy;
+        self.error_policy_explicit = true;
+        self
+    }
+
+    /// Obtains a clone of the atomic module liveness tombstone flag.
+    #[inline]
+    pub fn is_active(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.is_active)
+    }
+
+    /// Sets the atomic module liveness tombstone flag.
+    #[inline]
+    pub fn set_is_active(&mut self, is_active: Arc<AtomicBool>) {
+        self.is_active = is_active;
+    }
+
+    /// Fluent builder method to attach an atomic module liveness tombstone flag.
+    #[inline]
+    pub fn with_is_active(mut self, is_active: Arc<AtomicBool>) -> Self {
+        self.is_active = is_active;
+        self
+    }
+
+    /// Configures an optional C-ABI `run_if` predicate evaluated before each system run.
+    #[inline]
+    pub fn set_run_if(&mut self, run_if: Option<(BamRunIfFn, *mut c_void)>) {
+        self.run_if = run_if.map(|(cb, ud)| (GuestFnPtr(cb), GuestUserData::new(ud)));
+    }
+
+    /// Fluent builder method to attach an optional C-ABI `run_if` predicate.
+    #[inline]
+    pub fn with_run_if(mut self, run_if: Option<(BamRunIfFn, *mut c_void)>) -> Self {
+        self.set_run_if(run_if);
+        self
+    }
+
+    /// Returns the configured `run_if` callback and context pointer, if any.
+    #[inline]
+    pub fn run_if(&self) -> Option<(BamRunIfFn, *mut c_void)> {
+        self.run_if.map(|(GuestFnPtr(cb), ud)| (cb, ud.as_ptr()))
+    }
+
+    fn record_fault_and_apply_policy(
+        &mut self,
+        status: FfiResult,
+        panicked: bool,
+        last_error: Option<String>,
+    ) -> Result<(), RunSystemError> {
+        if self.error_policy != ModErrorPolicy::DelegateToBevyFallback {
+            self.enabled_flag.store(false, Ordering::Release);
+        }
+        // Discard any partial deferred commands recorded by the faulting callback invocation.
+        self.commands_storage.clear();
+
+        let mod_id = self.mod_id;
+        let mod_namespace = self.mod_namespace.as_deref().map(str::to_owned);
+        let ns_label = mod_namespace.as_deref().unwrap_or("unscoped");
+        let generation = self.mod_generation;
+        let sys_name = self.name.to_string();
+        let last_error = last_error.filter(|s| !s.is_empty());
+
+        match self.error_policy {
+            ModErrorPolicy::Quarantine => {
+                tracing::warn!(
+                    system = %sys_name,
+                    mod_id = ?mod_id,
+                    namespace = %ns_label,
+                    generation,
+                    %status,
+                    panicked,
+                    last_error = ?last_error,
+                    "quarantined faulting guest mod system"
+                );
+            }
+            ModErrorPolicy::Log | ModErrorPolicy::ReportToBevy => {
+                tracing::error!(
+                    system = %sys_name,
+                    mod_id = ?mod_id,
+                    namespace = %ns_label,
+                    generation,
+                    %status,
+                    panicked,
+                    last_error = ?last_error,
+                    "guest mod system faulted"
+                );
+            }
+            ModErrorPolicy::DelegateToBevyFallback => {
+                tracing::debug!(
+                    system = %sys_name,
+                    mod_id = ?mod_id,
+                    namespace = %ns_label,
+                    generation,
+                    %status,
+                    panicked,
+                    last_error = ?last_error,
+                    "delegating guest mod system fault to Bevy FallbackErrorHandler"
+                );
+            }
+        }
+
+        let fault_msg = ModSystemFaulted {
+            mod_id,
+            mod_namespace: mod_namespace.clone(),
+            generation,
+            system_name: sys_name.clone(),
+            status,
+            panicked,
+            last_error: last_error.clone(),
+            init_error: None,
+        };
+        self.fault_queue.push(move |world: &mut World| {
+            if let Some(id) = mod_id {
+                ModHost::record_fault_in_world(world, id);
+            }
+            if let Some(mut msgs) = world.get_resource_mut::<Messages<ModSystemFaulted>>() {
+                msgs.write(fault_msg);
+            }
+        });
+
+        match self.error_policy {
+            ModErrorPolicy::Quarantine | ModErrorPolicy::Log => Ok(()),
+            ModErrorPolicy::ReportToBevy | ModErrorPolicy::DelegateToBevyFallback => {
+                let mod_err = ModSystemError {
+                    mod_id,
+                    mod_namespace,
+                    generation,
+                    system_name: sys_name,
+                    status,
+                    panicked,
+                    last_error,
+                };
+                Err(RunSystemError::Failed(mod_err.into_bevy_error()))
+            }
+        }
+    }
+}
+
+impl System for GuestSystem {
+    type In = ();
+    type Out = ();
+
+    fn name(&self) -> DebugName {
+        self.debug_name.clone()
+    }
+
+    fn flags(&self) -> SystemStateFlags {
+        if self.is_main_thread {
+            SystemStateFlags::DEFERRED | SystemStateFlags::NON_SEND
+        } else {
+            SystemStateFlags::DEFERRED
+        }
+    }
+
+    fn default_system_sets(&self) -> Vec<InternedSystemSet> {
+        let mut sets = vec![SystemSet::intern(&ModSystemSet::All)];
+        if let Some(id) = self.mod_id {
+            sets.push(SystemSet::intern(&ModSystemSet::Mod(id)));
+        }
+        sets
+    }
+
+    fn initialize(&mut self, world: &mut World) -> SystemAccess {
+        self.init_count = self.init_count.saturating_add(1);
+        self.this_run = world.change_tick();
+        self.last_run = Tick::new(world.change_tick().get().wrapping_sub(Tick::MAX.get()));
+        self.self_conflict = false;
+        self.init_error = None;
+
+        if !self.error_policy_explicit
+            && let Some(cfg) = world.get_resource::<ModErrorPolicyConfig>()
+        {
+            self.error_policy = cfg.0;
+        }
+
+        if !self.mod_generation_explicit
+            && let Some(ns) = self.mod_namespace.as_deref()
+            && let Some(mod_host) = world.get_resource::<ModHost>()
+        {
+            self.mod_generation = mod_host.mod_generation(ns);
+        }
+
+        if let Some(world_reg) = world.get_resource::<ModRegistry>() {
+            let world_gen = world_reg.generation();
+            if world_gen != self.cached_registry_gen {
+                self.snapshot = world_reg.snapshot_arc();
+                self.cached_registry_gen = world_gen;
+            }
+            self.registry = world_reg.clone();
+        }
+
+        if let Some(mod_id) = self.mod_id
+            && let Some(mut quarantine) = world.get_resource_mut::<ModQuarantine>()
+        {
+            quarantine.register_system(
+                mod_id,
+                Arc::clone(&self.name),
+                Arc::clone(&self.enabled_flag),
+            );
+        }
+
+        // Bind each query group to this system's `(mod_namespace, system_name)` identity so
+        // message / removed-component cursors persist across `reload_mod` through
+        // `PersistentMessageCursors`. Unscoped (host-constructed) systems never persist cursors,
+        // preventing accidental cross-system cursor sharing between same-named host systems.
+        for group in &mut self.query_groups {
+            if let Some(ns) = self.mod_namespace.as_ref() {
+                group.set_system_identity(Some(Arc::clone(ns)), Arc::clone(&self.name));
+            } else {
+                group.owner_system_key = None;
+            }
+        }
+
+        match initialize_query_groups_in_world(world, &self.snapshot, &mut self.query_groups) {
+            Ok(mut access_set) => {
+                if let Some(budget_id) = world.components().component_id::<ModBudgetRuntime>() {
+                    access_set.add_resource_read(budget_id);
+                    self.budget_runtime_id = Some(budget_id);
+                } else {
+                    self.budget_runtime_id = None;
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    if let Some(col_id) =
+                        world.components().component_id::<ModDiagnosticsCollector>()
+                    {
+                        access_set.add_resource_read(col_id);
+                        self.diagnostics_collector_id = Some(col_id);
+                    } else {
+                        self.diagnostics_collector_id = None;
+                    }
+                }
+                self.access = SystemAccess::Shared(access_set);
+                let cell = world.as_unsafe_world_cell();
+                for group in &mut self.query_groups {
+                    group.update_archetypes(cell);
+                }
+                self.access.clone()
+            }
+            Err(err) => {
+                self.enabled_flag.store(false, Ordering::Release);
+                self.access = SystemAccess::None;
+                if matches!(err, SystemInitError::SelfConflict { .. }) {
+                    self.self_conflict = true;
+                }
+                let status = err.status_code();
+                let err_detail = err.to_string();
+                let mod_namespace = self.mod_namespace.as_deref().map(str::to_owned);
+                let ns_label = mod_namespace.as_deref().unwrap_or("unscoped");
+                let generation = self.mod_generation;
+                self.init_error = Some(err.clone());
+
+                tracing::error!(
+                    system = %self.name,
+                    mod_id = ?self.mod_id,
+                    namespace = %ns_label,
+                    generation,
+                    error = %err,
+                    "guest mod system failed initialization and was quarantined"
+                );
+
+                if let Some(id) = self.mod_id {
+                    ModHost::record_fault_in_world(world, id);
+                }
+
+                let fault_msg = ModSystemFaulted {
+                    mod_id: self.mod_id,
+                    mod_namespace: mod_namespace.clone(),
+                    generation,
+                    system_name: self.name.to_string(),
+                    status,
+                    panicked: false,
+                    last_error: Some(err_detail.clone()),
+                    init_error: Some(err),
+                };
+                if let Some(mut msgs) = world.get_resource_mut::<Messages<ModSystemFaulted>>() {
+                    msgs.write(fault_msg);
+                }
+
+                if matches!(
+                    self.error_policy,
+                    ModErrorPolicy::ReportToBevy | ModErrorPolicy::DelegateToBevyFallback
+                ) {
+                    dispatch_mod_fault_to_fallback_handler(
+                        world,
+                        ModSystemError {
+                            mod_id: self.mod_id,
+                            mod_namespace,
+                            generation,
+                            system_name: self.name.to_string(),
+                            status,
+                            panicked: false,
+                            last_error: Some(err_detail),
+                        },
+                        self.last_run,
+                    );
+                }
+
+                self.access.clone()
+            }
+        }
+    }
+
+    unsafe fn run_unsafe(
+        &mut self,
+        _input: SystemIn<'_, Self>,
+        world: UnsafeWorldCell,
+    ) -> Result<Self::Out, RunSystemError> {
+        if self.self_conflict
+            || self.init_error.is_some()
+            || !self.enabled_flag.load(Ordering::Acquire)
+            || !self.is_active.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
+        // Refresh cached `Arc<RegistrySnapshot>` in O(1) only if `ModRegistry` generation advanced.
+        let latest_gen = self.registry.latest_generation();
+        if latest_gen != self.cached_registry_gen {
+            self.snapshot = self.registry.latest_snapshot_arc();
+            self.cached_registry_gen = latest_gen;
+        }
+
+        if let Some((GuestFnPtr(cond_fn), cond_ud)) = self.run_if {
+            // SAFETY: `cond_fn` is a foreign `extern "C"` predicate belonging to an active loaded mod.
+            let flag = unsafe { cond_fn(cond_ud.as_ptr()) };
+            if !flag.get() {
+                return Ok(());
+            }
+        }
+
+        let change_tick = world.increment_change_tick();
+        self.this_run = change_tick;
+        let last_run = self.last_run;
+
+        for group in &mut self.query_groups {
+            group.update_archetypes(world);
+        }
+
+        // SAFETY: Scheduler verified access via `FilteredAccessSet`; no intra-system conflict exists.
+        let storages = unsafe { world.storages() };
+        let archetypes = world.archetypes();
+
+        let budget_runtime: Option<&ModBudgetRuntime> = self.budget_runtime_id.and_then(|bid| {
+            // SAFETY: Shared read access to `ModBudgetRuntime` (`bid`) was declared in `FilteredAccessSet`.
+            unsafe { world.get_resource_by_id(bid) }.map(|ptr| {
+                // SAFETY: `bid` is `ModBudgetRuntime`'s `ComponentId`.
+                unsafe { ptr.deref::<ModBudgetRuntime>() }
+            })
+        });
+
+        let mod_label = self.mod_namespace.as_deref().unwrap_or("unscoped");
+        let (quota_limits, shared_frame_spawns, table_metrics) = if let Some(rt) = budget_runtime {
+            let (limits, shared) = rt.prepare_system_quotas(self.mod_id, mod_label);
+            let tm = compute_query_table_metrics(
+                &self.query_groups,
+                &storages.tables,
+                archetypes,
+                last_run,
+                change_tick,
+            );
+            (limits, shared, tm)
+        } else {
+            (
+                CommandQuotaLimits::UNLIMITED,
+                None,
+                QueryTableMetrics::default(),
+            )
+        };
+
+        let count = self.query_groups.len().min(MAX_SYSTEM_QUERIES);
+        let mut host_iters: [Option<HostIter<'_>>; MAX_SYSTEM_QUERIES] =
+            [const { None }; MAX_SYSTEM_QUERIES];
+        let mut query_views: [Option<RandomQueryView<'_>>; MAX_SYSTEM_QUERIES] =
+            [None; MAX_SYSTEM_QUERIES];
+
+        for (i, group) in self.query_groups.iter_mut().take(count).enumerate() {
+            query_views[i] = Some(RandomQueryView {
+                plan: &group.plan,
+                is_dense: group.is_dense,
+                matched_tables: &group.matched_tables,
+                matched_archetypes: &group.matched_archetypes,
+                has_query_state: group.query_state.is_some(),
+            });
+            let iter = if group.is_dense {
+                HostIter::new_dense(
+                    &storages.tables,
+                    &group.matched_tables,
+                    &group.plan,
+                    last_run,
+                    change_tick,
+                )
+            } else {
+                HostIter::new_archetypal(
+                    &storages.tables,
+                    archetypes,
+                    &storages.sparse_sets,
+                    &group.matched_archetypes,
+                    &group.plan,
+                    &mut group.sparse_scratch,
+                    last_run,
+                    change_tick,
+                )
+            }
+            .with_world(world)
+            .with_msg_cursors(&mut group.msg_cursors);
+            host_iters[i] = Some(iter);
+        }
+
+        let mut iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES] =
+            [core::ptr::null_mut(); MAX_SYSTEM_QUERIES];
+        for i in 0..count {
+            if let Some(ref mut it) = host_iters[i] {
+                iter_ptrs[i] = it.as_ffi_ptr();
+            }
+        }
+
+        let sys_span = tracing::debug_span!(
+            "bam_guest_system",
+            mod_name = %mod_label,
+            system = %self.name,
+            chunks = tracing::field::Empty,
+            entities = tracing::field::Empty,
+            commands = tracing::field::Empty,
+        );
+        let _span_guard = sys_span.enter();
+
+        if self.commands_storage.is_empty() {
+            self.commands_storage.reset_invocation_counters();
+        }
+
+        #[cfg(feature = "diagnostics")]
+        let has_diagnostics = self.diagnostics_collector_id.is_some();
+        #[cfg(not(feature = "diagnostics"))]
+        let has_diagnostics = false;
+
+        let start_time =
+            (has_diagnostics || budget_runtime.is_some()).then(std::time::Instant::now);
+
+        let (status, reported_fault) = {
+            let mut host_commands = HostCommands::new(
+                &mut self.commands_storage,
+                world.entity_allocator(),
+                &self.snapshot,
+            )
+            .with_mod_context(self.mod_id, Some(Arc::clone(&self.is_active)))
+            .with_registry(&self.registry)
+            .with_quotas(quota_limits, shared_frame_spawns.as_deref());
+            let commands_ptr = host_commands.as_ffi_ptr();
+            let err_buf = core::mem::take(&mut self.last_error_buf);
+            let mut sys_ctx = HostSystemCtx::new(
+                Arc::clone(&self.snapshot),
+                self.mod_namespace.clone(),
+                err_buf,
+                iter_ptrs,
+                count,
+                commands_ptr,
+            )
+            .with_world_and_queries(world, query_views, last_run, change_tick);
+            let host_ctx_ptr = sys_ctx.host_ctx_ffi_ptr();
+            let sys_ctx_ptr = sys_ctx.as_ffi_ptr();
+            let GuestFnPtr(callback) = self.callback;
+            let fault_guard = ActiveGuestFaultGuard::enter(
+                host_ctx_ptr,
+                self.mod_id,
+                self.mod_namespace.clone(),
+                self.mod_generation,
+                Arc::clone(&self.name),
+            );
+            // SAFETY: Calling foreign `extern "C"` callback with stack-scoped `HostSystemCtx`,
+            // `HostIter`s, and `HostCommands` whose headers are poisoned when this block exits.
+            let res = unsafe { callback(sys_ctx_ptr, self.user_data.as_ptr()) };
+            let reported = fault_guard.finish();
+            self.last_error_buf = sys_ctx.reclaim_error_buffer();
+            (res, reported)
+        };
+
+        let elapsed = start_time.map(|t| t.elapsed());
+
+        let mut total_chunks = 0usize;
+        let mut total_entities = 0usize;
+        for it in host_iters.iter().take(count).flatten() {
+            let (c, e) = it.stats();
+            total_chunks += c;
+            total_entities += e;
+        }
+        drop(host_iters);
+
+        let commands_queued = self.commands_storage.len();
+        let arena_bytes_used = self.commands_storage.arena_bytes_used();
+        let spawns_queued = self.commands_storage.spawns_queued();
+        let arena_breaches = self.commands_storage.arena_breaches();
+        let spawn_breaches = self.commands_storage.spawn_breaches();
+        if !sys_span.is_disabled() {
+            sys_span.record("chunks", total_chunks);
+            sys_span.record("entities", total_entities);
+            sys_span.record("commands", commands_queued);
+        }
+
+        let faulted =
+            status == FfiResult::PANIC_CAUGHT || status.is_err() || reported_fault.is_some();
+
+        let mut watchdog_quarantined = false;
+        if let Some(rt) = budget_runtime {
+            let duration_us = elapsed
+                .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            let matched_entities = if total_chunks > 0 || table_metrics.has_row_filters {
+                total_entities as u64
+            } else {
+                table_metrics.unfiltered_entities
+            };
+            let action = rt.record_system_run(GuestSystemRunMetrics {
+                mod_id: self.mod_id,
+                mod_name: self.mod_namespace.clone().unwrap_or_else(unscoped_mod_name),
+                system_name: Arc::clone(&self.name),
+                duration_us,
+                matched_entities,
+                matched_tables: table_metrics.matched_tables,
+                skipped_summary_tick_tables: table_metrics.skipped_summary_tick_tables,
+                chunks_yielded: total_chunks,
+                commands_queued: if faulted { 0 } else { commands_queued },
+                arena_bytes_used,
+                spawns_queued: if faulted { 0 } else { spawns_queued },
+                arena_breaches,
+                spawn_breaches,
+                faulted,
+            });
+            if !faulted && action.quarantine {
+                watchdog_quarantined = true;
+                self.enabled_flag.store(false, Ordering::Release);
+                let mod_id = self.mod_id;
+                let mod_namespace = self.mod_namespace.as_deref().map(str::to_owned);
+                let ns_label = mod_namespace.as_deref().unwrap_or("unscoped");
+                let generation = self.mod_generation;
+                let sys_name = self.name.to_string();
+                let reason = action.reason.unwrap_or_else(|| {
+                    format!("guest system '{sys_name}' exceeded max_p99_system_micros budget")
+                });
+                tracing::warn!(
+                    system = %sys_name,
+                    mod_id = ?mod_id,
+                    namespace = %ns_label,
+                    generation,
+                    duration_us,
+                    reason = %reason,
+                    "quarantined guest mod system due to frame-time budget breach"
+                );
+                let fault_msg = ModSystemFaulted {
+                    mod_id,
+                    mod_namespace,
+                    generation,
+                    system_name: sys_name,
+                    status: FfiResult::CAPACITY_EXCEEDED,
+                    panicked: false,
+                    last_error: Some(reason),
+                    init_error: None,
+                };
+                self.fault_queue.push(move |world: &mut World| {
+                    if let Some(id) = mod_id {
+                        ModHost::record_fault_in_world(world, id);
+                    }
+                    if let Some(mut msgs) = world.get_resource_mut::<Messages<ModSystemFaulted>>() {
+                        msgs.write(fault_msg);
+                    }
+                });
+            }
+        }
+        let _ = watchdog_quarantined;
+
+        #[cfg(feature = "diagnostics")]
+        if let Some(col_id) = self.diagnostics_collector_id {
+            let cpu_time_us = elapsed.map_or(0.0, |d| d.as_secs_f64() * 1_000_000.0);
+            // SAFETY: Shared read access to `ModDiagnosticsCollector` (`col_id`) was declared in `FilteredAccessSet`.
+            if let Some(ptr) = unsafe { world.get_resource_by_id(col_id) } {
+                // SAFETY: `col_id` is `ModDiagnosticsCollector`'s `ComponentId`.
+                let collector = unsafe { ptr.deref::<ModDiagnosticsCollector>() };
+                collector.push(ModDiagnosticsSample {
+                    mod_id: self.mod_id,
+                    mod_name: self.mod_namespace.clone().unwrap_or_else(unscoped_mod_name),
+                    system_name: Arc::clone(&self.name),
+                    cpu_time_us,
+                    commands_queued: if faulted { 0 } else { commands_queued },
+                    faulted: faulted || watchdog_quarantined,
+                });
+            }
+        }
+
+        drop(_span_guard);
+        self.last_run = change_tick;
+
+        if faulted {
+            let effective_status = if status == FfiResult::PANIC_CAUGHT || status.is_err() {
+                status
+            } else {
+                FfiResult::INTERNAL_ERROR
+            };
+            let last_error = reported_fault
+                .filter(|s| !s.is_empty())
+                .or_else(|| (!self.last_error_buf.is_empty()).then(|| self.last_error_buf.clone()));
+            return self.record_fault_and_apply_policy(
+                effective_status,
+                effective_status == FfiResult::PANIC_CAUGHT,
+                last_error,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn apply_deferred(&mut self, world: &mut World) {
+        self.commands_storage.apply_to_world(world, &self.snapshot);
+        if !self.fault_queue.is_empty() {
+            self.fault_queue.apply(world);
+        }
+    }
+
+    fn run(
+        &mut self,
+        input: SystemIn<'_, Self>,
+        world: &mut World,
+    ) -> Result<Self::Out, RunSystemError> {
+        let res = self.run_without_applying_deferred(input, world);
+        self.apply_deferred(world);
+        res
+    }
+
+    fn queue_deferred(&mut self, mut world: DeferredWorld) {
+        if !self.commands_storage.is_empty() {
+            let mut taken = self.commands_storage.take_for_deferred_queue();
+            let snap = Arc::clone(&self.snapshot);
+            world.commands().queue(move |w: &mut World| {
+                taken.apply_to_world(w, &snap);
+            });
+        }
+        if !self.fault_queue.is_empty() {
+            world.commands().append(&mut self.fault_queue);
+        }
+    }
+
+    fn check_change_tick(&mut self, check: CheckChangeTicks) {
+        self.last_run.check_tick(check);
+        self.this_run.check_tick(check);
+    }
+
+    fn get_last_run(&self) -> Tick {
+        self.last_run
+    }
+
+    fn set_last_run(&mut self, last_run: Tick) {
+        self.last_run = last_run;
+    }
+}
+
+#[inline]
+fn unscoped_mod_name() -> Arc<str> {
+    static UNSCOPED: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
+    Arc::clone(UNSCOPED.get_or_init(|| Arc::from("unscoped")))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct QueryTableMetrics {
+    matched_tables: u64,
+    skipped_summary_tick_tables: u64,
+    unfiltered_entities: u64,
+    has_row_filters: bool,
+}
+
+fn table_skipped_by_summary_tick(
+    table: &bevy_ecs::storage::Table,
+    plan: &QueryPlan,
+    last_run: Tick,
+    this_run: Tick,
+) -> bool {
+    for tf in &plan.tick_filters {
+        if tf.is_sparse {
+            continue;
+        }
+        if !tf.is_added
+            && let Some(col) = table.get_column(tf.component_id)
+            && let Some(summary) = col.get_summary_tick()
+            && !summary.get().is_newer_than(last_run, this_run)
+        {
+            return true;
+        }
+    }
+    for group in &plan.or_groups {
+        let mut trivially_satisfied = false;
+        let mut saw_summary_skip = false;
+        let mut has_active_clause = false;
+        for clause in &group.terms {
+            match clause.mode {
+                AccessMode::FILTER_ONLY => {
+                    if table.has_column(clause.component_id) {
+                        trivially_satisfied = true;
+                        break;
+                    }
+                }
+                AccessMode::WITHOUT => {
+                    if !table.has_column(clause.component_id) {
+                        trivially_satisfied = true;
+                        break;
+                    }
+                }
+                AccessMode::CHANGED | AccessMode::ADDED => {
+                    if clause.is_sparse {
+                        has_active_clause = true;
+                        continue;
+                    }
+                    let Some(col) = table.get_column(clause.component_id) else {
+                        continue;
+                    };
+                    if clause.mode == AccessMode::CHANGED
+                        && let Some(summary) = col.get_summary_tick()
+                        && !summary.get().is_newer_than(last_run, this_run)
+                    {
+                        saw_summary_skip = true;
+                        continue;
+                    }
+                    has_active_clause = true;
+                }
+                _ => {}
+            }
+        }
+        if !trivially_satisfied && saw_summary_skip && !has_active_clause {
+            return true;
+        }
+    }
+    false
+}
+
+fn compute_query_table_metrics(
+    query_groups: &[CachedQueryGroup],
+    tables: &bevy_ecs::storage::Tables,
+    archetypes: &bevy_ecs::archetype::Archetypes,
+    last_run: Tick,
+    this_run: Tick,
+) -> QueryTableMetrics {
+    let mut out = QueryTableMetrics::default();
+    for group in query_groups.iter().take(MAX_SYSTEM_QUERIES) {
+        if !group.plan.has_entity_terms {
+            continue;
+        }
+        let has_filters = !group.plan.tick_filters.is_empty() || !group.plan.or_groups.is_empty();
+        out.has_row_filters |= has_filters;
+        if group.is_dense {
+            for &table_id in &group.matched_tables {
+                let Some(table) = tables.get(table_id) else {
+                    continue;
+                };
+                let len = table.entity_count() as u64;
+                if len == 0 {
+                    continue;
+                }
+                out.matched_tables = out.matched_tables.saturating_add(1);
+                if has_filters
+                    && table_skipped_by_summary_tick(table, &group.plan, last_run, this_run)
+                {
+                    out.skipped_summary_tick_tables =
+                        out.skipped_summary_tick_tables.saturating_add(1);
+                } else {
+                    out.unfiltered_entities = out.unfiltered_entities.saturating_add(len);
+                }
+            }
+        } else {
+            for &arch_id in &group.matched_archetypes {
+                let Some(arch) = archetypes.get(arch_id) else {
+                    continue;
+                };
+                let len = arch.len() as u64;
+                if len == 0 {
+                    continue;
+                }
+                out.matched_tables = out.matched_tables.saturating_add(1);
+                if has_filters
+                    && let Some(table) = tables.get(arch.table_id())
+                    && table_skipped_by_summary_tick(table, &group.plan, last_run, this_run)
+                {
+                    out.skipped_summary_tick_tables =
+                        out.skipped_summary_tick_tables.saturating_add(1);
+                } else {
+                    out.unfiltered_entities = out.unfiltered_entities.saturating_add(len);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/guest_system_tests.rs"]
+mod tests;

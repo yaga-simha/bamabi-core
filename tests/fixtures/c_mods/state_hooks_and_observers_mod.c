@@ -1,0 +1,423 @@
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include "bamabi.h"
+
+/* Host-registered `ext::ReloadStateProbe` POD resource mirrored in C99. */
+typedef struct ReloadStateProbe {
+    uint64_t reload_epoch;
+    uint64_t accumulated_ticks;
+    uint32_t fail_next_save;
+    uint32_t fail_next_restore;
+} ReloadStateProbe;
+
+/* Dynamic POD component `"state_hooks_and_observers_mod::HookedAura"` with `on_add` / `on_remove` hooks. */
+typedef struct HookedAura {
+    uint32_t strength;
+    uint32_t tag;
+} HookedAura;
+
+typedef void (*RecordHookFn)(BamEntity entity, uint32_t is_remove, uint32_t strength);
+typedef void (*RecordEventFn)(uint32_t kind, BamEntity target, uint32_t value_u32, float value_f32);
+typedef BamEntity (*GetWatchedFn)(void);
+
+typedef struct CPrivateLayout {
+    uint64_t magic;
+    uint32_t counter;
+    uint32_t pad0;
+} CPrivateLayout;
+
+typedef struct PingSignal {
+    uint32_t seq;
+} PingSignal;
+
+typedef struct DamageApplied {
+    BamEntity target;
+    float amount;
+    uint32_t pad0;
+} DamageApplied;
+
+typedef struct DamagedMark {
+    uint32_t hits;
+} DamagedMark;
+
+typedef struct ExtModInstance {
+    BamHostApi     api;
+    const BamHostCtx* host_ctx;
+    uint64_t       reload_epoch;
+    uint64_t       accumulated_ticks;
+    uint32_t       fail_next_save;
+    uint32_t       fail_next_restore;
+    BamComponent   probe_res;
+    BamComponent   aura_comp;
+    BamComponent   private_comp;
+    BamComponent   damaged_mark_comp;
+    RecordHookFn   record_hook;
+    RecordEventFn  record_event;
+} ExtModInstance;
+
+static void ext_private_drop(void* ptr) {
+    CPrivateLayout* layout = (CPrivateLayout*)ptr;
+    (void)layout;
+    if (ptr != NULL) {
+        /* Note: called via host WorldDropGuard when entity despawns before unload. */
+        layout->magic = 0ull;
+    }
+}
+
+static RecordEventFn g_last_drop_cb = NULL;
+
+static void ext_private_drop_recorded(void* ptr) {
+    CPrivateLayout* layout = (CPrivateLayout*)ptr;
+    if (layout != NULL && g_last_drop_cb != NULL) {
+        g_last_drop_cb(99u, BAM_ENTITY_NULL, layout->counter, (float)layout->magic);
+    }
+    ext_private_drop(ptr);
+}
+
+static BamResult ext_global_ping_obs(
+    BamEntity target_entity,
+    const void* event_data,
+    BamCommands* commands,
+    void* user_data
+) {
+    ExtModInstance* inst = (ExtModInstance*)user_data;
+    const PingSignal* ping = (const PingSignal*)event_data;
+    (void)commands;
+    if (inst != NULL && inst->record_event != NULL && ping != NULL) {
+        inst->record_event(1u, target_entity, ping->seq, 0.0f);
+    }
+    return BAM_RESULT_OK;
+}
+
+static BamResult ext_damage_entity_obs(
+    BamEntity target_entity,
+    const void* event_data,
+    BamCommands* commands,
+    void* user_data
+) {
+    ExtModInstance* inst = (ExtModInstance*)user_data;
+    const DamageApplied* dmg = (const DamageApplied*)event_data;
+    if (inst != NULL && inst->record_event != NULL && dmg != NULL) {
+        inst->record_event(2u, target_entity, 0u, dmg->amount);
+        if (commands != NULL && bam_component_is_valid(inst->damaged_mark_comp) && target_entity != BAM_ENTITY_NULL) {
+            DamagedMark mark;
+            mark.hits = (uint32_t)dmg->amount;
+            inst->api.cmd_insert(commands, target_entity, inst->damaged_mark_comp, (const uint8_t*)&mark, sizeof(mark));
+        }
+    }
+    return BAM_RESULT_OK;
+}
+
+static BamResult ext_in_set_sys_cb(BamSystemCtx* sys_ctx, void* user_data) {
+    ExtModInstance* inst = (ExtModInstance*)user_data;
+    (void)sys_ctx;
+    if (inst != NULL && inst->record_event != NULL) {
+        inst->record_event(5u, BAM_ENTITY_NULL, 0u, 0.0f);
+    }
+    return BAM_RESULT_OK;
+}
+
+static BamResult ext_fixed_sys_cb(BamSystemCtx* sys_ctx, void* user_data) {
+    ExtModInstance* inst = (ExtModInstance*)user_data;
+    (void)sys_ctx;
+    if (inst != NULL && inst->record_event != NULL) {
+        inst->record_event(6u, BAM_ENTITY_NULL, 0u, 0.0f);
+    }
+    return BAM_RESULT_OK;
+}
+
+static void ext_aura_on_add(BamEntity entity, const void* component_ptr, void* user_data) {
+    ExtModInstance* inst = (ExtModInstance*)user_data;
+    const HookedAura* aura = (const HookedAura*)component_ptr;
+    if (inst != NULL && inst->record_hook != NULL && aura != NULL) {
+        inst->record_hook(entity, 0u, aura->strength);
+    }
+}
+
+static void ext_aura_on_remove(BamEntity entity, const void* component_ptr, void* user_data) {
+    ExtModInstance* inst = (ExtModInstance*)user_data;
+    const HookedAura* aura = (const HookedAura*)component_ptr;
+    if (inst != NULL && inst->record_hook != NULL && aura != NULL) {
+        inst->record_hook(entity, 1u, aura->strength);
+    }
+}
+
+static BamResult ext_tick_cb(BamSystemCtx* sys_ctx, void* user_data) {
+    ExtModInstance* inst = (ExtModInstance*)user_data;
+    BamIter* iter = NULL;
+    ReloadStateProbe* probe;
+    BamResult rc;
+
+    if (inst == NULL || sys_ctx == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    inst->accumulated_ticks += 1u;
+    rc = inst->api.sys_query(sys_ctx, 0u, &iter);
+    if (rc != BAM_RESULT_OK || iter == NULL) {
+        return rc;
+    }
+    probe = (ReloadStateProbe*)inst->api.res_mut_ptr(iter, 0u);
+    if (probe != NULL) {
+        inst->fail_next_save = probe->fail_next_save;
+        inst->fail_next_restore = probe->fail_next_restore;
+        probe->reload_epoch = inst->reload_epoch;
+        probe->accumulated_ticks = inst->accumulated_ticks;
+    }
+    return BAM_RESULT_OK;
+}
+
+static BamResult ext_save_state(
+    BamInstance* raw_inst,
+    BamStateWriterFn writer,
+    void* writer_ctx
+) {
+    ExtModInstance* inst = (ExtModInstance*)raw_inst;
+    uint8_t buf[24];
+
+    if (inst == NULL || writer == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    if (inst->fail_next_save != 0u) {
+        return BAM_RESULT_INVALID_STATE;
+    }
+    bam_write_le64(buf, inst->reload_epoch);
+    bam_write_le64(buf + 8u, inst->accumulated_ticks);
+    bam_write_le64(buf + 16u, (uint64_t)inst->fail_next_restore);
+    return writer(writer_ctx, buf, sizeof(buf));
+}
+
+static BamResult ext_restore_state(
+    BamInstance* raw_inst,
+    const uint8_t* bytes,
+    size_t len
+) {
+    ExtModInstance* inst = (ExtModInstance*)raw_inst;
+    uint64_t fail_flag;
+
+    if (inst == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    if (len != 24u || bytes == NULL) {
+        return BAM_RESULT_INVALID_ARGUMENT;
+    }
+    fail_flag = bam_read_le64(bytes + 16u);
+    if (fail_flag != 0u) {
+        return BAM_RESULT_INVALID_STATE;
+    }
+    inst->reload_epoch = bam_read_le64(bytes) + 1u;
+    inst->accumulated_ticks = bam_read_le64(bytes + 8u);
+    return BAM_RESULT_OK;
+}
+
+static const BamManifest MANIFEST = {
+    .struct_size = (uint32_t)sizeof(BamManifest),
+    .abi_version = BAM_ABI_VERSION,
+    .name = "state_hooks_and_observers_mod",
+    .version = "0.2.0",
+    .flags = 0u,
+    .reserved0 = 0u,
+    .save_state = ext_save_state,
+    .restore_state = ext_restore_state
+};
+
+BAM_EXPORT const BamManifest* bamabi_manifest(void) {
+    return &MANIFEST;
+}
+
+BAM_EXPORT BamResult bamabi_init(
+    const BamHostApi* api,
+    BamLoadCtx* load_ctx,
+    BamInstance** instance_out
+) {
+    static const char* const AFTER_PHYSICS[] = { "host::physics" };
+    static const char* const BEFORE_RENDER[] = { "host::render" };
+    ExtModInstance* inst;
+    BamComponentDesc aura_desc;
+    BamTermDesc res_term;
+    BamQueryDesc res_query;
+    BamSystemDesc sys_desc;
+    BamComponent flag_res = BAM_COMPONENT_INVALID;
+    BamResult rc;
+
+    if (load_ctx == NULL || instance_out == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    *instance_out = NULL;
+
+    inst = (ExtModInstance*)calloc(1u, sizeof(ExtModInstance));
+    if (inst == NULL) {
+        return BAM_RESULT_INTERNAL_ERROR;
+    }
+
+    rc = bam_host_api_copy_bounded(&inst->api, sizeof(inst->api), api);
+    if (rc != BAM_RESULT_OK) {
+        free(inst);
+        return rc;
+    }
+    inst->host_ctx = inst->api.load_host_ctx(load_ctx);
+    if (inst->host_ctx == NULL) {
+        free(inst);
+        return BAM_RESULT_NULL_POINTER;
+    }
+
+    inst->record_hook = (RecordHookFn)inst->api.get_proc_address(
+        inst->host_ctx,
+        "bam.v0.ext.record_hook"
+    );
+
+    memset(&aura_desc, 0, sizeof(aura_desc));
+    aura_desc.struct_size = (uint32_t)sizeof(BamComponentDesc);
+    aura_desc.name = "state_hooks_and_observers_mod::HookedAura";
+    aura_desc.uuid = bam_uuid_from_parts(
+        "state_hooks_and_observers_mod::HookedAura",
+        sizeof(HookedAura),
+        sizeof(uint32_t),
+        0ull
+    );
+    aura_desc.size = sizeof(HookedAura);
+    aura_desc.align = sizeof(uint32_t);
+    aura_desc.on_add = ext_aura_on_add;
+    aura_desc.on_remove = ext_aura_on_remove;
+    aura_desc.hook_user_data = inst;
+
+    rc = inst->api.register_component(load_ctx, &aura_desc, &inst->aura_comp);
+    if (rc != BAM_RESULT_OK) {
+        free(inst);
+        return rc;
+    }
+
+    rc = inst->api.resolve_component(inst->host_ctx, "ext::ReloadStateProbe", NULL, &inst->probe_res);
+    if (rc == BAM_RESULT_OK && bam_component_is_valid(inst->probe_res)) {
+        res_term = bam_term_desc(inst->probe_res, BAM_ACCESS_RESOURCE_WRITE, 0u);
+        memset(&res_query, 0, sizeof(res_query));
+        res_query.struct_size = (uint32_t)sizeof(BamQueryDesc);
+        res_query.terms = &res_term;
+        res_query.term_count = 1u;
+
+        memset(&sys_desc, 0, sizeof(sys_desc));
+        sys_desc.struct_size = (uint32_t)sizeof(BamSystemDesc);
+        sys_desc.name = "ext_state_tick";
+        sys_desc.queries = &res_query;
+        sys_desc.query_count = 1u;
+        sys_desc.callback = ext_tick_cb;
+        sys_desc.user_data = inst;
+        sys_desc.schedule = BAM_SCHEDULE_UPDATE;
+
+        if (inst->api.resolve_component(inst->host_ctx, "ext::OrderHostSets", NULL, &flag_res) == BAM_RESULT_OK) {
+            sys_desc.after = AFTER_PHYSICS;
+            sys_desc.after_count = 1u;
+            sys_desc.before = BEFORE_RENDER;
+            sys_desc.before_count = 1u;
+        }
+
+        rc = inst->api.register_system(load_ctx, &sys_desc);
+        if (rc != BAM_RESULT_OK) {
+            free(inst);
+            return rc;
+        }
+    }
+
+    if (inst->api.resolve_component(inst->host_ctx, "ext::EnableObserverAndLayoutTest", NULL, &flag_res) == BAM_RESULT_OK) {
+        BamComponentDesc priv_desc;
+        BamComponent ping_ev = BAM_COMPONENT_INVALID;
+        BamComponent dmg_ev = BAM_COMPONENT_INVALID;
+        BamObserverDesc obs_ping;
+        BamObserverDesc obs_dmg;
+
+        inst->record_event = (RecordEventFn)inst->api.get_proc_address(
+            inst->host_ctx,
+            "bam.v0.ext.record_event"
+        );
+        g_last_drop_cb = inst->record_event;
+
+        priv_desc = bam_desc_component_with_layout(
+            "state_hooks_and_observers_mod::CPrivateLayout",
+            sizeof(CPrivateLayout),
+            BAM_ALIGNOF(CPrivateLayout),
+            ext_private_drop_recorded
+        );
+        rc = inst->api.register_component(load_ctx, &priv_desc, &inst->private_comp);
+        if (rc != BAM_RESULT_OK) {
+            free(inst);
+            return rc;
+        }
+
+        (void)inst->api.resolve_component(
+            inst->host_ctx,
+            "ext::DamagedMark",
+            NULL,
+            &inst->damaged_mark_comp
+        );
+
+        if (inst->api.resolve_component(inst->host_ctx, "ext::PingSignal", NULL, &ping_ev) == BAM_RESULT_OK) {
+            obs_ping = bam_observer_desc(ping_ev, BAM_ENTITY_NULL, ext_global_ping_obs, inst);
+            obs_ping.name = "ext_c_ping_obs";
+            rc = inst->api.register_observer(load_ctx, &obs_ping);
+            if (rc != BAM_RESULT_OK) {
+                free(inst);
+                return rc;
+            }
+        }
+        if (inst->api.resolve_component(inst->host_ctx, "ext::DamageApplied", NULL, &dmg_ev) == BAM_RESULT_OK) {
+            /* Global watch or specific target handle passed via helper callback. */
+            BamComponent tgt_res = BAM_COMPONENT_INVALID;
+            BamEntity watched = BAM_ENTITY_NULL;
+            if (inst->api.resolve_component(inst->host_ctx, "ext::WatchedTarget", NULL, &tgt_res) == BAM_RESULT_OK) {
+                GetWatchedFn get_watched = (GetWatchedFn)inst->api.get_proc_address(
+                    inst->host_ctx,
+                    "bam.v0.ext.get_watched_target"
+                );
+                if (get_watched != NULL) {
+                    watched = get_watched();
+                }
+            }
+            obs_dmg = bam_observer_desc(dmg_ev, watched, ext_damage_entity_obs, inst);
+            obs_dmg.name = "ext_c_damage_obs";
+            rc = inst->api.register_observer(load_ctx, &obs_dmg);
+            if (rc != BAM_RESULT_OK) {
+                free(inst);
+                return rc;
+            }
+        }
+
+        if (inst->api.resolve_component(inst->host_ctx, "ext::EnableInSetTest", NULL, &flag_res) == BAM_RESULT_OK) {
+            static const char* const IN_SET_LOGIC[] = { "host::logic" };
+            BamSystemDesc logic_desc;
+            BamSystemDesc fixed_desc;
+            memset(&logic_desc, 0, sizeof(logic_desc));
+            logic_desc.struct_size = (uint32_t)sizeof(BamSystemDesc);
+            logic_desc.name = "ext_in_set_logic";
+            logic_desc.callback = ext_in_set_sys_cb;
+            logic_desc.user_data = inst;
+            logic_desc.schedule = BAM_SCHEDULE_UPDATE;
+            logic_desc.in_sets = IN_SET_LOGIC;
+            logic_desc.in_set_count = 1u;
+            rc = inst->api.register_system(load_ctx, &logic_desc);
+            if (rc != BAM_RESULT_OK) {
+                free(inst);
+                return rc;
+            }
+
+            memset(&fixed_desc, 0, sizeof(fixed_desc));
+            fixed_desc.struct_size = (uint32_t)sizeof(BamSystemDesc);
+            fixed_desc.name = "ext_fixed_step";
+            fixed_desc.callback = ext_fixed_sys_cb;
+            fixed_desc.user_data = inst;
+            fixed_desc.schedule = BAM_SCHEDULE_FIXED_UPDATE;
+            rc = inst->api.register_system(load_ctx, &fixed_desc);
+            if (rc != BAM_RESULT_OK) {
+                free(inst);
+                return rc;
+            }
+        }
+    }
+
+    *instance_out = (BamInstance*)inst;
+    return BAM_RESULT_OK;
+}
+
+BAM_EXPORT void bamabi_shutdown(BamInstance* instance) {
+    free(instance);
+}

@@ -1,0 +1,77 @@
+[package]
+name = "bamabi_host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Safe (`#![forbid(unsafe_code)]`) headless Bevy ECS plugin, extension traits, and lifecycle messages for `bamabi`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+autotests = false
+
+[lints]
+workspace = true
+
+[features]
+strict-ffi-checks = ["bamabi_host_sys/strict-ffi-checks"]
+test-utils = ["bamabi_host_sys/test-utils"]
+diagnostics = ["bamabi_host_sys/diagnostics", "dep:bevy_diagnostic"]
+signature-verification = ["bamabi_host_sys/signature-verification"]
+
+[dependencies]
+bamabi_sys = { workspace = true }
+bamabi_manifest = { workspace = true }
+bamabi_host_sys = { workspace = true }
+bamabi_macros = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_app = { workspace = true }
+bevy_platform = { workspace = true }
+bevy_diagnostic = { workspace = true, optional = true }
+toml = { workspace = true }
+semver = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bamabi_host_sys = { workspace = true, features = ["test-utils"] }
+bamabi_sdk_gen = { workspace = true }
+bevy_ecs = { workspace = true, features = ["debug"] }
+libloading = { workspace = true }
+proptest = { workspace = true }
+rusty-fork = "0.3"
+ssh-key = { workspace = true, features = ["getrandom"] }
+
+[[test]]
+name = "ffi"
+path = "tests/ffi/main.rs"
+
+[[test]]
+name = "scheduling"
+path = "tests/scheduling/main.rs"
+
+[[test]]
+name = "lifecycle"
+path = "tests/lifecycle/main.rs"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
+
+[[test]]
+name = "mod_budgets"
+path = "tests/mod_budgets.rs"
+
+[[test]]
+name = "schedule_shuffle_fuzz"
+path = "tests/schedule_shuffle_fuzz.rs"
+
+[[test]]
+name = "soak_10k_reloads"
+path = "tests/soak_10k_reloads.rs"
+
+[[bench]]
+name = "chunk_throughput"
+path = "benches/chunk_throughput.rs"
+harness = false
