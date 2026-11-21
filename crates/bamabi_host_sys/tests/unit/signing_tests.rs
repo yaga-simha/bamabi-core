@@ -703,3 +703,88 @@ fn newly_reexported_trust_items_and_deref_getters_accessible() {
     let _extract_err_variant: fn(usize, usize) -> BamPackExtractError =
         |count, limit| BamPackExtractError::TooManyEntries { count, limit };
 }
+
+#[cfg(all(feature = "signature-verification", feature = "keygen"))]
+#[test]
+fn keygen_generates_writes_and_issues_verifiable_openssh_cert() {
+    let tmp = TempDirGuard::new("keygen_parity");
+    let ca = generate_ed25519_keypair(Some("ca-root")).expect("generate CA keypair");
+    assert_eq!(ca.comment(), "ca-root");
+    let signer = keygen::generate_ed25519_keypair(None).expect("generate signer keypair");
+    assert!(matches!(
+        generate_ed25519_keypair(Some("bad\ncomment")),
+        Err(ModSigningError::Encoding { .. })
+    ));
+
+    let out_prefix = tmp.path().join("keys").join("mod_signer");
+    let written: GeneratedKeypair =
+        write_openssh_keypair(&out_prefix, Some("disk-signer")).expect("write keypair");
+    assert_eq!(written.private_key, out_prefix);
+    assert_eq!(written.public_key, tmp.path().join("keys/mod_signer.pub"));
+    assert!(written.private_key.is_file());
+    assert!(written.public_key.is_file());
+
+    let loaded_priv = PrivateKey::read_openssh_file(&written.private_key).expect("read priv key");
+    let loaded_pub = PublicKey::read_openssh_file(&written.public_key).expect("read pub key");
+    assert_eq!(loaded_priv.public_key(), &loaded_pub);
+    assert_eq!(
+        loaded_pub.fingerprint(HashAlg::Sha256).to_string(),
+        written.fingerprint
+    );
+
+    let overwrite_err =
+        write_openssh_keypair(&out_prefix, None).expect_err("refuse to overwrite existing keypair");
+    assert!(matches!(
+        overwrite_err,
+        ModTrustConfigError::Io { source, .. } if source.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+
+    let issued: IssuedCertificate = issue_ed25519_certificate_openssh(
+        &ca,
+        signer.public_key(),
+        707,
+        "m4-keygen-cert",
+        &["sample_mod".to_owned()],
+        0,
+        u64::MAX,
+    )
+    .expect("issue OpenSSH user certificate");
+    assert!(
+        issued
+            .certificate_openssh
+            .starts_with("ssh-ed25519-cert-v01@openssh.com ")
+    );
+    assert_eq!(
+        issued.subject_fingerprint,
+        signer.public_key().fingerprint(HashAlg::Sha256).to_string()
+    );
+    assert_eq!(
+        issued.ca_fingerprint,
+        ca.public_key().fingerprint(HashAlg::Sha256).to_string()
+    );
+
+    let payload = b"keygen-signed-mod-payload";
+    let pem = sign_mod_bytes_with_openssh_certificate(
+        &signer,
+        &issued.certificate_openssh,
+        DEFAULT_SIGNATURE_NAMESPACE,
+        payload,
+    )
+    .expect("sign payload with issued cert");
+
+    let policy = ModTrustPolicy::from_ca_openssh(&ca.public_key().to_openssh().unwrap())
+        .unwrap()
+        .with_validity_policy(CertificateValidityPolicy::FixedTimestamp(1_700_000_000))
+        .with_required_principal("sample_mod");
+    let verified = policy
+        .verify_bytes(payload, pem.as_bytes())
+        .expect("verify payload signed with keygen-issued cert");
+    assert_eq!(verified.serial, Some(707));
+    assert_eq!(verified.key_id.as_deref(), Some("m4-keygen-cert"));
+    assert_eq!(verified.principals, vec!["sample_mod"]);
+    assert_eq!(
+        verified.ca_fingerprint.as_deref(),
+        Some(issued.ca_fingerprint.as_str())
+    );
+    assert_eq!(verified.signer_fingerprint, issued.subject_fingerprint);
+}

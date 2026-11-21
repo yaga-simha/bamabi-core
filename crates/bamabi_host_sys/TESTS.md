@@ -8,7 +8,7 @@ This document inventories every unit test suite, integration test binary, Loom c
 
 | Layer | Location | Count | Command |
 |---|---|---|---|
-| **Unit tests (`--lib`)** | `27` `#[path = ...]` files in [`tests/unit/`](tests/unit/) | `102` tests | `cargo test -p bamabi_host_sys --lib --all-features` |
+| **Unit tests (`--lib`)** | `27` `#[path = ...]` files in [`tests/unit/`](tests/unit/) | `104` tests | `cargo test -p bamabi_host_sys --lib --all-features` |
 | **ABI 0.3.0 / FFI coverage** | [`tests/ffi_v03_coverage.rs`](tests/ffi_v03_coverage.rs) | `7` tests | `cargo test -p bamabi_host_sys --test ffi_v03_coverage --all-features` |
 | **Core host_sys integration** | [`tests/host_sys_integration_tests.rs`](tests/host_sys_integration_tests.rs) | `10` tests | `cargo test -p bamabi_host_sys --test host_sys_integration_tests --all-features` |
 | **Loom concurrency models** | [`tests/loom_drop_trampoline.rs`](tests/loom_drop_trampoline.rs) | `3` models | `cargo test -p bamabi_host_sys --test loom_drop_trampoline --release` |
@@ -19,13 +19,13 @@ This document inventories every unit test suite, integration test binary, Loom c
 | **Schedule sets & error bridge** | [`tests/v03_schedules_error_bridge.rs`](tests/v03_schedules_error_bridge.rs) | `6` tests | `cargo test -p bamabi_host_sys --test v03_schedules_error_bridge` |
 | **Zero-alloc commands** | [`tests/zero_alloc_commands.rs`](tests/zero_alloc_commands.rs) | `1` test | `cargo test -p bamabi_host_sys --test zero_alloc_commands` |
 | **Doctests** | `src/` | `0` tests | `cargo test --doc -p bamabi_host_sys --all-features` |
-| **Miri UB checks** | `--lib` (default & `bridge-reflect`) | `102` unit tests | `MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bamabi_host_sys --lib` |
+| **Miri UB checks** | `--lib` (default & `bridge-reflect`) | `92` default / `94` `bridge-reflect` unit tests | `MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bamabi_host_sys --lib` |
 
-> **Total with `--all-features`:** `102` unit tests + `47` integration tests = `149` tests (`0` `#[ignore]`). Under `cfg!(miri)`, tests in `iter.rs`, `hierarchy_ext.rs`, `symbols.rs`, and `shared_lib_tests.rs` automatically adjust thread pools, page limits, and `proptest` case counts so Miri executes cleanly without OS-thread or timeout failures.
+> **Total with `--all-features`:** `104` unit tests + `47` integration tests = `151` tests (`0` `#[ignore]`; `136` under default features). Under `cfg!(miri)`, tests in `iter.rs`, `hierarchy_ext.rs`, `symbols.rs`, and `shared_lib_tests.rs` automatically adjust thread pools, page limits, and `proptest` case counts so Miri executes cleanly without OS-thread or timeout failures.
 
 ---
 
-## 2. Unit Test Suites (`tests/unit/`, `102` tests)
+## 2. Unit Test Suites (`tests/unit/`, `104` tests)
 
 Every source module links its unit tests cleanly via `#[cfg(test)] #[path = "..."]`:
 
@@ -44,9 +44,9 @@ Every source module links its unit tests cleanly via `#[cfg(test)] #[path = "...
 | `src/ffi/validation.rs` | [`validation_tests.rs`](tests/unit/validation_tests.rs), [`validation_coverage_tests.rs`](tests/unit/validation_coverage_tests.rs) | `4` + `5` | `BamFieldDesc` validation, `ReflectFromPtr`/`ReflectComponent`/`ReflectResource` under Miri, panic-free uninitialized slot fallback, cross-world extraction, witness export/apply. |
 | `src/loader/error.rs` | [`loader_error_coverage_tests.rs`](tests/unit/loader_error_coverage_tests.rs) | `3` | ABI SemVer compatibility matrix and `ModLoadError` `Display`/`Error::source` formatting (including `ScheduleLeased`). |
 | `src/loader/mod_host.rs` | [`mod_host_tests.rs`](tests/unit/mod_host_tests.rs) | `1` | `excise_and_unload_mod_in_world` cleans mod-owned `IsResource` entities while preserving host resources. |
-| `src/loader/schema_migration.rs` | [`schema_migration_tests.rs`](tests/unit/schema_migration_tests.rs), [`schema_migration_coverage_tests.rs`](tests/unit/schema_migration_coverage_tests.rs) | `3` + `2` | `migrate_component_column` (`8B -> 16B`, ZST, `SparseSet`, rollback), zero-copy fingerprint retention, dynamic resources & errors under Miri. |
+| `src/loader/schema_migration.rs` | [`schema_migration_tests.rs`](tests/unit/schema_migration_tests.rs), [`schema_migration_coverage_tests.rs`](tests/unit/schema_migration_coverage_tests.rs) | `4` + `2` | `migrate_component_column` (`8B -> 16B`, ZST, `SparseSet`, rollback), zero-copy fingerprint retention, `IsResource` entity reuse on reload (`resource_reload_reuses_existing_is_resource_entity_under_miri`), dynamic resources & errors under Miri. |
 | `src/loader/shared_lib.rs` | [`shared_lib_tests.rs`](tests/unit/shared_lib_tests.rs) | `8` | ELF64/ELF32/Mach-O/PE32/PE32+ residency & `.pdb` `RSDS` patching, oversized/truncated regression, and **4 `proptest` parser fuzzers** proving panic-free determinism and bounded writes. |
-| `src/loader/signing.rs` | [`signing_tests.rs`](tests/unit/signing_tests.rs) | `9` | `signature-verification` only: `ModTrustPolicy` delegates (`add_krl_signer_*`, `with_krl_signer_principal`, `verify_bampack_*`), `Deref` getters, `VerifiedModSignature` `&`/owned round-trips, `bampack`/`embedded_sig`/`ssh_key` parity. |
+| `src/loader/signing.rs` | [`signing_tests.rs`](tests/unit/signing_tests.rs) | `10` | `9` `signature-verification` tests (`ModTrustPolicy` delegates, `Deref` getters, `VerifiedModSignature` `&`/owned round-trips, `bampack`/`embedded_sig`/`ssh_key` parity) + `1` `keygen` test (`keygen_generates_writes_and_issues_verifiable_openssh_cert`). |
 | `src/loader/symbols.rs` | [`symbols_tests.rs`](tests/unit/symbols_tests.rs) | `4` | Sharded lock-free `BamSymbolTable` deduplication and `ModNamedObjects` reload persistence + `World` cleanup. |
 | `src/loader/transaction.rs` | [`transaction_tests.rs`](tests/unit/transaction_tests.rs) | `1` | `LoadTransaction::drop` reclaims fresh slots across `1,100` failed inits in one live `World`. |
 | `src/registry/bridge.rs` | [`bridge_coverage_tests.rs`](tests/unit/bridge_coverage_tests.rs) | `1` | `HostWireBridge`, `HostStringBridge`, resource/event/relationship shims and error paths. |
@@ -84,4 +84,4 @@ Every source module links its unit tests cleanly via `#[cfg(test)] #[path = "...
   MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bamabi_host_sys --lib --features bridge-reflect
   ```
 - **Proptest scaling (`shared_lib_tests.rs`):** Scale parser fuzzing beyond default case counts with `PROPTEST_CASES=2048 cargo test -p bamabi_host_sys --lib shared_lib::tests::proptest_shared_lib_parsers`.
-- **Line coverage:** Every source file in `bamabi_host_sys/src/` exceeds the `85%` CI gate (`85.37%`–`100.00%`; zero exclusions remain in `.github/workflows/ci.yml` for `bamabi_host_sys`).
+- **Line coverage:** Every source file in `bamabi_host_sys/src/` exceeds the `85%` CI gate (`85.45%`–`100.00%`; zero exclusions remain in `.github/workflows/ci.yml` for `bamabi_host_sys`).

@@ -802,3 +802,647 @@ fn sync_dir_fingerprint_suppresses_stale_event_but_allows_modified_file() {
     .expect("send real modify");
     assert_eq!(watcher.poll_events(), (vec![dylib_path], Vec::new()));
 }
+
+#[test]
+fn public_builders_and_plugin_error_paths() {
+    let temp = TempDirGuard::new("bam_public_builders");
+    let mods_dir = temp.0.join("mods");
+    std::fs::create_dir_all(&mods_dir).expect("create mods_dir");
+
+    let watcher = ModHotReloadWatcher::watch(&mods_dir).expect("watch existing dir");
+    assert_eq!(watcher.watch_dir(), mods_dir);
+    assert!(watcher.load_options().shadow_copy);
+    assert!(watcher.poll_changed_paths().is_empty());
+
+    let missing_dir = temp.0.join("does_not_exist");
+    let err = ModHotReloadWatcher::watch_with_options(
+        &missing_dir,
+        Duration::from_millis(50),
+        false,
+        LoadOptions::default(),
+    )
+    .err()
+    .expect("watching nonexistent dir must fail");
+    assert!(!err.to_string().is_empty());
+
+    let dummy_dylib = mods_dir.join(dylib_filename("poll_changed"));
+    std::fs::write(&dummy_dylib, b"stub").expect("write dummy dylib");
+    let (tx, rx) = mpsc::channel::<DebounceEventResult>();
+    tx.send(Ok(vec![DebouncedEvent::new(
+        Event::new(EventKind::Create(CreateKind::File)).add_path(dummy_dylib.clone()),
+        Instant::now(),
+    )]))
+    .expect("send create event");
+    let rx_watcher = ModHotReloadWatcher::from_receiver_for_test(
+        &mods_dir,
+        Duration::ZERO,
+        rx,
+        LoadOptions::default(),
+    );
+    assert_eq!(rx_watcher.poll_changed_paths(), vec![dummy_dylib]);
+
+    let plugin = ModHotReloadPlugin::new(&missing_dir)
+        .with_load_options(LoadOptions::new().with_shadow_copy(false));
+    assert!(
+        plugin.load_options.shadow_copy,
+        "watcher plugin must force shadow_copy = true"
+    );
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let subscriber = LogMatchCounter {
+        needle: "failed to initialize ModHotReloadWatcher",
+        hits: Arc::clone(&hits),
+    };
+    tracing::subscriber::with_default(subscriber, || {
+        let mut app = App::new();
+        app.add_plugins(plugin);
+        assert!(app.world().contains_resource::<ModHotReloadHistory>());
+        assert!(app.world().get_resource::<ModHotReloadWatcher>().is_none());
+    });
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn poll_events_filters_and_system_edge_paths() {
+    let temp = TempDirGuard::new("bam_poll_edge_paths");
+    let mods_dir = temp.0.join("mods");
+    std::fs::create_dir_all(&mods_dir).expect("create mods_dir");
+
+    // 1. `poll_hot_reload_watcher_system` without `ModHotReloadWatcher` resource returns cleanly.
+    let mut empty_world = World::new();
+    poll_hot_reload_watcher_system(&mut empty_world);
+    assert!(!empty_world.contains_resource::<ModHotReloadHistory>());
+
+    // 2. Irrelevant event kinds, non-watchable files, `with_unload_on_delete(false)`, and `requeue_pending`.
+    let dylib = mods_dir.join(dylib_filename("edge_stub"));
+    let readme = mods_dir.join("README.md");
+    std::fs::write(&dylib, b"stub").expect("write stub dylib");
+    std::fs::write(&readme, b"readme").expect("write readme");
+
+    let (tx, rx) = mpsc::channel::<DebounceEventResult>();
+    tx.send(Ok(vec![
+        DebouncedEvent::new(
+            Event::new(EventKind::Access(AccessKind::Read)).add_path(dylib.clone()),
+            Instant::now(),
+        ),
+        DebouncedEvent::new(
+            Event::new(EventKind::Create(CreateKind::File)).add_path(readme),
+            Instant::now(),
+        ),
+    ]))
+    .expect("send filtered events");
+
+    let watcher = ModHotReloadWatcher::from_receiver_for_test(
+        &mods_dir,
+        Duration::ZERO,
+        rx,
+        LoadOptions::default(),
+    )
+    .with_unload_on_delete(false);
+    assert_eq!(watcher.poll_events(), (Vec::new(), Vec::new()));
+
+    // Delete with `unload_on_delete(false)` -> expires debounce without emitting deleted path.
+    std::fs::remove_file(&dylib).expect("remove stub dylib");
+    tx.send(Ok(vec![DebouncedEvent::new(
+        Event::new(EventKind::Remove(RemoveKind::File)).add_path(dylib.clone()),
+        Instant::now(),
+    )]))
+    .expect("send remove event");
+    assert_eq!(watcher.poll_events(), (Vec::new(), Vec::new()));
+
+    // Requeued change that no longer exists and requeued delete that still exists are skipped;
+    // existing change emits, while missing delete stays suppressed under `unload_on_delete(false)`.
+    let existing_change = mods_dir.join(dylib_filename("requeued_change"));
+    let missing_change = mods_dir.join(dylib_filename("gone_change"));
+    std::fs::write(&existing_change, b"stub2").expect("write existing_change");
+    watcher.requeue_pending(
+        vec![missing_change, existing_change.clone()],
+        vec![existing_change.clone(), dylib],
+    );
+    // Duplicate requeue does not produce duplicate entries.
+    watcher.requeue_pending(vec![existing_change.clone()], vec![existing_change.clone()]);
+    assert_eq!(watcher.poll_events(), (vec![existing_change], Vec::new()));
+
+    // 3. `poll_hot_reload_watcher_system` lazily initializes `ModHotReloadHistory` on disconnect.
+    let (disc_tx, disc_rx) = mpsc::channel::<DebounceEventResult>();
+    drop(disc_tx);
+    let disc_watcher = ModHotReloadWatcher::from_receiver_for_test(
+        &mods_dir,
+        Duration::ZERO,
+        disc_rx,
+        LoadOptions::default(),
+    );
+    let mut disc_world = World::new();
+    disc_world.insert_resource(disc_watcher);
+    poll_hot_reload_watcher_system(&mut disc_world);
+    let hist = disc_world.resource::<ModHotReloadHistory>();
+    assert_eq!(hist.outcomes.len(), 1);
+    assert_eq!(
+        hist.outcomes[0].action,
+        ModHotReloadAction::Failed("watcher channel disconnected".to_string())
+    );
+
+    // 4. `poll_hot_reload_watcher_system` exercises `requeue_pending` when `Update` is leased.
+    let build_dir = temp.0.join("build");
+    std::fs::create_dir_all(&build_dir).expect("create build_dir");
+    let sys_dylib = mods_dir.join(dylib_filename("sys_leased"));
+    if !compile_c_unit_mod(&build_dir, &sys_dylib, "sys_leased", "0.1.0", 3) {
+        return;
+    }
+
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.insert_resource(UnitCounter::default());
+    app.register_mod_resource::<UnitCounter>()
+        .expect("register UnitCounter");
+    ensure_mod_lifecycle_flush_schedule(&mut app);
+
+    let (sys_tx, sys_rx) = mpsc::channel::<DebounceEventResult>();
+    let sys_watcher = ModHotReloadWatcher::from_receiver_for_test(
+        &mods_dir,
+        Duration::ZERO,
+        sys_rx,
+        LoadOptions::new().with_shadow_copy(true),
+    );
+    app.insert_resource(sys_watcher);
+    app.add_systems(ModLifecycleFlush, poll_hot_reload_watcher_system);
+
+    sys_tx
+        .send(Ok(vec![DebouncedEvent::new(
+            Event::new(EventKind::Create(CreateKind::File)).add_path(sys_dylib.clone()),
+            Instant::now(),
+        )]))
+        .expect("send create");
+
+    let leased_update = app
+        .world_mut()
+        .resource_mut::<Schedules>()
+        .remove_temporarily(Update)
+        .expect("Update schedule exists");
+    app.world_mut().run_schedule(ModLifecycleFlush);
+    assert!(app.world().resource::<ModHost>().is_empty());
+    assert!(
+        !app.world().contains_resource::<ModHotReloadHistory>()
+            || app
+                .world()
+                .resource::<ModHotReloadHistory>()
+                .outcomes
+                .is_empty(),
+        "ScheduleLeased during system run must defer without Failed"
+    );
+
+    app.world_mut()
+        .resource_mut::<Schedules>()
+        .reinsert(leased_update);
+    app.world_mut().run_schedule(ModLifecycleFlush);
+    let hist = app.world().resource::<ModHotReloadHistory>();
+    assert_eq!(hist.outcomes.len(), 1);
+    assert_eq!(hist.outcomes[0].action, ModHotReloadAction::Loaded);
+    assert_eq!(hist.outcomes[0].path, sys_dylib);
+}
+
+#[test]
+fn sync_dir_and_validate_dir_dag_cover_error_and_cascade_paths() {
+    let temp = TempDirGuard::new("bam_sync_dag_errors");
+    let missing_dir = temp.0.join("missing_mods");
+
+    let mut world = World::new();
+    let missing_sync = load_unloaded_dag_mods(&mut world, &missing_dir, &LoadOptions::default());
+    assert_eq!(missing_sync.outcomes.len(), 1);
+    assert!(matches!(
+        missing_sync.outcomes[0].action,
+        ModHotReloadAction::Failed(_)
+    ));
+    assert!(
+        validate_dir_dag_for_reload(&world, &missing_dir, "any", None).is_err(),
+        "missing watch_dir must error in validate_dir_dag_for_reload"
+    );
+
+    // Only broken `mod.toml` present (`manifests.is_empty()` && `!parse_errors.is_empty()`).
+    let broken_only_dir = temp.0.join("broken_only");
+    let broken_sub = broken_only_dir.join("broken");
+    std::fs::create_dir_all(&broken_sub).expect("create broken_sub");
+    let broken_toml = broken_sub.join("mod.toml");
+    std::fs::write(&broken_toml, "[mod]\nid = \"unclosed\n").expect("write broken mod.toml");
+    let err_only = validate_dir_dag_for_reload(&world, &broken_only_dir, "broken", None)
+        .expect_err("all-broken manifests must error");
+    assert!(!err_only.is_empty());
+
+    // Valid `mod.toml` + broken `mod.toml` with `target_manifest_path` matching broken file.
+    let mixed_dir = temp.0.join("mixed_mods");
+    let valid_sub = mixed_dir.join("valid_a");
+    let bad_sub = mixed_dir.join("bad_toml");
+    let unsat_sub = mixed_dir.join("unsat_dep");
+    let missing_lib_sub = mixed_dir.join("missing_lib");
+    let cascade_sub = mixed_dir.join("cascade_dep");
+    let corrupt_sub = mixed_dir.join("corrupt_bin");
+    let cyc_a_sub = mixed_dir.join("cyc_a");
+    let cyc_b_sub = mixed_dir.join("cyc_b");
+    for d in [
+        &valid_sub,
+        &bad_sub,
+        &unsat_sub,
+        &missing_lib_sub,
+        &cascade_sub,
+        &corrupt_sub,
+        &cyc_a_sub,
+        &cyc_b_sub,
+    ] {
+        std::fs::create_dir_all(d).expect("create mod subdir");
+    }
+
+    std::fs::write(
+        valid_sub.join("mod.toml"),
+        "[mod]\nid = \"valid_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n",
+    )
+    .expect("write valid_a");
+    let bad_toml_path = bad_sub.join("mod.toml");
+    std::fs::write(&bad_toml_path, "[mod]\nid = \"unclosed\n").expect("write bad_toml");
+    std::fs::write(
+        unsat_sub.join("mod.toml"),
+        "[mod]\nid = \"unsat_dep\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nmissing_mod = \"^1.0\"\n",
+    )
+    .expect("write unsat_dep");
+    std::fs::write(
+        missing_lib_sub.join("mod.toml"),
+        "[mod]\nid = \"missing_lib\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n",
+    )
+    .expect("write missing_lib");
+    std::fs::write(
+        cascade_sub.join("mod.toml"),
+        "[mod]\nid = \"cascade_dep\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nmissing_lib = \"^1.0\"\n",
+    )
+    .expect("write cascade_dep");
+    let corrupt_entry = dylib_filename("corrupt_bin");
+    std::fs::write(
+        corrupt_sub.join("mod.toml"),
+        format!(
+            "[mod]\nid = \"corrupt_bin\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\nentry = \"{corrupt_entry}\"\n"
+        ),
+    )
+    .expect("write corrupt_bin mod.toml");
+    std::fs::write(corrupt_sub.join(&corrupt_entry), b"not_a_real_dylib")
+        .expect("write corrupt binary");
+    std::fs::write(
+        cyc_a_sub.join("mod.toml"),
+        "[mod]\nid = \"cyc_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\ncyc_b = \"^1.0\"\n",
+    )
+    .expect("write cyc_a");
+    std::fs::write(
+        cyc_b_sub.join("mod.toml"),
+        "[mod]\nid = \"cyc_b\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\ncyc_a = \"^1.0\"\n",
+    )
+    .expect("write cyc_b");
+
+    // `validate_dir_dag_for_reload` branches:
+    let target_parse_err =
+        validate_dir_dag_for_reload(&world, &mixed_dir, "bad_toml", Some(&bad_toml_path))
+            .expect_err("target manifest parse error must fail validation");
+    assert!(target_parse_err.contains(&bad_toml_path.display().to_string()));
+
+    let cycle_err = validate_dir_dag_for_reload(&world, &mixed_dir, "cyc_a", None)
+        .expect_err("cycle member must fail validation");
+    assert!(cycle_err.contains("participates in a dependency cycle"));
+
+    let unsat_err = validate_dir_dag_for_reload(&world, &mixed_dir, "unsat_dep", None)
+        .expect_err("unsatisfied dependency must fail validation");
+    assert!(unsat_err.contains("unsat_dep"));
+
+    // `sync_dir` branches:
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    let (_tx, rx) = mpsc::channel::<DebounceEventResult>();
+    let watcher = ModHotReloadWatcher::from_receiver_for_test(
+        &mixed_dir,
+        Duration::ZERO,
+        rx,
+        LoadOptions::new().with_shadow_copy(true),
+    );
+    let outcomes = watcher.sync_dir(app.world_mut());
+
+    let failed_msgs: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|o| match &o.action {
+            ModHotReloadAction::Failed(msg) => Some(msg.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        failed_msgs
+            .iter()
+            .any(|m| m.contains("bad_toml") || m.contains("TOML")),
+        "expected parse_error outcome, got {failed_msgs:?}"
+    );
+    assert!(
+        failed_msgs.iter().any(|m| m.contains("missing_mod")),
+        "expected unsatisfied dependency diagnostic, got {failed_msgs:?}"
+    );
+    assert!(
+        failed_msgs.iter().any(|m| m.contains("missing_lib")),
+        "expected missing library failure, got {failed_msgs:?}"
+    );
+    assert!(
+        failed_msgs
+            .iter()
+            .any(|m| m.contains("mod 'cascade_dep' skipped because dependency 'missing_lib'")),
+        "expected cascade skip failure, got {failed_msgs:?}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| o.path == corrupt_sub.join(&corrupt_entry)
+                && matches!(o.action, ModHotReloadAction::Failed(_))),
+        "expected corrupt binary load failure, got {outcomes:?}"
+    );
+}
+
+#[test]
+fn apply_hot_reload_events_handles_manifest_reload_leased_failure_and_delete() {
+    let temp = TempDirGuard::new("bam_manifest_reload_unit");
+    let mods_dir = temp.0.join("mods");
+    let pkg_dir = mods_dir.join("pkg");
+    let build_dir = temp.0.join("build");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg_dir");
+    std::fs::create_dir_all(&build_dir).expect("create build_dir");
+
+    let dylib_v1 = pkg_dir.join(dylib_filename("pkg_v1"));
+    let dylib_v2 = pkg_dir.join(dylib_filename("pkg_v2"));
+    if !compile_c_unit_mod(&build_dir, &dylib_v1, "pkg_mod", "1.0.0", 2) {
+        return;
+    }
+    if !compile_c_unit_mod(&build_dir, &dylib_v2, "pkg_mod", "2.0.0", 20) {
+        return;
+    }
+
+    let manifest_path = pkg_dir.join("mod.toml");
+    std::fs::write(
+        &manifest_path,
+        format!(
+            "[mod]\nid = \"pkg_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\nentry = \"{}\"\n",
+            dylib_filename("pkg_v1")
+        ),
+    )
+    .expect("write v1 mod.toml");
+
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.insert_resource(UnitCounter::default());
+    app.register_mod_resource::<UnitCounter>()
+        .expect("register UnitCounter");
+
+    let opts = LoadOptions::new().with_shadow_copy(true);
+    let sync = load_unloaded_dag_mods(app.world_mut(), &mods_dir, &opts);
+    assert_eq!(sync.outcomes.len(), 1);
+    assert_eq!(sync.outcomes[0].action, ModHotReloadAction::Loaded);
+
+    // Exercise lookup fallbacks (`find_loaded_mod_for_dylib` stem+parent and `find_loaded_mod_for_manifest_dir` dir fallback).
+    let alt_stem_path = pkg_dir.join("pkg_v1.so");
+    assert!(
+        find_loaded_mod_for_dylib(app.world(), &alt_stem_path).is_some(),
+        "stem+parent fallback should match loaded pkg_v1 mod"
+    );
+    assert!(
+        find_loaded_mod_for_manifest_dir(app.world(), &manifest_path, Some("renamed")).is_some(),
+        "dir fallback should match loaded mod when parsed_name differs"
+    );
+
+    // 1. `mod.toml` reload while `Update` is leased -> deferred + duplicate in batch ignored.
+    let leased_update = app
+        .world_mut()
+        .resource_mut::<Schedules>()
+        .remove_temporarily(Update)
+        .expect("Update schedule exists");
+    let leased_res = apply_hot_reload_events(
+        app.world_mut(),
+        &mods_dir,
+        &[manifest_path.clone(), manifest_path.clone()],
+        &[],
+        &opts,
+    );
+    assert!(leased_res.outcomes.is_empty());
+    assert_eq!(leased_res.retry_changes, vec![manifest_path.clone()]);
+    app.world_mut()
+        .resource_mut::<Schedules>()
+        .reinsert(leased_update);
+
+    // 2. Valid `mod.toml` edit switching entry to v2 + duplicate manifest + dylib in same batch.
+    std::fs::write(
+        &manifest_path,
+        format!(
+            "[mod]\nid = \"pkg_mod\"\nversion = \"2.0.0\"\nabi_version = \"^0.3.0\"\nentry = \"{}\"\n",
+            dylib_filename("pkg_v2")
+        ),
+    )
+    .expect("write v2 mod.toml");
+    let reload_res = apply_hot_reload_events(
+        app.world_mut(),
+        &mods_dir,
+        &[
+            manifest_path.clone(),
+            manifest_path.clone(),
+            dylib_v2.clone(),
+        ],
+        &[],
+        &opts,
+    );
+    assert_eq!(reload_res.outcomes.len(), 1);
+    assert_eq!(reload_res.outcomes[0].action, ModHotReloadAction::Reloaded);
+    assert_eq!(reload_res.outcomes[0].path, dylib_v2);
+
+    let before = app.world().resource::<UnitCounter>().value;
+    app.update();
+    assert_eq!(app.world().resource::<UnitCounter>().value - before, 20);
+
+    // 3. Invalid `mod.toml` edit (syntax error) -> `Failed` outcome, mod remains loaded.
+    std::fs::write(&manifest_path, "[mod]\nid = \"broken\n").expect("write broken mod.toml");
+    let syntax_err_res = apply_hot_reload_events(
+        app.world_mut(),
+        &mods_dir,
+        std::slice::from_ref(&manifest_path),
+        &[],
+        &opts,
+    );
+    assert_eq!(syntax_err_res.outcomes.len(), 1);
+    assert!(matches!(
+        syntax_err_res.outcomes[0].action,
+        ModHotReloadAction::Failed(_)
+    ));
+    assert_eq!(app.world().resource::<ModHost>().len(), 1);
+
+    // 4. `mod.toml` deletion (+ ignored non-watchable deletion) -> `Unloaded`.
+    std::fs::remove_file(&manifest_path).expect("remove mod.toml");
+    let del_res = apply_hot_reload_events(
+        app.world_mut(),
+        &mods_dir,
+        &[],
+        &[mods_dir.join("README.md"), manifest_path.clone()],
+        &opts,
+    );
+    assert_eq!(del_res.outcomes.len(), 1);
+    assert_eq!(del_res.outcomes[0].action, ModHotReloadAction::Unloaded);
+    assert!(app.world().resource::<ModHost>().is_empty());
+
+    // 5. Re-load v2, then point `mod.toml` to corrupt binary -> `reload_mod_from` failure (`Failed`).
+    std::fs::write(
+        &manifest_path,
+        format!(
+            "[mod]\nid = \"pkg_mod\"\nversion = \"2.0.0\"\nabi_version = \"^0.3.0\"\nentry = \"{}\"\n",
+            dylib_filename("pkg_v2")
+        ),
+    )
+    .expect("restore v2 mod.toml");
+    let reload_sync = load_unloaded_dag_mods(app.world_mut(), &mods_dir, &opts);
+    assert_eq!(reload_sync.outcomes.len(), 1);
+    assert_eq!(reload_sync.outcomes[0].action, ModHotReloadAction::Loaded);
+
+    let corrupt_name = dylib_filename("corrupt_v3");
+    std::fs::write(pkg_dir.join(&corrupt_name), b"not_a_dylib").expect("write corrupt dylib");
+    std::fs::write(
+        &manifest_path,
+        format!(
+            "[mod]\nid = \"pkg_mod\"\nversion = \"3.0.0\"\nabi_version = \"^0.3.0\"\nentry = \"{corrupt_name}\"\n"
+        ),
+    )
+    .expect("write v3 corrupt mod.toml");
+    let corrupt_reload = apply_hot_reload_events(
+        app.world_mut(),
+        &mods_dir,
+        std::slice::from_ref(&manifest_path),
+        &[],
+        &opts,
+    );
+    assert!(!corrupt_reload.outcomes.is_empty());
+    assert!(
+        corrupt_reload
+            .outcomes
+            .iter()
+            .all(|o| matches!(o.action, ModHotReloadAction::Failed(_)))
+    );
+}
+
+#[test]
+fn apply_hot_reload_events_handles_corrupt_dylib_and_sidecar_dag_errors() {
+    let temp = TempDirGuard::new("bam_corrupt_dylib_events");
+    let mods_dir = temp.0.join("mods");
+    let ext_dir = temp.0.join("external");
+    let sub_a = mods_dir.join("sidecar_a");
+    let sub_b = mods_dir.join("sidecar_b");
+    let build_dir = temp.0.join("build");
+    for d in [&mods_dir, &ext_dir, &sub_a, &sub_b, &build_dir] {
+        std::fs::create_dir_all(d).expect("create dir");
+    }
+
+    let opts = LoadOptions::new().with_shadow_copy(true);
+
+    // Pure-Rust: corrupt standalone dylib + duplicate canonical path in same batch.
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.insert_resource(UnitCounter::default());
+    app.register_mod_resource::<UnitCounter>()
+        .expect("register UnitCounter");
+
+    let corrupt_standalone = mods_dir.join(dylib_filename("corrupt_standalone"));
+    std::fs::write(&corrupt_standalone, b"not_a_dylib").expect("write corrupt standalone");
+    let dup_standalone = sub_a.join("..").join(dylib_filename("corrupt_standalone"));
+    let standalone_err = apply_hot_reload_events(
+        app.world_mut(),
+        &mods_dir,
+        &[corrupt_standalone, dup_standalone],
+        &[],
+        &opts,
+    );
+    assert_eq!(
+        standalone_err.outcomes.len(),
+        1,
+        "duplicate canonical standalone path in same batch must deduplicate"
+    );
+    assert!(matches!(
+        standalone_err.outcomes[0].action,
+        ModHotReloadAction::Failed(_)
+    ));
+
+    // C-compiled branches: external loaded mod in `validate_dir_dag_for_reload`,
+    // duplicate standalone load, sidecar DAG failure on dylib change, and corrupt dylib replacement.
+    let ext_dylib = ext_dir.join(dylib_filename("ext_dep"));
+    if !compile_c_unit_mod(&build_dir, &ext_dylib, "ext_dep", "1.0.0", 1) {
+        return;
+    }
+    let a_dylib = sub_a.join(dylib_filename("sidecar_a"));
+    if !compile_c_unit_mod(&build_dir, &a_dylib, "sidecar_a", "1.0.0", 2) {
+        return;
+    }
+    let standalone_ok = mods_dir.join(dylib_filename("standalone_ok"));
+    if !compile_c_unit_mod(&build_dir, &standalone_ok, "standalone_ok", "1.0.0", 3) {
+        return;
+    }
+
+    // Load external mod outside `watch_dir` so `validate_dir_dag_for_reload` populates `external_loaded`.
+    app.world_mut()
+        .load_mod_with(&ext_dylib, opts.clone())
+        .expect("load ext_dep");
+
+    // Duplicate standalone valid dylib in one batch: first loads, second hits `find_loaded_mod_for_dylib`.
+    let dup_load = apply_hot_reload_events(
+        app.world_mut(),
+        &mods_dir,
+        &[standalone_ok.clone(), standalone_ok],
+        &[],
+        &opts,
+    );
+    assert_eq!(dup_load.outcomes.len(), 1);
+    assert_eq!(dup_load.outcomes[0].action, ModHotReloadAction::Loaded);
+
+    // Load `sidecar_a` depending on `ext_dep`.
+    let a_toml = sub_a.join("mod.toml");
+    std::fs::write(
+        &a_toml,
+        "[mod]\nid = \"sidecar_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\next_dep = \"^1.0\"\n",
+    )
+    .expect("write sidecar_a mod.toml");
+    let sync_a = load_unloaded_dag_mods(app.world_mut(), &mods_dir, &opts);
+    assert_eq!(sync_a.outcomes.len(), 1);
+    assert_eq!(sync_a.outcomes[0].action, ModHotReloadAction::Loaded);
+    assert!(
+        validate_dir_dag_for_reload(app.world(), &mods_dir, "sidecar_a", Some(&a_toml)).is_ok(),
+        "external loaded mod must satisfy dependency in validate_dir_dag_for_reload"
+    );
+
+    // Introduce cycle in sidecar `mod.toml` files and deliver `.dylib` change -> `validate_dir_dag_for_reload` fails.
+    std::fs::write(
+        &a_toml,
+        "[mod]\nid = \"sidecar_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nsidecar_b = \"^1.0\"\n",
+    )
+    .expect("write cyclic sidecar_a");
+    std::fs::write(
+        sub_b.join("mod.toml"),
+        "[mod]\nid = \"sidecar_b\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nsidecar_a = \"^1.0\"\n",
+    )
+    .expect("write cyclic sidecar_b");
+    let sidecar_fail = apply_hot_reload_events(
+        app.world_mut(),
+        &mods_dir,
+        std::slice::from_ref(&a_dylib),
+        &[],
+        &opts,
+    );
+    assert_eq!(sidecar_fail.outcomes.len(), 1);
+    assert!(matches!(
+        sidecar_fail.outcomes[0].action,
+        ModHotReloadAction::Failed(_)
+    ));
+
+    // Remove cycle, overwrite `a_dylib` with corrupt bytes, and deliver `.dylib` change -> `reload_mod_from` fails.
+    let _ = std::fs::remove_file(sub_b.join("mod.toml"));
+    std::fs::write(
+        &a_toml,
+        "[mod]\nid = \"sidecar_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n",
+    )
+    .expect("restore valid sidecar_a");
+    std::fs::write(&a_dylib, b"corrupt_replacement_dylib").expect("overwrite a_dylib");
+    let dylib_fail = apply_hot_reload_events(app.world_mut(), &mods_dir, &[a_dylib], &[], &opts);
+    assert_eq!(dylib_fail.outcomes.len(), 1);
+    assert!(matches!(
+        dylib_fail.outcomes[0].action,
+        ModHotReloadAction::Failed(_)
+    ));
+}

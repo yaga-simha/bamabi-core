@@ -58,9 +58,9 @@ impl TempCdylibCrate {
                     && root.join("crates/bamabi_sys/Cargo.toml").is_file()
             })
             .or_else(|| {
-                workspace_root
-                    .parent()
-                    .map(|p| p.join("bamabi-wire"))
+                crate::support::sibling_wire_requested(workspace_root)
+                    .then(|| workspace_root.parent().map(|p| p.join("bamabi-wire")))
+                    .flatten()
                     .filter(|root| {
                         root.join("crates/bamabi_guest/Cargo.toml").is_file()
                             && root.join("crates/bamabi_sys/Cargo.toml").is_file()

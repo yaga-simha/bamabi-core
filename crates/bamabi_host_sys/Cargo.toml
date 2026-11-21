@@ -19,6 +19,7 @@ strict-ffi-checks = []
 test-utils = []
 diagnostics = []
 signature-verification = ["dep:bamabi_trust"]
+keygen = ["signature-verification", "bamabi_trust/keygen"]
 bridge-reflect = ["dep:bevy_reflect", "bevy_ecs/bevy_reflect"]
 
 [dependencies]

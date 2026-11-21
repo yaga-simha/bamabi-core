@@ -45,4 +45,9 @@ pub use signing::{
     sign_mod_bytes_with_openssh_certificate, ssh_key, validate_bampack_entry_path,
     zeroed_binary_for_bam_sig,
 };
+#[cfg(feature = "keygen")]
+pub use signing::{
+    GeneratedKeypair, IssuedCertificate, generate_ed25519_keypair,
+    issue_ed25519_certificate_openssh, keygen, write_openssh_keypair,
+};
 pub use symbols::{BamSymbolTable, ModNamedObjects, ensure_symbol_tables_in_world};

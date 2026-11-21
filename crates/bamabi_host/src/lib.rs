@@ -20,6 +20,10 @@
 //! - `diagnostics`: Publishes per-mod and aggregate `bevy_diagnostic` counters.
 //! - `signature-verification`: Pure-Rust OpenSSH `SSHSIG` + Ed25519 CA certificate verification
 //!   of shared libraries prior to `dlopen` / `LoadLibraryW` (`ModTrustPolicy`, `VerifiedModSignature`).
+//! - `keygen`: Implies `signature-verification` and enables pure-Rust Ed25519 OpenSSH keypair
+//!   generation and certificate issuance (`generate_ed25519_keypair`,
+//!   `issue_ed25519_certificate_openssh`, `write_openssh_keypair`, `GeneratedKeypair`,
+//!   `IssuedCertificate`, `keygen`).
 //!
 //! # Quickstart
 //!
@@ -95,6 +99,11 @@ pub use bamabi_host_sys::{
     inspect_library_residency, inspect_library_residency_file, is_abi_version_compatible,
     read_entity_pod_bytes, write_entity_pod_bytes,
 };
+#[cfg(feature = "keygen")]
+pub use bamabi_host_sys::{
+    GeneratedKeypair, IssuedCertificate, generate_ed25519_keypair,
+    issue_ed25519_certificate_openssh, keygen, write_openssh_keypair,
+};
 pub use budgets::{
     DEFAULT_BUDGET_WINDOW_SIZE, DEFAULT_MAX_CONSECUTIVE_BREACHES, ModBudgetBreach,
     ModBudgetBreachKind, ModBudgetExt, ModBudgetLimits, ModBudgetPolicy, ModBudgetSnapshot,
@@ -159,6 +168,11 @@ pub mod prelude {
         SignatureVerificationError, default_signature_path_for, preverify_mod_on_disk,
         sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
         sign_mod_bytes_with_openssh_certificate,
+    };
+    #[cfg(feature = "keygen")]
+    pub use crate::{
+        GeneratedKeypair, IssuedCertificate, generate_ed25519_keypair,
+        issue_ed25519_certificate_openssh, write_openssh_keypair,
     };
     pub use bamabi_sys::{
         ABI_VERSION, AccessMode, BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_LOG_DEBUG, BAM_LOG_ERROR,

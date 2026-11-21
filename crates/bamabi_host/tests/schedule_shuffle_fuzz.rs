@@ -1051,6 +1051,39 @@ mod logic {
 bamabi_guest::export_mod!(name: c"mod_e_reduce", version: c"0.3.0", logic::build);
 "#;
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn sibling_wire_overlay_active(workspace_root: &Path) -> bool {
+    let Some(parent) = workspace_root.parent() else {
+        return false;
+    };
+    let Ok(contents) = fs::read_to_string(parent.join(".cargo").join("config.toml")) else {
+        return false;
+    };
+    let mut in_wire_patch_section = false;
+    for raw_line in contents.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_wire_patch_section = line.contains("patch.") && line.contains("bamabi-wire");
+            continue;
+        }
+        if in_wire_patch_section && line.contains('=') {
+            return true;
+        }
+        if line.contains("path") && line.contains("bamabi-wire") {
+            return true;
+        }
+    }
+    false
+}
+
 fn build_five_dag_mods() -> BuiltDagMods {
     static NEXT_WORKSPACE_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = NEXT_WORKSPACE_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1066,13 +1099,14 @@ fn build_five_dag_mods() -> BuiltDagMods {
                 && root.join("crates/bamabi_sys/Cargo.toml").is_file()
         })
         .or_else(|| {
-            workspace_root
-                .parent()
-                .map(|p| p.join("bamabi-wire"))
-                .filter(|root| {
-                    root.join("crates/bamabi_guest/Cargo.toml").is_file()
-                        && root.join("crates/bamabi_sys/Cargo.toml").is_file()
-                })
+            (env_flag_enabled("BAM_USE_SIBLING_WIRE")
+                || sibling_wire_overlay_active(workspace_root))
+            .then(|| workspace_root.parent().map(|p| p.join("bamabi-wire")))
+            .flatten()
+            .filter(|root| {
+                root.join("crates/bamabi_guest/Cargo.toml").is_file()
+                    && root.join("crates/bamabi_sys/Cargo.toml").is_file()
+            })
         });
     let deps_block = if let Some(wire_root) = wire_root {
         let guest_path = wire_root.join("crates").join("bamabi_guest");

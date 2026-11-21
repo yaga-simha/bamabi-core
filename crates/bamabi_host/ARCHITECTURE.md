@@ -10,13 +10,23 @@
 2. **Strict Headless Bevy Dependencies:** [`Cargo.toml`](Cargo.toml) permits only `bevy_ecs`, `bevy_app`, `bevy_platform`, and optional `bevy_diagnostic` (`diagnostics`), plus `bamabi_sys`, `bamabi_manifest`, `bamabi_host_sys`, `bamabi_macros`, `toml`, `semver`, and `tracing`. It **never** pulls in `bevy_render`, `bevy_reflect`, `bevy_scene`, `bevy_asset`, `bevy_winit`, `bevy_window`, `wgpu`, or `notify`.
 3. **Zero Non-Test Panics & Companion Decoupling:** `src/` keeps non-test `.unwrap()`, `.expect()`, `panic!`, `unreachable!`, `todo!`, and `#[allow(...)]` at zero. Rendering, reflection, assets, scenes, and file watching plug in externally through `ModUnloadHooks` and `bamabi_host_sys` traits.
 
+### Feature Flags
+
+| Feature | Dependencies Enabled | Purpose |
+|---|---|---|
+| `strict-ffi-checks` | `bamabi_host_sys/strict-ffi-checks` | Enables hot-path FFI handle magic/generation validation even in release builds. |
+| `test-utils` | `bamabi_host_sys/test-utils` | Exposes mock `LoadedMod` registration helpers for test crates. |
+| `diagnostics` | `bamabi_host_sys/diagnostics`, `dep:bevy_diagnostic` | Publishes per-mod and aggregate `bamabi/*` metrics to Bevy `DiagnosticsStore`. |
+| `signature-verification` | `bamabi_host_sys/signature-verification` | Enables pre-`dlopen` `.sig` / `.bam_sig` / `.bampack` / `SSHKRL` verification without enabling `bamabi_trust/keygen` (`ssh-key/getrandom`). |
+| `keygen` | `signature-verification`, `bamabi_host_sys/keygen` | Opt-in feature exposing OpenSSH Ed25519 keypair generation and certificate issuance (`keygen` module at crate root, plus `GeneratedKeypair`, `IssuedCertificate`, `generate_ed25519_keypair`, `issue_ed25519_certificate_openssh`, and `write_openssh_keypair` at crate root and `prelude`). |
+
 ---
 
 ## 2. Module-by-Module Map
 
 | Module | Path | Contents |
 |---|---|---|
-| **Crate root** | [`src/lib.rs`](src/lib.rs) | `#![forbid(unsafe_code)]`, flat re-exports of host APIs + `bamabi_host_sys` types + `signature-verification` trust items, and `prelude`. |
+| **Crate root** | [`src/lib.rs`](src/lib.rs) | `#![forbid(unsafe_code)]`, flat re-exports of host APIs + `bamabi_host_sys` types + `signature-verification` & `keygen` trust items, and `prelude`. |
 | **Plugin & Flush** | [`src/plugin.rs`](src/plugin.rs) | `AbiModPlugin`, `ConfiguredAbiModPlugin`, `ModLifecycleFlush`, `ensure_mod_lifecycle_flush_schedule`, `ensure_startup_tracker`. |
 | **App extension** | [`src/app_ext.rs`](src/app_ext.rs) | `ModAppExt` ergonomic `App` wrapper delegating to `ModWorldExt` (plus `compile_fail` doctest proving `ResMut<ModHost>` cannot unload). |
 | **World extension** | [`src/world_ext.rs`](src/world_ext.rs) | `ModWorldExt`, `ModUnloadHookFn`, `ModUnloadHooks`, `register_mod_unload_hook_in_world`, `load_mod*`, `unload_mod`, `unload_all_mods`, `reload_mod*`, `load_mods_dir*`, `evict_revoked_mods`. |
@@ -74,7 +84,7 @@ While Bevy executes a schedule (e.g. `Update`, `FixedUpdate`, `PreUpdate`, `Last
 
 ### 3.3 Trust Parity & `keygen` Gate
 
-With `--features signature-verification`, [`src/lib.rs`](src/lib.rs) re-exports `ModTrustPolicy`, `VerifiedModSignature`, `KrlBuilder`, `BamPackBuilder`, `VerifiedBamPack`, `BamPackExtractLimits`, `BamPackExtractError`, `bampack`, `embedded_sig`, `ssh_key`, `LineEnding`, `Algorithm`, `Certificate`, `Fingerprint`, `HashAlg`, `PrivateKey`, `PublicKey`, and signing/verification helpers from `bamabi_host_sys`. Note that `bamabi_trust::keygen` items remain upstream-gated because `bamabi_host_sys/signature-verification` does not enable `bamabi_trust/keygen` (`ssh-key/getrandom`).
+With `--features signature-verification`, [`src/lib.rs`](src/lib.rs) re-exports `ModTrustPolicy`, `VerifiedModSignature`, `KrlBuilder`, `BamPackBuilder`, `VerifiedBamPack`, `BamPackExtractLimits`, `BamPackExtractError`, `bampack`, `embedded_sig`, `ssh_key`, `LineEnding`, `Algorithm`, `Certificate`, `Fingerprint`, `HashAlg`, `PrivateKey`, `PublicKey`, and signing/verification helpers from `bamabi_host_sys` without pulling in `ssh-key/getrandom`. Enabling opt-in `--features keygen` (`["signature-verification", "bamabi_host_sys/keygen"]`) additionally exposes `GeneratedKeypair`, `IssuedCertificate`, `generate_ed25519_keypair`, `issue_ed25519_certificate_openssh`, and `write_openssh_keypair` in both the crate root and `prelude` (plus the `keygen` module at the crate root).
 
 ---
 

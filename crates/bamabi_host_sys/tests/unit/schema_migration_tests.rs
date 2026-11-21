@@ -282,6 +282,371 @@ fn snapshot_migrate_and_restore_v1_to_v2_under_miri() {
 }
 
 #[test]
+fn resource_reload_reuses_existing_is_resource_entity_under_miri() {
+    let _serial = crate::drop_trampoline::TEST_DROP_SLAB_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    static RES_V1_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static RES_V2_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Clone, Default)]
+    struct ResDropV1;
+    impl Drop for ResDropV1 {
+        fn drop(&mut self) {
+            RES_V1_DROPS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ResDropV2;
+    impl Drop for ResDropV2 {
+        fn drop(&mut self) {
+            RES_V2_DROPS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone, Default, ModComponent)]
+    #[mod_component(name = "sim::DynStateRes")]
+    struct ResV1 {
+        hp: i32,
+        tag: String,
+        scores: Vec<u32>,
+        legacy: u64,
+        #[mod_field(skip)]
+        _probe: ResDropV1,
+    }
+
+    #[derive(Clone, ModComponent)]
+    #[mod_component(name = "sim::DynStateRes")]
+    struct ResV2 {
+        shield: f32,
+        scores: Vec<u32>,
+        hp: i64,
+        tag: String,
+        #[mod_field(skip)]
+        _probe: ResDropV2,
+    }
+
+    impl Default for ResV2 {
+        fn default() -> Self {
+            Self {
+                shield: 9.5,
+                scores: Vec::new(),
+                hp: 0,
+                tag: String::new(),
+                _probe: ResDropV2,
+            }
+        }
+    }
+
+    unsafe extern "C" fn drop_v1(ptr: *mut c_void) {
+        // SAFETY: `ptr` points to a live aligned `ResV1`.
+        unsafe { core::ptr::drop_in_place(ptr.cast::<ResV1>()) };
+    }
+    unsafe extern "C" fn drop_v2(ptr: *mut c_void) {
+        // SAFETY: `ptr` points to a live aligned `ResV2`.
+        unsafe { core::ptr::drop_in_place(ptr.cast::<ResV2>()) };
+    }
+    unsafe extern "C" fn init_v2(dst: *mut c_void) -> FfiResult {
+        // SAFETY: `dst` points to writable `ResV2`-aligned storage.
+        unsafe { core::ptr::write(dst.cast::<ResV2>(), ResV2::default()) };
+        FfiResult::OK
+    }
+    unsafe extern "C" fn noop_shutdown(_inst: *mut BamInstance) {}
+    unsafe extern "C" fn resolve_v1(
+        _inst: *const BamInstance,
+        name: *const c_char,
+    ) -> *const c_void {
+        // SAFETY: `name` is a NUL-terminated C string.
+        let Ok(s) = (unsafe { CStr::from_ptr(name) }).to_str() else {
+            return core::ptr::null();
+        };
+        ResV1::resolve_symbol(s).unwrap_or(core::ptr::null())
+    }
+    unsafe extern "C" fn resolve_v2(
+        _inst: *const BamInstance,
+        name: *const c_char,
+    ) -> *const c_void {
+        // SAFETY: `name` is a NUL-terminated C string.
+        let Ok(s) = (unsafe { CStr::from_ptr(name) }).to_str() else {
+            return core::ptr::null();
+        };
+        if s == "bam.v0.sim::DynStateRes.init_default" {
+            return init_v2 as *const c_void;
+        }
+        ResV2::resolve_symbol(s).unwrap_or(core::ptr::null())
+    }
+
+    let is_res_entities_for = |world: &mut World, cid: ComponentId| -> Vec<Entity> {
+        let mut q = world.query::<(Entity, &IsResource)>();
+        q.iter(world)
+            .filter(|(_, r)| r.resource_component_id() == cid)
+            .map(|(e, _)| e)
+            .collect()
+    };
+
+    RES_V1_DROPS.store(0, Ordering::SeqCst);
+    RES_V2_DROPS.store(0, Ordering::SeqCst);
+
+    let mut world = World::new();
+    world.insert_resource(WorldDropGuard::new());
+    world.insert_resource(ModHost::new());
+    world.insert_resource(ModRegistry::new());
+    world.insert_resource(ModQuarantine::new());
+
+    let old_active = Arc::new(AtomicBool::new(true));
+    let old_id = LoadedMod::register_mock_for_test(
+        &mut world,
+        "sim_res_mod",
+        Arc::clone(&old_active),
+        noop_shutdown,
+        Some(resolve_v1),
+        core::ptr::null_mut(),
+    );
+    let mut old_handle = BamComponent::INVALID;
+    {
+        let reg = world.resource::<ModRegistry>().clone();
+        let world_ptr = &raw mut world;
+        let mut load_ctx =
+            LoadContext::with_world_and_mod_id(reg, old_active, world_ptr, Some(old_id));
+        let desc = ComponentDesc::new(
+            ResV1::COMPONENT_CSTR.as_ptr(),
+            ResV1::UUID,
+            core::mem::size_of::<ResV1>(),
+            core::mem::align_of::<ResV1>(),
+        )
+        .with_drop(drop_v1)
+        .with_vtable(ResV1::erased_vtable_ptr());
+        let rc_v1 =
+            // SAFETY: `load_ctx`, `desc`, and `&mut old_handle` are valid for this test registration.
+            unsafe {
+                host_register_component(
+                    load_ctx.as_ffi_ptr(),
+                    &raw const desc,
+                    &raw mut old_handle,
+                )
+            };
+        assert_eq!(rc_v1, FfiResult::OK);
+        world.insert_resource(load_ctx.registry.clone());
+        load_ctx.finish_init();
+    }
+
+    let (res_v1_cid, v1_drop_slot) = {
+        let mut reg = world.resource_mut::<ModRegistry>();
+        let mut reg_snap = (*reg.snapshot_arc()).clone();
+        let idx = (old_handle.0 - 1) as usize;
+        reg_snap.entries[idx].storage_flags |= BAM_STORAGE_FLAG_RESOURCE;
+        let cid = reg_snap.entries[idx].component_id;
+        let slot = reg_snap.entries[idx].drop_slot.expect("v1 drop slot");
+        reg.restore_snapshot(Arc::new(reg_snap));
+        (cid, slot)
+    };
+
+    let v1_ent = world.spawn(IsResource::new(res_v1_cid)).id();
+    // SAFETY: `res_v1_cid` has exact `ResV1` layout.
+    unsafe {
+        OwningPtr::make(
+            ResV1 {
+                hp: -11,
+                tag: String::from("res_v1"),
+                scores: vec![10, 20, 30],
+                legacy: 777,
+                _probe: ResDropV1,
+            },
+            |ptr| {
+                world.entity_mut(v1_ent).insert_by_id(res_v1_cid, ptr);
+            },
+        );
+    }
+    assert_eq!(
+        crate::drop_trampoline::drop_slot_live_values(v1_drop_slot),
+        Some(1)
+    );
+
+    // Snapshot V1 resource and unload old mod for reload.
+    let snap =
+        snapshot_mod_dynamic_columns_for_reload(&mut world, old_id).expect("snapshot succeeds");
+    assert_eq!(RES_V1_DROPS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        crate::drop_trampoline::drop_slot_live_values(v1_drop_slot),
+        Some(0)
+    );
+    assert!(!world.contains_resource_by_id(res_v1_cid));
+
+    excise_and_unload_mod_for_reload_in_world(&mut world, old_id, |_| {})
+        .expect("unload for reload succeeds");
+
+    // Register V2 with evolved layout.
+    let new_active = Arc::new(AtomicBool::new(true));
+    let new_id = LoadedMod::register_mock_for_test(
+        &mut world,
+        "sim_res_mod",
+        Arc::clone(&new_active),
+        noop_shutdown,
+        Some(resolve_v2),
+        core::ptr::null_mut(),
+    );
+    let mut new_handle = BamComponent::INVALID;
+    {
+        let reg = world.resource::<ModRegistry>().clone();
+        let world_ptr = &raw mut world;
+        let mut load_ctx =
+            LoadContext::with_world_and_mod_id(reg, new_active, world_ptr, Some(new_id));
+        let desc = ComponentDesc::new(
+            ResV2::COMPONENT_CSTR.as_ptr(),
+            ResV2::UUID,
+            core::mem::size_of::<ResV2>(),
+            core::mem::align_of::<ResV2>(),
+        )
+        .with_drop(drop_v2)
+        .with_vtable(ResV2::erased_vtable_ptr());
+        let rc_v2 =
+            // SAFETY: `load_ctx`, `desc`, and `&mut new_handle` are valid for this test registration.
+            unsafe {
+                host_register_component(
+                    load_ctx.as_ffi_ptr(),
+                    &raw const desc,
+                    &raw mut new_handle,
+                )
+            };
+        assert_eq!(rc_v2, FfiResult::OK);
+        world.insert_resource(load_ctx.registry.clone());
+        load_ctx.finish_init();
+    }
+
+    let (res_v2_cid, v2_drop_slot) = {
+        let mut reg = world.resource_mut::<ModRegistry>();
+        let mut reg_snap = (*reg.snapshot_arc()).clone();
+        let idx = (new_handle.0 - 1) as usize;
+        reg_snap.entries[idx].storage_flags |= BAM_STORAGE_FLAG_RESOURCE;
+        let cid = reg_snap.entries[idx].component_id;
+        let slot = reg_snap.entries[idx].drop_slot.expect("v2 drop slot");
+        reg.restore_snapshot(Arc::new(reg_snap));
+        (cid, slot)
+    };
+
+    // Case A: V2 init pre-inserted a default resource before `restore_mod_dynamic_columns_after_reload`
+    // (`contains_resource_by_id == true` and `resource_entities().get(res_v2_cid) == Some(pre_ent)`).
+    let pre_ent = world.spawn(IsResource::new(res_v2_cid)).id();
+    // SAFETY: `res_v2_cid` has exact `ResV2` layout.
+    unsafe {
+        OwningPtr::make(
+            ResV2 {
+                shield: 1.0,
+                scores: vec![],
+                hp: 999,
+                tag: String::from("pre_init"),
+                _probe: ResDropV2,
+            },
+            |ptr| {
+                world.entity_mut(pre_ent).insert_by_id(res_v2_cid, ptr);
+            },
+        );
+    }
+    assert!(world.contains_resource_by_id(res_v2_cid));
+    assert_eq!(world.resource_entities().get(res_v2_cid), Some(pre_ent));
+    assert_eq!(
+        crate::drop_trampoline::drop_slot_live_values(v2_drop_slot),
+        Some(1)
+    );
+
+    restore_mod_dynamic_columns_after_reload(&mut world, new_id, snap.clone())
+        .expect("restore V2 resource over pre-existing resource succeeds");
+
+    // Pre-existing V2 value dropped once; migrated V2 value is live on `pre_ent`.
+    assert_eq!(RES_V2_DROPS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        crate::drop_trampoline::drop_slot_live_values(v2_drop_slot),
+        Some(1)
+    );
+    assert_eq!(is_res_entities_for(&mut world, res_v2_cid), vec![pre_ent]);
+    assert_eq!(world.resource_entities().get(res_v2_cid), Some(pre_ent));
+    assert!(world.contains_resource_by_id(res_v2_cid));
+    {
+        let ptr = world
+            .get_resource_by_id(res_v2_cid)
+            .expect("restored resource must be readable before world.flush()");
+        // SAFETY: `res_v2_cid` holds live `ResV2`.
+        let val = unsafe { ptr.deref::<ResV2>() };
+        assert_eq!(val.hp, -11i64);
+        assert!((val.shield - 9.5).abs() < f32::EPSILON);
+        assert_eq!(val.tag, "res_v1");
+        assert_eq!(val.scores, vec![10, 20, 30]);
+    }
+
+    // Flush deferred commands (previously triggered `IsResource::on_insert` deferred removal!).
+    world.flush();
+    assert_eq!(RES_V2_DROPS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        crate::drop_trampoline::drop_slot_live_values(v2_drop_slot),
+        Some(1)
+    );
+    assert_eq!(is_res_entities_for(&mut world, res_v2_cid), vec![pre_ent]);
+    assert!(world.contains_resource_by_id(res_v2_cid));
+    {
+        let ptr = world
+            .get_resource_by_id(res_v2_cid)
+            .expect("restored resource must remain readable after world.flush()");
+        // SAFETY: `res_v2_cid` holds live `ResV2`.
+        let val = unsafe { ptr.deref::<ResV2>() };
+        assert_eq!(val.hp, -11i64);
+        assert!((val.shield - 9.5).abs() < f32::EPSILON);
+        assert_eq!(val.tag, "res_v1");
+        assert_eq!(val.scores, vec![10, 20, 30]);
+    }
+
+    // Case B: post-`remove_resource_by_id` where `contains_resource_by_id == false` while
+    // `resource_entities().get(res_v2_cid) == Some(pre_ent)` still holds the canonical entity.
+    assert!(world.remove_resource_by_id(res_v2_cid));
+    assert_eq!(RES_V2_DROPS.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        crate::drop_trampoline::drop_slot_live_values(v2_drop_slot),
+        Some(0)
+    );
+    assert!(!world.contains_resource_by_id(res_v2_cid));
+    assert_eq!(world.resource_entities().get(res_v2_cid), Some(pre_ent));
+
+    restore_mod_dynamic_columns_after_reload(&mut world, new_id, snap)
+        .expect("restore V2 resource onto removed-but-registered resource entity succeeds");
+    assert_eq!(RES_V2_DROPS.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        crate::drop_trampoline::drop_slot_live_values(v2_drop_slot),
+        Some(1)
+    );
+    assert_eq!(is_res_entities_for(&mut world, res_v2_cid), vec![pre_ent]);
+    assert!(world.get_resource_by_id(res_v2_cid).is_some());
+
+    world.flush();
+    assert_eq!(RES_V2_DROPS.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        crate::drop_trampoline::drop_slot_live_values(v2_drop_slot),
+        Some(1)
+    );
+    assert_eq!(is_res_entities_for(&mut world, res_v2_cid), vec![pre_ent]);
+    {
+        let ptr = world
+            .get_resource_by_id(res_v2_cid)
+            .expect("restored resource remains readable after second world.flush()");
+        // SAFETY: `res_v2_cid` holds live `ResV2`.
+        let val = unsafe { ptr.deref::<ResV2>() };
+        assert_eq!(val.hp, -11i64);
+        assert!((val.shield - 9.5).abs() < f32::EPSILON);
+        assert_eq!(val.tag, "res_v1");
+        assert_eq!(val.scores, vec![10, 20, 30]);
+    }
+
+    // Final unload drops the live V2 resource cleanly with zero leaked drop slots.
+    crate::loader::mod_host::excise_and_unload_mod_in_world(&mut world, new_id, |_| {})
+        .expect("permanent unload succeeds");
+    assert_eq!(RES_V2_DROPS.load(Ordering::SeqCst), 3);
+    assert!(!world.contains_resource_by_id(res_v2_cid));
+    assert!(
+        crate::drop_trampoline::drop_slot_live_values(v2_drop_slot) == Some(0)
+            || crate::drop_trampoline::drop_slot_live_values(v2_drop_slot).is_none()
+    );
+}
+
+#[test]
 fn zero_copy_fingerprint_retention_reload_under_miri() {
     static EXPORT_CALLS: AtomicUsize = AtomicUsize::new(0);
 

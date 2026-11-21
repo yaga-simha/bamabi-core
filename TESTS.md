@@ -24,7 +24,7 @@ MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bamabi_host_sys --li
 cargo bench -p bamabi_host --bench chunk_throughput -- --test
 cargo bench -p bamabi_host --bench v03_subsystem_bench -- --test
 cargo llvm-cov --no-report --all-features -p bamabi_host_sys -p bamabi_host -p bamabi_watcher
-cargo llvm-cov report --ignore-filename-regex '(crates/bamabi_watcher/|(tests|examples|xtask|benches)/|\.cargo/)' --fail-under-lines 85
+cargo llvm-cov report --ignore-filename-regex '(tests|examples|xtask|benches)/|\.cargo/' --fail-under-lines 85
 ```
 
 ---
@@ -46,21 +46,22 @@ cargo llvm-cov report --ignore-filename-regex '(crates/bamabi_watcher/|(tests|ex
    ```bash
    cargo clippy --workspace --all-targets -- -D warnings
    cargo clippy -p bamabi_host_sys -p bamabi_host --features signature-verification --all-targets -- -D warnings
+   cargo clippy -p bamabi_host_sys -p bamabi_host --features keygen --all-targets -- -D warnings
    cargo clippy -p bamabi_host_sys --features bridge-reflect --all-targets -- -D warnings
    cargo clippy --workspace --all-targets --all-features -- -D warnings
    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
    ```
 
-### Tier 2: Complete Test Inventory per Crate (`439` total tests with `--all-features`)
+### Tier 2: Complete Test Inventory per Crate (`446` total tests with `--all-features`, `417` default)
 
-No tests in `bamabi-core` carry `#[ignore]`; optional tests gate on `--features signature-verification` or `--features diagnostics`, and [`soak_10k_reloads`](crates/bamabi_host/tests/soak_10k_reloads.rs) scales its iteration count via `BAM_SOAK_CYCLES` (`250` default, `10000` in CI Linux `--release`).
+No tests in `bamabi-core` carry `#[ignore]`; optional tests gate on `--features signature-verification`, `--features keygen`, `--features diagnostics`, or `--features bridge-reflect`, and [`soak_10k_reloads`](crates/bamabi_host/tests/soak_10k_reloads.rs) scales its iteration count via `BAM_SOAK_CYCLES` (`250` default, `10000` in CI Linux `--release`).
 
-#### `bamabi_host_sys` (`149` tests — [`crates/bamabi_host_sys/TESTS.md`](crates/bamabi_host_sys/TESTS.md))
+#### `bamabi_host_sys` (`151` tests — [`crates/bamabi_host_sys/TESTS.md`](crates/bamabi_host_sys/TESTS.md))
 
 | Suite / Binary | Command | Tests | Scope |
 |---|---|---|---|
-| **Unit (`--lib`)** (`27` files in `tests/unit/`) | `cargo test -p bamabi_host_sys --lib --all-features` | `102` | `drop_trampoline`, `ffi/*` (incl. `validation` reflection pool), `registry/*`, `schedule`, `system/*`, `loader/*` (incl. `shared_lib` `proptest` fuzzers & `signing` parity) |
+| **Unit (`--lib`)** (`27` files in `tests/unit/`) | `cargo test -p bamabi_host_sys --lib --all-features` | `104` | `drop_trampoline`, `ffi/*` (incl. `validation` reflection pool), `registry/*`, `schedule`, `system/*`, `loader/*` (incl. `schema_migration` `IsResource` reload test, `shared_lib` `proptest` fuzzers & `signing` / `keygen` parity) |
 | `ffi_v03_coverage` | `cargo test -p bamabi_host_sys --test ffi_v03_coverage --all-features` | `7` | Exhaustive ABI `0.3.0`, `assets_scene`, `commands*`, `iter*`, `observers_ext`, `hierarchy_ext`, `system/*` edge paths |
 | `host_sys_integration_tests` | `cargo test -p bamabi_host_sys --test host_sys_integration_tests --all-features` | `10` | World-scoped `last_error` & symbols, handle poisoning, `WorldDropGuard`, `SparseSet`, `thiserror` chains |
 | `loom_drop_trampoline` | `cargo test -p bamabi_host_sys --test loom_drop_trampoline --release` | `3` | Exhaustive atomic interleaving proofs for `DROP_PAGES` (incl. 3rd ABA generation-reuse model) |
@@ -85,11 +86,11 @@ No tests in `bamabi-core` carry `#[ignore]`; optional tests gate on `--features 
 | `soak_10k_reloads` | `BAM_SOAK_CYCLES=10000 cargo test -p bamabi_host --test soak_10k_reloads --release` | `1` | `250` default cycles (`10,000` with `BAM_SOAK_CYCLES=10000`): zero-copy + 500 migrations + `DROP_PAGES` recycling + `< 2.0 ms` p99 / `< 32 MiB` RSS drift |
 | **Doctests** | `cargo test --doc -p bamabi_host --all-features` | `2` | `src/lib.rs` (`no_run`) + `src/app_ext.rs` (`compile_fail` proving `ResMut<ModHost>` cannot unload) |
 
-#### `bamabi_watcher` (`22` tests — [`crates/bamabi_watcher/TESTS.md`](crates/bamabi_watcher/TESTS.md))
+#### `bamabi_watcher` (`27` tests — [`crates/bamabi_watcher/TESTS.md`](crates/bamabi_watcher/TESTS.md))
 
 | Suite / Binary | Command | Tests | Scope |
 |---|---|---|---|
-| **Unit (`--lib`)** (`tests/unit/watcher_tests.rs`) | `cargo test -p bamabi_watcher --lib --all-features` | `13` | Mock `mpsc` drain, `TryRecvError::Disconnected` once-semantics, `ScheduleLeased` deferral, atomic-rename grace window, `sync_fingerprints`, poisoned mutex recovery |
+| **Unit (`--lib`)** (`tests/unit/watcher_tests.rs`) | `cargo test -p bamabi_watcher --lib --all-features` | `18` | Mock `mpsc` drain, `TryRecvError::Disconnected` once-semantics, `ScheduleLeased` deferral, atomic-rename grace window, `sync_fingerprints`, poisoned mutex recovery, `mod.toml`/`.dylib` DAG & reload/delete error paths |
 | `hot_reload` (`tests/hot_reload.rs`) | `cargo test -p bamabi_watcher --test hot_reload --all-features` | `9` | `ModLifecycleFlush` polling, synchronous `with_sync_on_start`, `ScheduleLeased` DAG retry, cascading reload/rollback, non-recursive & delete guards |
 
 ### Tier 3: Excluded Asymmetric Rust & C99/C11 Guest Fixtures
@@ -148,19 +149,18 @@ cargo bench -p bamabi_host --bench v03_subsystem_bench -- --quick relations
 
 ### Tier 7: Line Coverage Gate (`cargo llvm-cov >= 85%`)
 
-All prior `bamabi_host_sys` and `bamabi_host` exclusions have been removed from the CI gate. Run:
+All `bamabi_host_sys`, `bamabi_host`, and `bamabi_watcher` crate exclusions have been removed from the CI gate. Run:
 
 ```bash
 cargo llvm-cov --no-report --all-features -p bamabi_host_sys -p bamabi_host -p bamabi_watcher
 cargo llvm-cov report \
-  --ignore-filename-regex '(crates/bamabi_watcher/|(tests|examples|xtask|benches)/|\.cargo/)' \
+  --ignore-filename-regex '(tests|examples|xtask|benches)/|\.cargo/' \
   --fail-under-lines 85
 ```
 
 Post-hardening coverage measurements:
-- **CI gate (`--ignore-filename-regex '(crates/bamabi_watcher/|(tests|examples|xtask|benches)/|\.cargo/)'`):** **`93.36%`** (`19,371 / 20,748` lines covered; every source file in `bamabi_host_sys/src/` and `bamabi_host/src/` is `>= 85%`, ranging from `85.37%` in `shared_lib.rs` up to `100.00%`).
-- **All measured files (no crate exclusions):** **`92.65%`** (`20,094 / 21,689` lines covered).
-- **Why `crates/bamabi_watcher/` remains excluded:** `crates/bamabi_watcher/src/watcher.rs` is at **`76.38%`** (`721 / 944` lines) due to OS `notify` / filesystem watcher event-loop branches (`inotify`/`FSEvents`/`ReadDirectoryChanges` platform error paths).
+- **CI gate (`--ignore-filename-regex '(tests|examples|xtask|benches)/|\.cargo/'`, zero crate exclusions):** **`93.34%`** (`20,376 / 21,829` lines covered; every source file in `bamabi_host_sys/src/`, `bamabi_host/src/`, and `bamabi_watcher/src/` is `>= 85%`, ranging from `85.45%` in `shared_lib.rs` up to `100.00%`).
+- **`bamabi_watcher/src/watcher.rs`:** **`92.27%`** (`871 / 944` lines covered).
 
 ### Tier 8: Spellcheck & Supply-Chain Audit
 
@@ -173,6 +173,6 @@ cargo deny --all-features check advisories licenses bans sources
 
 ## 3. Per-Crate Test Catalogs
 
-- [`crates/bamabi_host_sys/TESTS.md`](crates/bamabi_host_sys/TESTS.md) — `102` unit tests, `9` integration binaries (incl. 3 Loom ABA models & 4 parser proptests), and Miri coverage.
+- [`crates/bamabi_host_sys/TESTS.md`](crates/bamabi_host_sys/TESTS.md) — `104` unit tests, `9` integration binaries (incl. 3 Loom ABA models & 4 parser proptests), and Miri coverage.
 - [`crates/bamabi_host/TESTS.md`](crates/bamabi_host/TESTS.md) — `15` unit tests, `7` `[[test]]` suites (incl. `leased_schedule_soundness`, `schedule_shuffle_fuzz`, `soak_10k_reloads`), `2` doctests, and `chunk_throughput` / `v03_subsystem_bench`.
-- [`crates/bamabi_watcher/TESTS.md`](crates/bamabi_watcher/TESTS.md) — `13` unit tests, `9` `hot_reload` integration tests, and CI coverage exclusion details.
+- [`crates/bamabi_watcher/TESTS.md`](crates/bamabi_watcher/TESTS.md) — `18` unit tests, `9` `hot_reload` integration tests, and CI coverage status (`92.27%`).

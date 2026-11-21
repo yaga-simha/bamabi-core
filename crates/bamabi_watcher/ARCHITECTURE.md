@@ -18,7 +18,7 @@
 |---|---|---|
 | **Crate root** | [`src/lib.rs`](src/lib.rs) | `#![forbid(unsafe_code)]`, `#![warn(missing_docs)]`, crate re-exports, and `prelude`. |
 | **Watcher & plugin** | [`src/watcher.rs`](src/watcher.rs) | `ModHotReloadPlugin`, `ModHotReloadWatcher`, `ModHotReloadHistory`, `ModHotReloadOutcome`, `ModHotReloadAction`, `FileFingerprint`, DAG sync, and retry/disconnect state machines. |
-| **Unit tests** | [`tests/unit/watcher_tests.rs`](tests/unit/watcher_tests.rs) | 13 unit tests using mock `mpsc` channels, poisoned mutexes, and synthetic C99 `.cdylib` fixtures. |
+| **Unit tests** | [`tests/unit/watcher_tests.rs`](tests/unit/watcher_tests.rs) | 18 unit tests using mock `mpsc` channels, poisoned mutexes, deterministic DAG/reload error paths, and synthetic C99 `.cdylib` fixtures. |
 | **Integration tests** | [`tests/hot_reload.rs`](tests/hot_reload.rs) | 9 end-to-end filesystem watcher & Bevy `App` schedule tests. |
 
 ---
@@ -54,4 +54,4 @@ When the underlying `notify` debouncer thread exits or its `mpsc::Sender` drops,
 
 ## 4. Setup & Verification
 
-See [`TESTS.md`](TESTS.md) for all 22 unit and integration tests and coverage status (`76.38%`).
+See [`TESTS.md`](TESTS.md) for all 27 unit and integration tests and coverage status (`92.27%`).

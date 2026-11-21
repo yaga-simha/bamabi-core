@@ -367,6 +367,44 @@ fn snapshot_and_restore_cover_dynamic_resources_zsts_errors_and_cleanup() {
     // Also exercise the `contains_resource_by_id -> remove_resource_by_id` branch when restoring
     // over an existing resource entry.
     restore_mod_dynamic_columns_after_reload(&mut world, id2, snap.clone()).unwrap();
+    assert!(world.contains_resource_by_id(res2_cid));
+    let restored_again_count =
+        // SAFETY: `res2_cid` holds initialized `DynResVal`.
+        unsafe {
+            world
+                .get_resource_by_id(res2_cid)
+                .expect("res2_cid readable immediately after overwrite restore")
+                .deref::<DynResVal>()
+                .count
+        };
+    assert_eq!(restored_again_count, 77);
+    let is_res_count_before_flush = {
+        let mut q = world.query::<&IsResource>();
+        q.iter(&world)
+            .filter(|r| r.resource_component_id() == res2_cid)
+            .count()
+    };
+    assert_eq!(is_res_count_before_flush, 1);
+
+    world.flush();
+    assert!(world.contains_resource_by_id(res2_cid));
+    let restored_after_flush_count =
+        // SAFETY: `res2_cid` holds initialized `DynResVal`.
+        unsafe {
+            world
+                .get_resource_by_id(res2_cid)
+                .expect("res2_cid persists after world.flush()")
+                .deref::<DynResVal>()
+                .count
+        };
+    assert_eq!(restored_after_flush_count, 77);
+    let is_res_count_after_flush = {
+        let mut q = world.query::<&IsResource>();
+        q.iter(&world)
+            .filter(|r| r.resource_component_id() == res2_cid)
+            .count()
+    };
+    assert_eq!(is_res_count_after_flush, 1);
 
     // Missing `init_default` on non-POD & despawned entity skip & `insert_migrated_buf_into_entity`
     // despawn fallback (`invoke_drop_if_needed`).

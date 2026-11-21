@@ -11,12 +11,21 @@ else
     LDFLAGS = -shared -fPIC
 endif
 
+SIBLING_WIRE_INC := ../../../bamabi-wire/include
+OVERLAY_CFG := ../../../.cargo/config.toml
+OVERLAY_WIRE_ACTIVE := $(if $(wildcard $(OVERLAY_CFG)),$(shell sed 's/\#.*//' "$(OVERLAY_CFG)" 2>/dev/null | grep -E 'path[[:space:]]*=.*bamabi-wire'),)
+USE_SIBLING_WIRE := $(filter 1 true TRUE yes YES,$(strip $(BAM_USE_SIBLING_WIRE)))$(OVERLAY_WIRE_ACTIVE)
+
 ifneq ($(strip $(BAM_INCLUDE_DIR)),)
     INC_DIR := $(BAM_INCLUDE_DIR)
 else ifneq ($(strip $(BAM_WIRE_DIR)),)
     INC_DIR := $(BAM_WIRE_DIR)/include
-else ifneq ($(wildcard ../../../bamabi-wire/include/bamabi.h),)
-    INC_DIR := ../../../bamabi-wire/include
+else ifneq ($(strip $(USE_SIBLING_WIRE)),)
+    ifneq ($(wildcard $(SIBLING_WIRE_INC)/bamabi.h),)
+        INC_DIR := $(SIBLING_WIRE_INC)
+    else
+        INC_DIR := ../../target/include
+    endif
 else
     INC_DIR := ../../target/include
 endif

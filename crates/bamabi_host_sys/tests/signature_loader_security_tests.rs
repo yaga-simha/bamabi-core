@@ -52,6 +52,36 @@ impl Drop for TempTestDir {
     }
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn sibling_wire_overlay_active(workspace_root: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(workspace_root.join("../.cargo/config.toml")) else {
+        return false;
+    };
+    let mut in_wire_patch_section = false;
+    for raw_line in contents.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_wire_patch_section = line.contains("patch.") && line.contains("bamabi-wire");
+            continue;
+        }
+        if in_wire_patch_section && line.contains('=') {
+            return true;
+        }
+        if line.contains("path") && line.contains("bamabi-wire") {
+            return true;
+        }
+    }
+    false
+}
+
 fn fixture_dylib(stem: &str) -> PathBuf {
     static FIXTURE_BUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static NEXT_STAGE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -90,10 +120,14 @@ fn fixture_dylib(stem: &str) -> PathBuf {
                     .map(|d| PathBuf::from(d).join("include"))
             })
             .or_else(|| {
-                let sibling_inc = ws.join("../bamabi-wire/include");
-                (sibling_inc.join("bamabi.h").is_file()
-                    && sibling_inc.join("generated/testbed_components.h").is_file())
-                .then_some(sibling_inc)
+                if env_flag_enabled("BAM_USE_SIBLING_WIRE") || sibling_wire_overlay_active(&ws) {
+                    let sibling_inc = ws.join("../bamabi-wire/include");
+                    (sibling_inc.join("bamabi.h").is_file()
+                        && sibling_inc.join("generated/testbed_components.h").is_file())
+                    .then_some(sibling_inc)
+                } else {
+                    None
+                }
             });
         let inc_dir = if let Some(inc) = wire_inc {
             inc

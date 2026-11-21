@@ -8,7 +8,7 @@ Refactored from the original [`bevy_mod_abi`](https://github.com/yaga-simha/bevy
 
 | Crate | Safety Policy | Bevy Deps | Responsibilities | Docs |
 |---|---|---|---|---|
-| [`bamabi_host_sys`](crates/bamabi_host_sys/README.md) | Host `unsafe` (sealed `pub(crate)` `ffi/`) | `bevy_ecs`, `bevy_app`, `bevy_tasks`, opt. `bevy_reflect` | 68/68 live `HOST_API` slots, `ModRegistry` (CoW `Arc<RegistrySnapshot>`), `GuestSystem`, `HostIter`, `CascadeHierarchyCache`, `CommandArena`, `ModRelationGraph`, `ModScheduleSetRegistry`, `DROP_PAGES`, `ModHost`, `LoadedMod::registered_schedule_labels`, checked ELF/Mach-O/PE parsers, zero-copy reload, `migrate_component_column`, optional `signature-verification` (`bamabi_trust` non-`keygen` parity) | [`ARCHITECTURE`](crates/bamabi_host_sys/ARCHITECTURE.md) · [`TESTS`](crates/bamabi_host_sys/TESTS.md) |
+| [`bamabi_host_sys`](crates/bamabi_host_sys/README.md) | Host `unsafe` (sealed `pub(crate)` `ffi/`) | `bevy_ecs`, `bevy_app`, `bevy_tasks`, opt. `bevy_reflect` | 68/68 live `HOST_API` slots, `ModRegistry` (CoW `Arc<RegistrySnapshot>`), `GuestSystem`, `HostIter`, `CascadeHierarchyCache`, `CommandArena`, `ModRelationGraph`, `ModScheduleSetRegistry`, `DROP_PAGES`, `ModHost`, `LoadedMod::registered_schedule_labels`, checked ELF/Mach-O/PE parsers, zero-copy reload, `migrate_component_column`, optional `signature-verification` (`bamabi_trust` non-`keygen` parity) & opt-in `keygen` | [`ARCHITECTURE`](crates/bamabi_host_sys/ARCHITECTURE.md) · [`TESTS`](crates/bamabi_host_sys/TESTS.md) |
 | [`bamabi_host`](crates/bamabi_host/README.md) | `#![forbid(unsafe_code)]` | `bevy_ecs`, `bevy_app`, opt. `bevy_diagnostic` (**headless**) | `AbiModPlugin`, `ModLifecycleFlush` (`ensure_mod_lifecycle_flush_schedule`), `ModBudgetPolicy` / `ModBudgetTelemetry`, `ModAppExt`, `ModWorldExt` (`ScheduleLeased` guards, skip-leased `unload_all_mods`), `ModCommandsExt` (safe-point deferral), `ModVisibleSets`, `ModUnloadHooks`, `ModQuarantine`, `mod.toml` SemVer DAG loading (`ModDagErrorKind` + 13 accessors) | [`ARCHITECTURE`](crates/bamabi_host/ARCHITECTURE.md) · [`TESTS`](crates/bamabi_host/TESTS.md) |
 | [`bamabi_watcher`](crates/bamabi_watcher/README.md) | `#![forbid(unsafe_code)]` | `bevy_ecs`, `bevy_app` + `notify-debouncer-full` | Debounced recursive filesystem hot-reload watcher (`ModHotReloadPlugin`, `ModHotReloadWatcher`, `ModHotReloadHistory`) polling in `ModLifecycleFlush`, synchronous `with_sync_on_start` initial load, transient `ScheduleLeased` retries, disconnect handling, and cascading SemVer DAG reloads | [`ARCHITECTURE`](crates/bamabi_watcher/ARCHITECTURE.md) · [`TESTS`](crates/bamabi_watcher/TESTS.md) |
 
@@ -34,7 +34,7 @@ bamabi_watcher = { git = "https://github.com/yaga-simha/bamabi-core.git", branch
 # bamabi_host = { git = "https://github.com/yaga-simha/bamabi-core.git", branch = "main", features = ["diagnostics", "signature-verification"] }
 ```
 
-> **Note (`keygen`):** `bamabi_trust::keygen` items remain upstream-gated because `bamabi_trust/keygen` (`ssh-key/getrandom`) is not enabled by `signature-verification` in [`crates/bamabi_host_sys/Cargo.toml`](crates/bamabi_host_sys/Cargo.toml). Use `cargo-bam keygen` (`bamabi-tools`) or depend directly on `bamabi_trust` with `features = ["keygen"]` for key generation.
+> **Note (`keygen`):** `signature-verification` alone continues to omit `bamabi_trust/keygen` (`ssh-key/getrandom`). Enable the opt-in `keygen` feature (`bamabi_host` / `bamabi_host_sys` `features = ["keygen"]`, which implies `signature-verification`) to expose `keygen`, `GeneratedKeypair`, `IssuedCertificate`, `generate_ed25519_keypair`, `issue_ed25519_certificate_openssh`, and `write_openssh_keypair`, or use `cargo-bam keygen` (`bamabi-tools`).
 
 ## Local & CI Verification
 
@@ -73,7 +73,7 @@ BAM_SOAK_CYCLES=10000 cargo test -p bamabi_host --test soak_10k_reloads --releas
 cargo bench -p bamabi_host --bench chunk_throughput -- --test
 cargo bench -p bamabi_host --bench v03_subsystem_bench -- --test
 cargo llvm-cov --no-report --all-features -p bamabi_host_sys -p bamabi_host -p bamabi_watcher
-cargo llvm-cov report --ignore-filename-regex '(crates/bamabi_watcher/|(tests|examples|xtask|benches)/|\.cargo/)' --fail-under-lines 85
+cargo llvm-cov report --ignore-filename-regex '(tests|examples|xtask|benches)/|\.cargo/' --fail-under-lines 85
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bamabi_host_sys --lib
 
 # Spellcheck and dependency/license/source audit

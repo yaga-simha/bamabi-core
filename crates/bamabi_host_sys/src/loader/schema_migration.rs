@@ -945,10 +945,15 @@ pub fn restore_mod_dynamic_columns_after_reload(
                 import_field_fn,
                 &first.fields,
             )?;
-            if world.contains_resource_by_id(new_entry.component_id) {
-                world.remove_resource_by_id(new_entry.component_id);
-            }
-            let res_ent = world.spawn(IsResource::new(new_entry.component_id)).id();
+            let res_ent =
+                if let Some(existing_ent) = world.resource_entities().get(new_entry.component_id) {
+                    if world.contains_resource_by_id(new_entry.component_id) {
+                        world.remove_resource_by_id(new_entry.component_id);
+                    }
+                    existing_ent
+                } else {
+                    world.spawn(IsResource::new(new_entry.component_id)).id()
+                };
             insert_migrated_buf_into_entity(world, res_ent, &new_entry, buf);
             continue;
         }

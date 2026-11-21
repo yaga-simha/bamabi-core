@@ -5,7 +5,7 @@ Safe (`#![forbid(unsafe_code)]`) debounced filesystem hot-reload watcher for `ba
 ## Documentation Map
 
 - **Crate Architecture & Implementation:** [`ARCHITECTURE.md`](ARCHITECTURE.md) — module map, `ModLifecycleFlush` scheduling, synchronous `sync_on_start`, `ScheduleLeased` transient retry logic, `TryRecvError::Disconnected` handling, and atomic-rename / echo suppression.
-- **Test & Verification Guide:** [`TESTS.md`](TESTS.md) — complete inventory of `13` unit tests (`watcher_tests.rs`), `9` integration tests (`hot_reload.rs`), and CI coverage exclusion rationale (`76.38%`).
+- **Test & Verification Guide:** [`TESTS.md`](TESTS.md) — complete inventory of `18` unit tests (`watcher_tests.rs`), `9` integration tests (`hot_reload.rs`), and CI coverage status (`92.27%`, enforced in the `>= 85%` gate).
 - **Workspace Guides:** [`../../docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) · [`../../TESTS.md`](../../TESTS.md) · [`GEMINI.md`](GEMINI.md)
 
 ## Overview

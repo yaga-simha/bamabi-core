@@ -183,6 +183,43 @@ pub fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn sibling_wire_overlay_active(workspace_root: &Path) -> bool {
+    let Some(parent) = workspace_root.parent() else {
+        return false;
+    };
+    let Ok(contents) = std::fs::read_to_string(parent.join(".cargo").join("config.toml")) else {
+        return false;
+    };
+    let mut in_wire_patch_section = false;
+    for raw_line in contents.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_wire_patch_section = line.contains("patch.") && line.contains("bamabi-wire");
+            continue;
+        }
+        if in_wire_patch_section && line.contains('=') {
+            return true;
+        }
+        if line.contains("path") && line.contains("bamabi-wire") {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn sibling_wire_requested(workspace_root: &Path) -> bool {
+    env_flag_enabled("BAM_USE_SIBLING_WIRE") || sibling_wire_overlay_active(workspace_root)
+}
+
 pub fn fixture_dir() -> PathBuf {
     std::env::var_os("BAM_FIXTURE_DIR")
         .filter(|v| !v.is_empty())
@@ -236,8 +273,9 @@ pub fn fixture_dylib(stem: &str) -> PathBuf {
                         .map(|d| PathBuf::from(d).join("include"))
                 })
                 .or_else(|| {
-                    ws.parent()
-                        .map(|p| p.join("bamabi-wire").join("include"))
+                    sibling_wire_requested(&ws)
+                        .then(|| ws.parent().map(|p| p.join("bamabi-wire").join("include")))
+                        .flatten()
                         .filter(|inc| {
                             inc.join("bamabi.h").is_file()
                                 && inc.join("generated/testbed_components.h").is_file()

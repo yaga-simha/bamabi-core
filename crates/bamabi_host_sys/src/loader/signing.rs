@@ -1,10 +1,11 @@
 //! Thin Bevy ECS adapters over [`bamabi_trust`], storing cryptographic mod receipts
 //! ([`VerifiedModSignature`]) and trust policies ([`ModTrustPolicy`]) as Bevy `Component` / `Resource`.
 //!
-//! Note: `bamabi_trust`'s optional `keygen` module (`GeneratedKeypair`, `IssuedCertificate`,
-//! `generate_ed25519_keypair`, `issue_ed25519_certificate_openssh`, `write_openssh_keypair`) is
-//! gated behind the `bamabi_trust/keygen` feature, which `bamabi_host_sys`'s
-//! `signature-verification` feature does not enable.
+//! Optional OpenSSH Ed25519 keypair generation and certificate issuance (`keygen` module,
+//! `GeneratedKeypair`, `IssuedCertificate`, `generate_ed25519_keypair`,
+//! `issue_ed25519_certificate_openssh`, `write_openssh_keypair`) are exposed when the
+//! `keygen` feature is enabled (which implies `signature-verification` and enables
+//! `bamabi_trust/keygen`).
 
 use bevy_ecs::prelude::{Component, Resource};
 use core::ops::Deref;
@@ -19,6 +20,11 @@ pub use bamabi_trust::bampack::{
 pub use bamabi_trust::embedded_sig::{
     BAM_SIG_MACHO_SECTION_NAME, BAM_SIG_SECTION_NAME, EmbeddedSignatureSection,
     extract_embedded_bam_sig, zeroed_binary_for_bam_sig,
+};
+#[cfg(feature = "keygen")]
+pub use bamabi_trust::keygen::{
+    self, GeneratedKeypair, IssuedCertificate, generate_ed25519_keypair,
+    issue_ed25519_certificate_openssh, write_openssh_keypair,
 };
 pub use bamabi_trust::{
     Algorithm, Certificate, CertificateValidityPolicy, DEFAULT_KRL_SIGNATURE_NAMESPACE,

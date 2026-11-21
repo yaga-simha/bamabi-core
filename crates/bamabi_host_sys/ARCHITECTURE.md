@@ -10,7 +10,7 @@
 
 1. **All Host `unsafe` Isolated Here:** Crates above `bamabi_host_sys` (`bamabi_host`, `bamabi_watcher`, and Layer 3 `bamabi`, `bamabi_bridges`, `bamabi_render`, `bamabi_reflect`) enforce `#![forbid(unsafe_code)]`. Within `bamabi_host_sys`, crate lints enforce `unsafe_op_in_unsafe_fn = "deny"`, `improper_ctypes_definitions = "deny"`, `#![warn(missing_docs)]`, and `#![deny(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]`.
 2. **Sealed `ffi/` Submodules:** [`src/ffi/mod.rs`](src/ffi/mod.rs) marks all 13 FFI submodules `pub(crate)`, re-exporting only the audited crate-root surface in [`src/lib.rs`](src/lib.rs).
-3. **Zero Heavy Bevy or File-Watcher Dependencies:** `bamabi_host_sys` depends strictly on `bevy_ecs`, `bevy_app`, `bevy_platform`, `bevy_tasks`, `bamabi_sys`, `libloading`, `nonmax`, `arc-swap`, `thiserror`, `tracing`, plus optional `bamabi_trust` (`signature-verification`) and `bevy_reflect` + `bevy_ecs/bevy_reflect` (`bridge-reflect`). It **never** depends on `bevy_render`, `bevy_scene`, `bevy_asset`, or `notify`.
+3. **Zero Heavy Bevy or File-Watcher Dependencies:** `bamabi_host_sys` depends strictly on `bevy_ecs`, `bevy_app`, `bevy_platform`, `bevy_tasks`, `bamabi_sys`, `libloading`, `nonmax`, `arc-swap`, `thiserror`, `tracing`, plus optional `bamabi_trust` (`signature-verification` / `keygen`) and `bevy_reflect` + `bevy_ecs/bevy_reflect` (`bridge-reflect`). It **never** depends on `bevy_render`, `bevy_scene`, `bevy_asset`, or `notify`.
 4. **Zero Non-Test Panics:** Non-test `src/` paths keep `.unwrap()`, `.expect()`, `panic!`, `unreachable!`, `todo!`, and `#[allow(...)]` at zero.
 
 ### Feature Flags
@@ -20,7 +20,8 @@
 | `strict-ffi-checks` | — | Enables hot-path [`HandleHeader`] magic/generation checks on `HostIter`, `HostCommands`, and `HostSystemCtx` even in release builds (`cfg!(any(debug_assertions, feature = "strict-ffi-checks"))`). |
 | `test-utils` | — | Exposes mock `LoadedMod::register_mock_for_test` helpers for downstream test crates. |
 | `diagnostics` | — | Enables `ModDiagnosticsCollector` and `ModDiagnosticsSample` per-system telemetry snapshots. |
-| `signature-verification` | `dep:bamabi_trust` | Enables [`loader::signing`] (`ModTrustPolicy`, `VerifiedModSignature`, pre-`dlopen` `.sig` / `.bam_sig` / `.bampack` / `SSHKRL` verification). Does **not** enable `bamabi_trust/keygen`. |
+| `signature-verification` | `dep:bamabi_trust` | Enables [`loader::signing`] (`ModTrustPolicy`, `VerifiedModSignature`, pre-`dlopen` `.sig` / `.bam_sig` / `.bampack` / `SSHKRL` verification). Does **not** enable `bamabi_trust/keygen` (`ssh-key/getrandom`). |
+| `keygen` | `signature-verification`, `bamabi_trust/keygen` | Opt-in feature exposing OpenSSH Ed25519 keypair generation and certificate issuance (`keygen`, `GeneratedKeypair`, `IssuedCertificate`, `generate_ed25519_keypair`, `issue_ed25519_certificate_openssh`, `write_openssh_keypair`). |
 | `bridge-reflect` | `dep:bevy_reflect`, `bevy_ecs/bevy_reflect` | Enables declarative `BamFieldDesc` `ReflectFromPtr` / `ReflectComponent` / `ReflectResource` registration via `ffi/validation.rs`. |
 
 ---
@@ -91,7 +92,7 @@ When `signature-verification` is enabled, [`src/loader/signing.rs`](src/loader/s
 - Exposes explicit delegates for every builder and verifier method, including `add_krl_signer_openssh`, `add_krl_signer_file`, `with_krl_signer_principal`, `verify_bampack_bytes`, and `verify_bampack_file`.
 - Implements `Deref<Target = bamabi_trust::ModTrustPolicy>` so all 16 read-only getters (`krl_signer_principal`, `trusted_ca_count`, `trusted_public_key_count`, `trusted_krl_signer_count`, `min_krl_version`, `applied_krl_version`, `is_cert_serial_revoked`, `is_cert_key_id_revoked`, `enforcement`, `is_enforced`, `namespace`, `required_principal`, `validity_policy`, `max_binary_bytes`, `binds_manifest_name_to_principal`, `has_trust_anchors`) are reachable directly.
 - Re-exports `bampack`, `embedded_sig`, `ssh_key`, `LineEnding`, `Algorithm`, `Certificate`, `Fingerprint`, `HashAlg`, `PrivateKey`, `PublicKey`, `DEFAULT_KRL_SIGNER_PRINCIPAL`, `MAX_BAMPACK_PATH_LEN`, `MAX_BAMPACK_PATH_DEPTH`, `DEFAULT_MAX_BAMPACK_UNCOMPRESSED_BYTES`, `BamPackExtractLimits`, `BamPackExtractError`, `validate_bampack_entry_path`, and `parse_bampack_entries_unverified` at `loader::signing`, `loader`, and crate root.
-- **Upstream `keygen` gate:** `bamabi_trust::keygen` items (`keygen` module, `GeneratedKeypair`, `IssuedCertificate`, `generate_ed25519_keypair`, `issue_ed25519_certificate_openssh`, `write_openssh_keypair`) remain upstream-gated because `bamabi_trust/keygen` (`ssh-key/getrandom`) is not enabled by `signature-verification` in [`Cargo.toml`](Cargo.toml).
+- **Opt-in `keygen` gate:** `signature-verification` alone intentionally omits `bamabi_trust/keygen` (`ssh-key/getrandom`). Enabling the opt-in `keygen` feature (`["signature-verification", "bamabi_trust/keygen"]` in [`Cargo.toml`](Cargo.toml)) additionally re-exports `keygen`, `GeneratedKeypair`, `IssuedCertificate`, `generate_ed25519_keypair`, `issue_ed25519_certificate_openssh`, and `write_openssh_keypair`.
 
 ### 3.6 Panic-Free `bridge-reflect` Slot Pool (`ffi/validation.rs`)
 

@@ -105,6 +105,11 @@ pub use loader::{
     restore_mod_state_in_world, rollback_unscheduled_mod_in_world, save_mod_state_in_world,
     unload_all_mods_in_world,
 };
+#[cfg(feature = "keygen")]
+pub use loader::{
+    GeneratedKeypair, IssuedCertificate, generate_ed25519_keypair,
+    issue_ed25519_certificate_openssh, keygen, write_openssh_keypair,
+};
 pub use registry::{
     ComponentCollisionError, ComponentOptions, CreateMsgCursorFn, EntityEventTriggerFn,
     ExtractEventTargetFn, ExtractRelationshipTargetsFn, HostStringBridge, HostWireBridge,

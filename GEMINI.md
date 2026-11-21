@@ -34,7 +34,7 @@
   - Transient `ScheduleLeased` errors defer into `pending_retries` without recording `Failed`; `TryRecvError::Disconnected` logs once (`tracing::error!`) and emits one `ModHotReloadAction::Failed` outcome.
 - **Trust Parity & `keygen` Gate:**
   - `bamabi_host_sys::loader::signing` exposes full non-`keygen` `bamabi_trust` parity (`add_krl_signer_openssh`, `add_krl_signer_file`, `with_krl_signer_principal`, `verify_bampack_bytes`, `verify_bampack_file`, 16 `Deref` getters, and `bampack`/`embedded_sig`/`ssh_key` re-exports).
-  - `bamabi_trust::keygen` remains upstream-gated because `signature-verification` in `crates/bamabi_host_sys/Cargo.toml` does not enable `bamabi_trust/keygen` (`ssh-key/getrandom`).
+  - `signature-verification` alone continues to omit `bamabi_trust/keygen` (`ssh-key/getrandom`), while the opt-in `keygen` feature (`bamabi_host_sys/keygen`, `bamabi_host/keygen` — implying `signature-verification`) exposes `keygen`, `GeneratedKeypair`, `IssuedCertificate`, `generate_ed25519_keypair`, `issue_ed25519_certificate_openssh`, and `write_openssh_keypair`.
 - **`ModDagErrorKind` & Accessors:**
   - `ModDagErrorKind::as_str()` and all 13 `ModDagError` accessors (`kind`, `path`, `related_paths`, `mod_name`, `dependency`, `required_version`, `found_version`, `cycle_members`, `load_error`, `mod_id`, `is_cycle`, `is_io`, `is_recoverable`) provide allocation-light structured DAG diagnostics.
 
@@ -53,7 +53,7 @@ cargo bench -p bamabi_host --bench chunk_throughput -- --test
 cargo bench -p bamabi_host --bench v03_subsystem_bench -- --test
 cargo test -p bamabi_host_sys --test loom_drop_trampoline --release
 cargo llvm-cov --no-report --all-features -p bamabi_host_sys -p bamabi_host -p bamabi_watcher
-cargo llvm-cov report --ignore-filename-regex '(crates/bamabi_watcher/|(tests|examples|xtask|benches)/|\.cargo/)' --fail-under-lines 85
+cargo llvm-cov report --ignore-filename-regex '(tests|examples|xtask|benches)/|\.cargo/' --fail-under-lines 85
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bamabi_host_sys --lib
 typos
 ```
