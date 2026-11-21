@@ -1391,19 +1391,15 @@ mod bam_field_reflect_pool {
     }
 
     #[inline]
-    fn slot_core_expect(slot: usize) -> &'static BamReflectSlotCore {
-        SLOT_CELLS[slot]
-            .core
-            .get()
-            .expect("BamFieldReflectSlot core metadata must be initialized before use")
+    fn slot_type_info(slot: usize) -> Option<&'static TypeInfo> {
+        SLOT_CELLS.get(slot)?.type_info.get().copied()
     }
 
-    #[inline]
-    fn slot_type_info_expect(slot: usize) -> &'static TypeInfo {
-        SLOT_CELLS[slot]
-            .type_info
-            .get()
-            .expect("BamFieldReflectSlot TypeInfo must be initialized before use")
+    #[derive(bevy_ecs::component::Component, Reflect)]
+    struct UninitializedBamFieldReflectSlot {}
+
+    fn fallback_slot_type_info() -> &'static TypeInfo {
+        <UninitializedBamFieldReflectSlot as Typed>::type_info()
     }
 
     fn parse_type_path_parts(
@@ -1560,7 +1556,12 @@ mod bam_field_reflect_pool {
         value: &dyn PartialReflect,
     ) -> Result<(), ApplyError> {
         let src_struct = value.reflect_ref().as_struct()?;
-        let meta = slot_core_expect(slot);
+        let Some(meta) = slot_core(slot) else {
+            return Err(ApplyError::MismatchedTypes {
+                from_type: value.reflect_type_path().into(),
+                to_type: UninitializedBamFieldReflectSlot::type_path().into(),
+            });
+        };
         for (name, field_val) in src_struct.iter_fields() {
             let Some(&idx) = meta.field_indices.get(name) else {
                 continue;
@@ -1596,19 +1597,19 @@ mod bam_field_reflect_pool {
             impl<$($gen)*> Struct for $ty {
                 fn field(&self, name: &str) -> Option<&dyn PartialReflect> {
                     let $s_slot = self;
-                    let idx = slot_core_expect($slot_expr).field_indices.get(name).copied()?;
+                    let idx = slot_core($slot_expr)?.field_indices.get(name).copied()?;
                     self.field_at(idx)
                 }
 
                 fn field_mut(&mut self, name: &str) -> Option<&mut dyn PartialReflect> {
                     let $s_slot = &*self;
-                    let idx = slot_core_expect($slot_expr).field_indices.get(name).copied()?;
+                    let idx = slot_core($slot_expr)?.field_indices.get(name).copied()?;
                     self.field_at_mut(idx)
                 }
 
                 fn field_at(&self, index: usize) -> Option<&dyn PartialReflect> {
                     let $s_slot = self;
-                    let field = slot_core_expect($slot_expr).fields.get(index)?;
+                    let field = slot_core($slot_expr)?.fields.get(index)?;
                     let $s_ptr = self;
                     let base = $ptr_expr;
                     let $s_len = self;
@@ -1619,7 +1620,7 @@ mod bam_field_reflect_pool {
 
                 fn field_at_mut(&mut self, index: usize) -> Option<&mut dyn PartialReflect> {
                     let $s_slot = &*self;
-                    let field = slot_core_expect($slot_expr).fields.get(index)?;
+                    let field = slot_core($slot_expr)?.fields.get(index)?;
                     let $s_len = &*self;
                     let len = $len_expr;
                     let $s_mut = self;
@@ -1630,17 +1631,17 @@ mod bam_field_reflect_pool {
 
                 fn name_at(&self, index: usize) -> Option<&str> {
                     let $s_slot = self;
-                    slot_core_expect($slot_expr).fields.get(index).map(|f| f.name)
+                    slot_core($slot_expr)?.fields.get(index).map(|f| f.name)
                 }
 
                 fn index_of_name(&self, name: &str) -> Option<usize> {
                     let $s_slot = self;
-                    slot_core_expect($slot_expr).field_indices.get(name).copied()
+                    slot_core($slot_expr)?.field_indices.get(name).copied()
                 }
 
                 fn field_len(&self) -> usize {
                     let $s_slot = self;
-                    slot_core_expect($slot_expr).fields.len()
+                    slot_core($slot_expr).map_or(0, |meta| meta.fields.len())
                 }
 
                 fn iter_fields(&self) -> FieldIter<'_> {
@@ -1776,29 +1777,34 @@ mod bam_field_reflect_pool {
 
     impl<const SLOT: usize, const SIZE: usize> TypePath for BamFieldReflectSlot<SLOT, SIZE> {
         fn type_path() -> &'static str {
-            slot_core_expect(SLOT).type_path
+            slot_core(SLOT).map_or(UninitializedBamFieldReflectSlot::type_path(), |meta| {
+                meta.type_path
+            })
         }
 
         fn short_type_path() -> &'static str {
-            slot_core_expect(SLOT).short_path
+            slot_core(SLOT).map_or(
+                UninitializedBamFieldReflectSlot::short_type_path(),
+                |meta| meta.short_path,
+            )
         }
 
         fn type_ident() -> Option<&'static str> {
-            Some(slot_core_expect(SLOT).short_path)
+            slot_core(SLOT).map(|meta| meta.short_path)
         }
 
         fn crate_name() -> Option<&'static str> {
-            slot_core_expect(SLOT).crate_name
+            slot_core(SLOT).and_then(|meta| meta.crate_name)
         }
 
         fn module_path() -> Option<&'static str> {
-            slot_core_expect(SLOT).module_path
+            slot_core(SLOT).and_then(|meta| meta.module_path)
         }
     }
 
     impl<const SLOT: usize, const SIZE: usize> Typed for BamFieldReflectSlot<SLOT, SIZE> {
         fn type_info() -> &'static TypeInfo {
-            slot_type_info_expect(SLOT)
+            slot_type_info(SLOT).unwrap_or_else(fallback_slot_type_info)
         }
     }
 
@@ -1809,9 +1815,13 @@ mod bam_field_reflect_pool {
         ptr: |s| s.0.as_ptr(),
         mut_ptr: |s| s.0.as_mut_ptr(),
         len: |_s| SIZE,
-        rep_type_info: |_s| Some(Self::type_info()),
+        rep_type_info: |_s| slot_type_info(SLOT),
         reflect_clone: |s| {
-            let meta = slot_core_expect(SLOT);
+            let Some(meta) = slot_core(SLOT) else {
+                return Err(ReflectCloneError::NotCloneable {
+                    type_path: Self::type_path().into(),
+                });
+            };
             if meta.is_abi_pod && !meta.has_drop {
                 // SAFETY: `s.0` holds `SIZE` live `MaybeUninit<u8>` bytes for `SLOT`.
                 let owned = unsafe { OwnedBamFieldStruct::from_raw_bytes(SLOT, s.0.as_ptr(), SIZE) };
@@ -1919,7 +1929,7 @@ mod bam_field_reflect_pool {
         ptr: |s| s.storage.as_ptr().cast::<MaybeUninit<u8>>(),
         mut_ptr: |s| s.storage.as_mut_ptr().cast::<MaybeUninit<u8>>(),
         len: |s| s.byte_len,
-        rep_type_info: |s| SLOT_CELLS[s.slot].type_info.get().copied(),
+        rep_type_info: |s| slot_type_info(s.slot),
         reflect_clone: |s| Ok(Box::new(s.clone_aligned())),
         set: |s, value| {
             match value.take::<Self>() {
@@ -1944,7 +1954,7 @@ mod bam_field_reflect_pool {
     impl DynamicTyped for OwnedBamFieldStruct {
         #[inline]
         fn reflect_type_info(&self) -> &'static TypeInfo {
-            slot_type_info_expect(self.slot)
+            slot_type_info(self.slot).unwrap_or_else(fallback_slot_type_info)
         }
     }
 
@@ -2161,7 +2171,13 @@ mod bam_field_reflect_pool {
             copy: |src_world, dst_world, src_ent, dst_ent, _registry| {
                 copy_slot_component_between_worlds(SLOT, src_world, dst_world, src_ent, dst_ent);
             },
-            register_component: |_world| slot_core_expect(SLOT).component_id,
+            register_component: |world| {
+                if let Some(meta) = slot_core(SLOT) {
+                    meta.component_id
+                } else {
+                    world.register_component::<UninitializedBamFieldReflectSlot>()
+                }
+            },
         })
     }
 
@@ -2942,3 +2958,7 @@ pub fn extract_resource_between_worlds(
 #[cfg(test)]
 #[path = "../../tests/unit/validation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/validation_coverage_tests.rs"]
+mod coverage_tests;

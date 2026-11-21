@@ -6,15 +6,18 @@ Refactored from the original [`bevy_mod_abi`](https://github.com/yaga-simha/bevy
 
 ## Workspace Crates
 
-| Crate | Safety Policy | Bevy Deps | Responsibilities |
-|---|---|---|---|
-| [`bamabi_host_sys`](crates/bamabi_host_sys/README.md) | Host `unsafe` (sealed `pub(crate)` `ffi/`) | `bevy_ecs`, `bevy_app`, `bevy_tasks`, opt. `bevy_reflect` | 68/68 live `HOST_API` slots, `ModRegistry` (CoW `Arc<RegistrySnapshot>`), `GuestSystem`, `HostIter`, `CascadeHierarchyCache`, `CommandArena`, `ModRelationGraph`, `ModScheduleSetRegistry`, `DROP_PAGES`, `ModHost`, zero-copy reload, `migrate_component_column`, optional `signature-verification` |
-| [`bamabi_host`](crates/bamabi_host/README.md) | `#![forbid(unsafe_code)]` | `bevy_ecs`, `bevy_app`, opt. `bevy_diagnostic` (**headless**) | `AbiModPlugin`, `ModBudgetPolicy` / `ModBudgetTelemetry`, `ModAppExt`, `ModWorldExt`, `ModCommandsExt`, `ModVisibleSets`, `ModUnloadHooks`, `ModQuarantine`, `mod.toml` SemVer DAG loading |
-| [`bamabi_watcher`](crates/bamabi_watcher/README.md) | `#![forbid(unsafe_code)]` | `bevy_ecs`, `bevy_app` + `notify-debouncer-full` | Debounced recursive filesystem hot-reload watcher (`ModHotReloadPlugin`, `ModHotReloadWatcher`, `ModHotReloadHistory`) with cascading SemVer DAG reloads |
+| Crate | Safety Policy | Bevy Deps | Responsibilities | Docs |
+|---|---|---|---|---|
+| [`bamabi_host_sys`](crates/bamabi_host_sys/README.md) | Host `unsafe` (sealed `pub(crate)` `ffi/`) | `bevy_ecs`, `bevy_app`, `bevy_tasks`, opt. `bevy_reflect` | 68/68 live `HOST_API` slots, `ModRegistry` (CoW `Arc<RegistrySnapshot>`), `GuestSystem`, `HostIter`, `CascadeHierarchyCache`, `CommandArena`, `ModRelationGraph`, `ModScheduleSetRegistry`, `DROP_PAGES`, `ModHost`, `LoadedMod::registered_schedule_labels`, checked ELF/Mach-O/PE parsers, zero-copy reload, `migrate_component_column`, optional `signature-verification` (`bamabi_trust` non-`keygen` parity) | [`ARCHITECTURE`](crates/bamabi_host_sys/ARCHITECTURE.md) · [`TESTS`](crates/bamabi_host_sys/TESTS.md) |
+| [`bamabi_host`](crates/bamabi_host/README.md) | `#![forbid(unsafe_code)]` | `bevy_ecs`, `bevy_app`, opt. `bevy_diagnostic` (**headless**) | `AbiModPlugin`, `ModLifecycleFlush` (`ensure_mod_lifecycle_flush_schedule`), `ModBudgetPolicy` / `ModBudgetTelemetry`, `ModAppExt`, `ModWorldExt` (`ScheduleLeased` guards, skip-leased `unload_all_mods`), `ModCommandsExt` (safe-point deferral), `ModVisibleSets`, `ModUnloadHooks`, `ModQuarantine`, `mod.toml` SemVer DAG loading (`ModDagErrorKind` + 13 accessors) | [`ARCHITECTURE`](crates/bamabi_host/ARCHITECTURE.md) · [`TESTS`](crates/bamabi_host/TESTS.md) |
+| [`bamabi_watcher`](crates/bamabi_watcher/README.md) | `#![forbid(unsafe_code)]` | `bevy_ecs`, `bevy_app` + `notify-debouncer-full` | Debounced recursive filesystem hot-reload watcher (`ModHotReloadPlugin`, `ModHotReloadWatcher`, `ModHotReloadHistory`) polling in `ModLifecycleFlush`, synchronous `with_sync_on_start` initial load, transient `ScheduleLeased` retries, disconnect handling, and cascading SemVer DAG reloads | [`ARCHITECTURE`](crates/bamabi_watcher/ARCHITECTURE.md) · [`TESTS`](crates/bamabi_watcher/TESTS.md) |
 
-## Architecture Documentation
+## Repository Documentation
 
-- **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** — Full federated architecture guide, safety invariants, execution lifecycle, `DROP_PAGES` reclamation state machine, trust model, and per-repo verification workflow.
+- **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** — Full federated architecture guide, safety invariants, execution lifecycle, `ModLifecycleFlush` / `ScheduleLeased` contract, `DROP_PAGES` reclamation state machine, trust model, and per-repo verification workflow.
+- **[`TESTS.md`](TESTS.md)** — Complete verification pyramid, test inventory per crate, `chunk_throughput` & `v03_subsystem_bench` benchmarks, Loom/Miri/proptest checks, and `cargo llvm-cov` (`>= 85%`) coverage status.
+- **[`GEMINI.md`](GEMINI.md)** — Workspace contributor and AI-agent engineering guide.
+- **[`CHANGELOG.md`](CHANGELOG.md)** — Release and `[Unreleased]` change history.
 
 ## Standalone Usage
 
@@ -31,9 +34,11 @@ bamabi_watcher = { git = "https://github.com/yaga-simha/bamabi-core.git", branch
 # bamabi_host = { git = "https://github.com/yaga-simha/bamabi-core.git", branch = "main", features = ["diagnostics", "signature-verification"] }
 ```
 
+> **Note (`keygen`):** `bamabi_trust::keygen` items remain upstream-gated because `bamabi_trust/keygen` (`ssh-key/getrandom`) is not enabled by `signature-verification` in [`crates/bamabi_host_sys/Cargo.toml`](crates/bamabi_host_sys/Cargo.toml). Use `cargo-bam keygen` (`bamabi-tools`) or depend directly on `bamabi_trust` with `features = ["keygen"]` for key generation.
+
 ## Local & CI Verification
 
-All checks run standalone inside `bamabi-core` with zero sibling repositories required:
+All checks run standalone inside `bamabi-core` with zero sibling repositories required (see [`TESTS.md`](TESTS.md) for detailed test/bench catalogs):
 
 ```bash
 # Formatting, #![forbid(unsafe_code)], clippy (default / sig-verif / all-features), and rustdoc
@@ -42,6 +47,7 @@ grep -q '#!\[forbid(unsafe_code)\]' crates/bamabi_host/src/lib.rs
 grep -q '#!\[forbid(unsafe_code)\]' crates/bamabi_watcher/src/lib.rs
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p bamabi_host_sys -p bamabi_host --features signature-verification --all-targets -- -D warnings
+cargo clippy -p bamabi_host_sys --features bridge-reflect --all-targets -- -D warnings
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
@@ -61,12 +67,13 @@ cargo check --manifest-path tests/fixtures/panic_abort_mod/Cargo.toml
 # C99 asymmetric mod + layout verification (auto-stages target/include/bamabi.h if needed)
 make -C tests/asymmetric_c_mod
 
-# Concurrency, soak, throughput smoke benchmark, coverage (>= 85%), and Miri
+# Concurrency (3 Loom models), 10k soak, benchmark smoke gates, coverage (>= 85%), and Miri
 cargo test -p bamabi_host_sys --test loom_drop_trampoline --release
 BAM_SOAK_CYCLES=10000 cargo test -p bamabi_host --test soak_10k_reloads --release
 cargo bench -p bamabi_host --bench chunk_throughput -- --test
+cargo bench -p bamabi_host --bench v03_subsystem_bench -- --test
 cargo llvm-cov --no-report --all-features -p bamabi_host_sys -p bamabi_host -p bamabi_watcher
-cargo llvm-cov report --ignore-filename-regex '(crates/bamabi_host_sys/src/(drop_trampoline|handle_header|lib|loader|registry|schedule|sync_ptr|ffi/validation)|crates/bamabi_(host|watcher)/|(tests|examples|xtask|benches)/|\.cargo/)' --fail-under-lines 85
+cargo llvm-cov report --ignore-filename-regex '(crates/bamabi_watcher/|(tests|examples|xtask|benches)/|\.cargo/)' --fail-under-lines 85
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bamabi_host_sys --lib
 
 # Spellcheck and dependency/license/source audit

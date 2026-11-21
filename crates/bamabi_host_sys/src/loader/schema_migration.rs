@@ -977,3 +977,7 @@ pub fn restore_mod_dynamic_columns_after_reload(
 #[cfg(test)]
 #[path = "../../tests/unit/schema_migration_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/schema_migration_coverage_tests.rs"]
+mod coverage_tests;

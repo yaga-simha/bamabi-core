@@ -276,6 +276,361 @@ impl std::error::Error for ModDagError {
     }
 }
 
+/// Fieldless discriminant identifying a [`ModDagError`] variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ModDagErrorKind {
+    /// Filesystem I/O failure reading a directory or `mod.toml`.
+    Io,
+    /// TOML syntax or schema failure parsing `mod.toml`.
+    TomlParse,
+    /// Neither `[mod].id` nor `[mod].name` was specified (or both were empty).
+    MissingModName,
+    /// `[mod].version` failed SemVer parsing.
+    InvalidVersion,
+    /// `[mod].abi_version` failed SemVer requirement parsing.
+    InvalidAbiVersion,
+    /// `[mod].abi_version` does not match the host's ABI version.
+    IncompatibleAbiVersion,
+    /// A dependency entry in `[dependencies]` or `[optional_dependencies]` failed SemVer parsing.
+    InvalidDependencyReq,
+    /// Two discovered `mod.toml` files declared the same canonical mod name.
+    DuplicateModName,
+    /// Expected native shared-library file was not found.
+    MissingLibrary,
+    /// A required dependency is missing (or failed earlier validation/load).
+    MissingDependency,
+    /// A dependency exists but its version does not satisfy the SemVer requirement.
+    IncompatibleDependencyVersion,
+    /// One or more mods formed (or depended on) a dependency cycle and were quarantined.
+    CycleQuarantined,
+    /// Dynamic shared-library loading failed for a mod in the topological load order.
+    LoadFailed,
+    /// Target [`ModId`] was not found in [`bamabi_host_sys::ModHost`].
+    ModNotFound,
+}
+
+impl ModDagErrorKind {
+    /// Returns a stable `snake_case` identifier for this error kind.
+    #[inline]
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Io => "io",
+            Self::TomlParse => "toml_parse",
+            Self::MissingModName => "missing_mod_name",
+            Self::InvalidVersion => "invalid_version",
+            Self::InvalidAbiVersion => "invalid_abi_version",
+            Self::IncompatibleAbiVersion => "incompatible_abi_version",
+            Self::InvalidDependencyReq => "invalid_dependency_req",
+            Self::DuplicateModName => "duplicate_mod_name",
+            Self::MissingLibrary => "missing_library",
+            Self::MissingDependency => "missing_dependency",
+            Self::IncompatibleDependencyVersion => "incompatible_dependency_version",
+            Self::CycleQuarantined => "cycle_quarantined",
+            Self::LoadFailed => "load_failed",
+            Self::ModNotFound => "mod_not_found",
+        }
+    }
+}
+
+impl ModDagError {
+    /// Returns the fieldless [`ModDagErrorKind`] identifying this error variant.
+    #[inline]
+    #[must_use]
+    pub const fn kind(&self) -> ModDagErrorKind {
+        match self {
+            Self::Io { .. } => ModDagErrorKind::Io,
+            Self::TomlParse { .. } => ModDagErrorKind::TomlParse,
+            Self::MissingModName { .. } => ModDagErrorKind::MissingModName,
+            Self::InvalidVersion { .. } => ModDagErrorKind::InvalidVersion,
+            Self::InvalidAbiVersion { .. } => ModDagErrorKind::InvalidAbiVersion,
+            Self::IncompatibleAbiVersion { .. } => ModDagErrorKind::IncompatibleAbiVersion,
+            Self::InvalidDependencyReq { .. } => ModDagErrorKind::InvalidDependencyReq,
+            Self::DuplicateModName { .. } => ModDagErrorKind::DuplicateModName,
+            Self::MissingLibrary { .. } => ModDagErrorKind::MissingLibrary,
+            Self::MissingDependency { .. } => ModDagErrorKind::MissingDependency,
+            Self::IncompatibleDependencyVersion { .. } => {
+                ModDagErrorKind::IncompatibleDependencyVersion
+            }
+            Self::CycleQuarantined { .. } => ModDagErrorKind::CycleQuarantined,
+            Self::LoadFailed { .. } => ModDagErrorKind::LoadFailed,
+            Self::ModNotFound { .. } => ModDagErrorKind::ModNotFound,
+        }
+    }
+
+    /// Returns the primary filesystem path associated with this error, if any.
+    ///
+    /// - For [`ModDagError::DuplicateModName`], returns `second_path` (the conflicting manifest).
+    /// - For [`ModDagError::MissingLibrary`] and [`ModDagError::LoadFailed`], returns `path`.
+    #[inline]
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Io { path, .. }
+            | Self::TomlParse { path, .. }
+            | Self::MissingModName { path }
+            | Self::InvalidVersion { path, .. }
+            | Self::InvalidAbiVersion { path, .. }
+            | Self::IncompatibleAbiVersion { path, .. }
+            | Self::InvalidDependencyReq { path, .. }
+            | Self::MissingLibrary { path, .. }
+            | Self::LoadFailed { path, .. }
+            | Self::DuplicateModName {
+                second_path: path, ..
+            } => Some(path.as_path()),
+            Self::MissingDependency { .. }
+            | Self::IncompatibleDependencyVersion { .. }
+            | Self::CycleQuarantined { .. }
+            | Self::ModNotFound { .. } => None,
+        }
+    }
+
+    /// Returns all filesystem paths referenced by this error (empty when no path applies).
+    ///
+    /// For [`ModDagError::DuplicateModName`], returns `[first_path, second_path]`.
+    #[must_use]
+    pub fn related_paths(&self) -> Vec<&Path> {
+        match self {
+            Self::Io { path, .. }
+            | Self::TomlParse { path, .. }
+            | Self::MissingModName { path }
+            | Self::InvalidVersion { path, .. }
+            | Self::InvalidAbiVersion { path, .. }
+            | Self::IncompatibleAbiVersion { path, .. }
+            | Self::InvalidDependencyReq { path, .. }
+            | Self::MissingLibrary { path, .. }
+            | Self::LoadFailed { path, .. } => vec![path.as_path()],
+            Self::DuplicateModName {
+                first_path,
+                second_path,
+                ..
+            } => vec![first_path.as_path(), second_path.as_path()],
+            Self::MissingDependency { .. }
+            | Self::IncompatibleDependencyVersion { .. }
+            | Self::CycleQuarantined { .. }
+            | Self::ModNotFound { .. } => Vec::new(),
+        }
+    }
+
+    /// Returns the canonical mod name associated with this error, if any.
+    #[inline]
+    #[must_use]
+    pub fn mod_name(&self) -> Option<&str> {
+        match self {
+            Self::IncompatibleAbiVersion { mod_name, .. }
+            | Self::InvalidDependencyReq { mod_name, .. }
+            | Self::DuplicateModName { mod_name, .. }
+            | Self::MissingLibrary { mod_name, .. }
+            | Self::MissingDependency { mod_name, .. }
+            | Self::IncompatibleDependencyVersion { mod_name, .. }
+            | Self::LoadFailed { mod_name, .. } => Some(mod_name.as_str()),
+            Self::Io { .. }
+            | Self::TomlParse { .. }
+            | Self::MissingModName { .. }
+            | Self::InvalidVersion { .. }
+            | Self::InvalidAbiVersion { .. }
+            | Self::CycleQuarantined { .. }
+            | Self::ModNotFound { .. } => None,
+        }
+    }
+
+    /// Returns the dependency mod name involved in this error, if any.
+    #[inline]
+    #[must_use]
+    pub fn dependency(&self) -> Option<&str> {
+        match self {
+            Self::InvalidDependencyReq { dependency, .. }
+            | Self::MissingDependency { dependency, .. }
+            | Self::IncompatibleDependencyVersion { dependency, .. } => Some(dependency.as_str()),
+            Self::Io { .. }
+            | Self::TomlParse { .. }
+            | Self::MissingModName { .. }
+            | Self::InvalidVersion { .. }
+            | Self::InvalidAbiVersion { .. }
+            | Self::IncompatibleAbiVersion { .. }
+            | Self::DuplicateModName { .. }
+            | Self::MissingLibrary { .. }
+            | Self::CycleQuarantined { .. }
+            | Self::LoadFailed { .. }
+            | Self::ModNotFound { .. } => None,
+        }
+    }
+
+    /// Returns the required SemVer constraint associated with this error, if any.
+    #[inline]
+    #[must_use]
+    pub fn required_version(&self) -> Option<&semver::VersionReq> {
+        match self {
+            Self::IncompatibleAbiVersion { required, .. }
+            | Self::MissingDependency { required, .. }
+            | Self::IncompatibleDependencyVersion { required, .. } => Some(required),
+            Self::Io { .. }
+            | Self::TomlParse { .. }
+            | Self::MissingModName { .. }
+            | Self::InvalidVersion { .. }
+            | Self::InvalidAbiVersion { .. }
+            | Self::InvalidDependencyReq { .. }
+            | Self::DuplicateModName { .. }
+            | Self::MissingLibrary { .. }
+            | Self::CycleQuarantined { .. }
+            | Self::LoadFailed { .. }
+            | Self::ModNotFound { .. } => None,
+        }
+    }
+
+    /// Returns the actual SemVer version found during a version check, if any.
+    ///
+    /// Returns `found` for [`ModDagError::IncompatibleDependencyVersion`] and `host_abi` for
+    /// [`ModDagError::IncompatibleAbiVersion`].
+    #[inline]
+    #[must_use]
+    pub fn found_version(&self) -> Option<&semver::Version> {
+        match self {
+            Self::IncompatibleDependencyVersion { found, .. }
+            | Self::IncompatibleAbiVersion {
+                host_abi: found, ..
+            } => Some(found),
+            Self::Io { .. }
+            | Self::TomlParse { .. }
+            | Self::MissingModName { .. }
+            | Self::InvalidVersion { .. }
+            | Self::InvalidAbiVersion { .. }
+            | Self::InvalidDependencyReq { .. }
+            | Self::DuplicateModName { .. }
+            | Self::MissingLibrary { .. }
+            | Self::MissingDependency { .. }
+            | Self::CycleQuarantined { .. }
+            | Self::LoadFailed { .. }
+            | Self::ModNotFound { .. } => None,
+        }
+    }
+
+    /// Returns the quarantined cycle member names, or an empty slice when this is not a cycle error.
+    #[inline]
+    #[must_use]
+    pub fn cycle_members(&self) -> &[String] {
+        match self {
+            Self::CycleQuarantined { cycle_members } => cycle_members.as_slice(),
+            Self::Io { .. }
+            | Self::TomlParse { .. }
+            | Self::MissingModName { .. }
+            | Self::InvalidVersion { .. }
+            | Self::InvalidAbiVersion { .. }
+            | Self::IncompatibleAbiVersion { .. }
+            | Self::InvalidDependencyReq { .. }
+            | Self::DuplicateModName { .. }
+            | Self::MissingLibrary { .. }
+            | Self::MissingDependency { .. }
+            | Self::IncompatibleDependencyVersion { .. }
+            | Self::LoadFailed { .. }
+            | Self::ModNotFound { .. } => &[],
+        }
+    }
+
+    /// Returns the underlying [`ModLoadError`] when this is [`ModDagError::LoadFailed`].
+    #[inline]
+    #[must_use]
+    pub fn load_error(&self) -> Option<&ModLoadError> {
+        match self {
+            Self::LoadFailed { source, .. } => Some(source.as_ref()),
+            Self::Io { .. }
+            | Self::TomlParse { .. }
+            | Self::MissingModName { .. }
+            | Self::InvalidVersion { .. }
+            | Self::InvalidAbiVersion { .. }
+            | Self::IncompatibleAbiVersion { .. }
+            | Self::InvalidDependencyReq { .. }
+            | Self::DuplicateModName { .. }
+            | Self::MissingLibrary { .. }
+            | Self::MissingDependency { .. }
+            | Self::IncompatibleDependencyVersion { .. }
+            | Self::CycleQuarantined { .. }
+            | Self::ModNotFound { .. } => None,
+        }
+    }
+
+    /// Returns the target [`ModId`] when this is [`ModDagError::ModNotFound`].
+    #[inline]
+    #[must_use]
+    pub fn mod_id(&self) -> Option<ModId> {
+        match self {
+            Self::ModNotFound { id } => Some(*id),
+            Self::Io { .. }
+            | Self::TomlParse { .. }
+            | Self::MissingModName { .. }
+            | Self::InvalidVersion { .. }
+            | Self::InvalidAbiVersion { .. }
+            | Self::IncompatibleAbiVersion { .. }
+            | Self::InvalidDependencyReq { .. }
+            | Self::DuplicateModName { .. }
+            | Self::MissingLibrary { .. }
+            | Self::MissingDependency { .. }
+            | Self::IncompatibleDependencyVersion { .. }
+            | Self::CycleQuarantined { .. }
+            | Self::LoadFailed { .. } => None,
+        }
+    }
+
+    /// Returns `true` if this error represents a quarantined dependency cycle
+    /// ([`ModDagError::CycleQuarantined`]).
+    #[inline]
+    #[must_use]
+    pub const fn is_cycle(&self) -> bool {
+        matches!(self, Self::CycleQuarantined { .. })
+    }
+
+    /// Returns `true` if this error is [`ModDagError::Io`] or wraps an underlying
+    /// [`std::io::Error`] in its error source chain (such as a [`ModDagError::LoadFailed`] caused
+    /// by a shadow-copy or signature-file I/O failure).
+    #[must_use]
+    pub fn is_io(&self) -> bool {
+        if matches!(self, Self::Io { .. }) {
+            return true;
+        }
+        let mut current = std::error::Error::source(self);
+        while let Some(err) = current {
+            if err.is::<std::io::Error>() {
+                return true;
+            }
+            current = err.source();
+        }
+        false
+    }
+
+    /// Returns `true` for per-mod diagnostics that do not abort a directory load.
+    ///
+    /// In [`ModWorldExt::load_mods_dir_with`](crate::ModWorldExt::load_mods_dir_with):
+    /// - [`ModDagError::Io`] is non-recoverable (`false`) because `discover_mod_manifests` aborts
+    ///   the directory load via `?` on directory-level I/O failures (even though per-manifest file
+    ///   I/O errors are buffered into [`DirectoryLoadReport::errors`]).
+    /// - [`ModDagError::ModNotFound`] is non-recoverable (`false`) because it represents a direct
+    ///   lookup failure for an explicit [`ModId`] rather than a per-mod directory diagnostic.
+    /// - All remaining variants (`TomlParse`, `MissingModName`, `InvalidVersion`,
+    ///   `InvalidAbiVersion`, `IncompatibleAbiVersion`, `InvalidDependencyReq`,
+    ///   `DuplicateModName`, `MissingLibrary`, `MissingDependency`,
+    ///   `IncompatibleDependencyVersion`, `CycleQuarantined`, and `LoadFailed`) are collected into
+    ///   [`DirectoryLoadReport::errors`] so independent acyclic mods continue loading (`true`).
+    #[inline]
+    #[must_use]
+    pub const fn is_recoverable(&self) -> bool {
+        match self {
+            Self::TomlParse { .. }
+            | Self::MissingModName { .. }
+            | Self::InvalidVersion { .. }
+            | Self::InvalidAbiVersion { .. }
+            | Self::IncompatibleAbiVersion { .. }
+            | Self::InvalidDependencyReq { .. }
+            | Self::DuplicateModName { .. }
+            | Self::MissingLibrary { .. }
+            | Self::MissingDependency { .. }
+            | Self::IncompatibleDependencyVersion { .. }
+            | Self::CycleQuarantined { .. }
+            | Self::LoadFailed { .. } => true,
+            Self::Io { .. } | Self::ModNotFound { .. } => false,
+        }
+    }
+}
+
 /// Result of running SemVer validation and Kahn's topological sort over discovered manifests.
 #[derive(Debug)]
 pub struct DagResolution {
@@ -427,3 +782,11 @@ impl ModDependencyGraph {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/mod_dag_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/mod_dag_coverage_tests.rs"]
+mod coverage_tests;

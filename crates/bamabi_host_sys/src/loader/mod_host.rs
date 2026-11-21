@@ -216,6 +216,13 @@ impl LoadedMod {
         self.is_active.load(Ordering::Acquire)
     }
 
+    /// Iterates over the [`InternedScheduleLabel`]s in which this mod registered guest systems or
+    /// scoped system sets.
+    #[inline]
+    pub fn registered_schedule_labels(&self) -> impl Iterator<Item = InternedScheduleLabel> + '_ {
+        self.registered_named_sets.iter().map(|(label, _)| *label)
+    }
+
     /// Returns the verified cryptographic signature metadata for this mod, if signature
     /// verification was enforced during load.
     #[cfg(feature = "signature-verification")]
@@ -873,6 +880,10 @@ fn excise_and_unload_mod_inner<F: FnOnce(&mut World)>(
     despawn_scoped: bool,
     before_dlclose: F,
 ) -> Result<(Arc<str>, PathBuf, usize), ModLoadError> {
+    let leased = world
+        .get_resource::<Schedules>()
+        .map(Schedules::get_temporarily_removed)
+        .unwrap_or_default();
     let (is_active, owned_named_sets, shared_named_sets, observer_entities) = {
         let Some(mut mod_host) = world.get_resource_mut::<ModHost>() else {
             return Err(ModLoadError::ModNotFound { id });
@@ -880,6 +891,16 @@ fn excise_and_unload_mod_inner<F: FnOnce(&mut World)>(
         let Some(idx) = mod_host.loaded_libraries.iter().position(|m| m.id == id) else {
             return Err(ModLoadError::ModNotFound { id });
         };
+        if !leased.is_empty()
+            && let Some(label) = mod_host.loaded_libraries[idx]
+                .registered_schedule_labels()
+                .find(|label| leased.contains(label))
+        {
+            return Err(ModLoadError::ScheduleLeased {
+                id,
+                schedule: format!("{label:?}"),
+            });
+        }
         let is_active = Arc::clone(&mod_host.loaded_libraries[idx].is_active);
         let taken = core::mem::take(&mut mod_host.loaded_libraries[idx].registered_named_sets);
         let observers = core::mem::take(&mut mod_host.loaded_libraries[idx].observer_entities);
@@ -1040,8 +1061,15 @@ where
         .unwrap_or_default();
 
     for id in ids_lifo {
-        if let Ok((name, path, removed)) = excise_and_unload_mod_in_world(world, id, |_| {}) {
-            on_each_unloaded(world, id, name, path, removed);
+        match excise_and_unload_mod_in_world(world, id, |_| {}) {
+            Ok((name, path, removed)) => on_each_unloaded(world, id, name, path, removed),
+            Err(err) => {
+                tracing::warn!(
+                    mod_id = ?id,
+                    error = %err,
+                    "skipping mod unload in unload_all_mods_in_world"
+                );
+            }
         }
     }
 }

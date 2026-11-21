@@ -75,10 +75,268 @@ jobs:
             exit 1
           fi
 
-      - name: Clippy across default, signature-verification, and all-features
+      - name: "Audit no #[allow] attributes in crates/*/src"
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -rnE '#!?\[allow' crates/*/src; then
+            echo "ERROR: Found forbidden #[allow] / #![allow] attribute in crates/*/src!"
+            exit 1
+          fi
+
+      - name: Audit no non-test unwrap/expect/panic in crates/*/src
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          import re
+          import sys
+
+          ITEM_KW = {
+              "fn", "mod", "struct", "enum", "trait", "impl", "type", "static",
+              "const", "use", "macro_rules", "let", "unsafe", "async", "extern",
+          }
+          VIOL_RE = re.compile(r"\.(?:unwrap|expect)\s*\(|\b(?:panic|unreachable|todo)!\s*[\(\[\{]")
+          CFG_TEST_RE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+
+          def strip_comments_and_strings(src: str) -> str:
+              out = []
+              n = len(src)
+              i = 0
+              while i < n:
+                  c = src[i]
+                  nxt = src[i + 1] if i + 1 < n else ""
+                  if c == "/" and nxt == "/":
+                      while i < n and src[i] != "\n":
+                          out.append(" ")
+                          i += 1
+                      continue
+                  if c == "/" and nxt == "*":
+                      depth = 1
+                      out.extend("  ")
+                      i += 2
+                      while i < n and depth > 0:
+                          if src[i] == "/" and i + 1 < n and src[i + 1] == "*":
+                              depth += 1
+                              out.extend("  ")
+                              i += 2
+                          elif src[i] == "*" and i + 1 < n and src[i + 1] == "/":
+                              depth -= 1
+                              out.extend("  ")
+                              i += 2
+                          else:
+                              out.append("\n" if src[i] == "\n" else " ")
+                              i += 1
+                      continue
+                  raw_prefix = 0
+                  if c == "r" and nxt in ('"', "#"):
+                      raw_prefix = 1
+                  elif c in ("b", "c") and nxt == "r" and i + 2 < n and src[i + 2] in ('"', "#"):
+                      raw_prefix = 2
+                  if raw_prefix and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+                      j = i + raw_prefix
+                      hashes = 0
+                      while j < n and src[j] == "#":
+                          hashes += 1
+                          j += 1
+                      if j < n and src[j] == '"':
+                          out.extend(src[i : j + 1])
+                          i = j + 1
+                          end_seq = '"' + ("#" * hashes)
+                          while i < n and not src.startswith(end_seq, i):
+                              out.append("\n" if src[i] == "\n" else " ")
+                              i += 1
+                          if i < n:
+                              out.extend(end_seq)
+                              i += len(end_seq)
+                          continue
+                  str_prefix = 0
+                  if c == '"':
+                      str_prefix = 0
+                  elif c in ("b", "c") and nxt == '"' and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+                      str_prefix = 1
+                  if c == '"' or str_prefix:
+                      out.extend(src[i : i + str_prefix + 1])
+                      i += str_prefix + 1
+                      while i < n:
+                          ch = src[i]
+                          if ch == "\\":
+                              out.append(" ")
+                              i += 1
+                              if i < n:
+                                  out.append("\n" if src[i] == "\n" else " ")
+                                  i += 1
+                          elif ch == '"':
+                              out.append('"')
+                              i += 1
+                              break
+                          else:
+                              out.append("\n" if ch == "\n" else " ")
+                              i += 1
+                      continue
+                  if c == "'":
+                      if nxt == "\\":
+                          out.append("'")
+                          i += 1
+                          while i < n:
+                              ch = src[i]
+                              if ch == "\\":
+                                  out.append(" ")
+                                  i += 1
+                                  if i < n:
+                                      out.append("\n" if src[i] == "\n" else " ")
+                                      i += 1
+                              elif ch == "'":
+                                  out.append("'")
+                                  i += 1
+                                  break
+                              else:
+                                  out.append("\n" if ch == "\n" else " ")
+                                  i += 1
+                          continue
+                      elif i + 2 < n and src[i + 2] == "'" and nxt != "\n":
+                          out.extend(["'", " ", "'"])
+                          i += 3
+                          continue
+                  out.append(c)
+                  i += 1
+              return "".join(out)
+
+          def non_test_mask(stripped: str) -> list[bool]:
+              n = len(stripped)
+              lines = stripped.splitlines(keepends=True)
+              line_non_test = [False] * len(lines)
+              brace = paren = bracket = 0
+              in_cfg = False
+              cfg_entered_brace = False
+              cfg_base = (0, 0, 0)
+              cfg_decided_kind = False
+              cfg_allow_comma = True
+              cfg_angle = 0
+              cfg_spans = {m.start(): m.end() for m in CFG_TEST_RE.finditer(stripped)}
+              line_idx = 0
+              i = 0
+              while i < n:
+                  if not in_cfg and i in cfg_spans:
+                      in_cfg = True
+                      cfg_entered_brace = False
+                      cfg_base = (brace, paren, bracket)
+                      cfg_decided_kind = False
+                      cfg_allow_comma = True
+                      cfg_angle = 0
+                      end = cfg_spans[i]
+                      while i < end:
+                          if stripped[i] == "\n":
+                              line_idx += 1
+                          i += 1
+                      continue
+                  ch = stripped[i]
+                  if ch == "\n":
+                      line_idx += 1
+                      i += 1
+                      continue
+                  if not in_cfg:
+                      if not ch.isspace():
+                          line_non_test[line_idx] = True
+                      if ch == "{":
+                          brace += 1
+                      elif ch == "}":
+                          brace = max(0, brace - 1)
+                      elif ch == "(":
+                          paren += 1
+                      elif ch == ")":
+                          paren = max(0, paren - 1)
+                      elif ch == "[":
+                          bracket += 1
+                      elif ch == "]":
+                          bracket = max(0, bracket - 1)
+                      i += 1
+                      continue
+                  if ch.isspace():
+                      i += 1
+                      continue
+                  if not cfg_entered_brace and not cfg_decided_kind and (brace, paren, bracket) == cfg_base:
+                      if ch == "#" and i + 1 < n and stripped[i + 1] == "[":
+                          bracket += 1
+                          i += 2
+                          continue
+                      if ch.isalpha() or ch == "_":
+                          j = i
+                          while j < n and (stripped[j].isalnum() or stripped[j] == "_"):
+                              j += 1
+                          ident = stripped[i:j]
+                          if ident == "pub":
+                              i = j
+                              continue
+                          cfg_decided_kind = True
+                          cfg_allow_comma = ident not in ITEM_KW
+                          i = j
+                          continue
+                  if not cfg_entered_brace and (brace, paren, bracket) == cfg_base:
+                      if ch == ";" or (ch == "," and cfg_allow_comma and cfg_angle == 0):
+                          in_cfg = False
+                          i += 1
+                          continue
+                      if ch == "{":
+                          cfg_entered_brace = True
+                          brace += 1
+                          i += 1
+                          continue
+                      if ch == "}":
+                          in_cfg = False
+                          brace = max(0, brace - 1)
+                          i += 1
+                          continue
+                      if cfg_allow_comma:
+                          prev = stripped[i - 1] if i > 0 else ""
+                          nxt = stripped[i + 1] if i + 1 < n else ""
+                          if ch == "<" and nxt not in ("<", "=") and (prev.isalnum() or prev in ("_", ":")):
+                              cfg_angle += 1
+                          elif ch == ">" and cfg_angle > 0 and prev not in ("-", "=", ">"):
+                              cfg_angle -= 1
+                  if ch == "{":
+                      brace += 1
+                  elif ch == "}":
+                      brace = max(0, brace - 1)
+                      if cfg_entered_brace and brace <= cfg_base[0]:
+                          in_cfg = False
+                  elif ch == "(":
+                      paren += 1
+                  elif ch == ")":
+                      paren = max(0, paren - 1)
+                  elif ch == "[":
+                      bracket += 1
+                  elif ch == "]":
+                      bracket = max(0, bracket - 1)
+                  i += 1
+              return line_non_test
+
+          hits = []
+          for path in sorted(glob.glob("crates/*/src/**/*.rs", recursive=True)):
+              with open(path, "r", encoding="utf-8") as fh:
+                  src = fh.read()
+              stripped = strip_comments_and_strings(src)
+              mask = non_test_mask(stripped)
+              for lineno, (orig_line, stripped_line, is_non_test) in enumerate(
+                  zip(src.splitlines(), stripped.splitlines(), mask), 1
+              ):
+                  if is_non_test and VIOL_RE.search(stripped_line):
+                      hits.append(f"{path}:{lineno}: {orig_line.strip()}")
+
+          if hits:
+              print("ERROR: Found non-test .unwrap()/.expect()/panic!/unreachable!/todo! in crates/*/src:")
+              for hit in hits:
+                  print(f"  {hit}")
+              sys.exit(1)
+          print("OK: zero non-test unwrap/expect/panic violations in crates/*/src")
+          PY
+
+      - name: Clippy across default, signature-verification, bridge-reflect, and all-features
         run: |
           cargo clippy --workspace --all-targets -- -D warnings
           cargo clippy -p bamabi_host_sys -p bamabi_host --features signature-verification --all-targets -- -D warnings
+          cargo clippy -p bamabi_host_sys --features bridge-reflect --all-targets -- -D warnings
           cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Rustdoc build (default and all-features)
@@ -128,7 +386,7 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run Layer 2 workspace, feature, doc, and 10k soak suites
+      - name: Run Layer 2 workspace, feature, bamabi_watcher, doc, and 10k soak suites
         shell: bash
         env:
           MSYS_NO_PATHCONV: "1"
@@ -143,6 +401,7 @@ jobs:
           cargo test --workspace
           cargo test -p bamabi_host_sys -p bamabi_host --features signature-verification
           cargo test --workspace --all-features
+          cargo test -p bamabi_watcher --all-features
           cargo test --doc --all-features
           if [ "${RUNNER_OS:-}" = "Linux" ]; then
             BAM_SOAK_CYCLES=10000 cargo test -p bamabi_host --test soak_10k_reloads --release
@@ -297,10 +556,10 @@ jobs:
           fi
 
   # ============================================================================
-  # 5. Benchmark Smoke Gate (`chunk_throughput -- --test`)
+  # 5. Benchmark Smoke Gate (`chunk_throughput` & `v03_subsystem_bench` `-- --test`)
   # ============================================================================
   benchmark-gate:
-    name: Benchmark Smoke Gate (chunk_throughput)
+    name: Benchmark Smoke Gate (chunk_throughput & v03_subsystem_bench)
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
@@ -317,7 +576,7 @@ jobs:
         with:
           key: bench-gate
 
-      - name: Pre-stage external asymmetric mods & run `chunk_throughput -- --test`
+      - name: Pre-stage external asymmetric mods & run benchmark smoke tests
         run: |
           mkdir -p target/fixtures
           cargo test -p bamabi_host --test ffi test_c99_shared_library_mutates_rust_components_via_vtable
@@ -329,12 +588,13 @@ jobs:
              target/fixtures/libasymmetric_c_mod.so
           BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
             cargo bench -p bamabi_host --bench chunk_throughput -- --test
+          cargo bench -p bamabi_host --bench v03_subsystem_bench -- --test
 
   # ============================================================================
-  # 6. Line Coverage Gate (`>= 85%` on `ffi/` and `system/`)
+  # 6. Line Coverage Gate (`>= 85%` on `bamabi_host_sys` & `bamabi_host`)
   # ============================================================================
   coverage:
-    name: Coverage Gate (>=85% ffi/ & system/)
+    name: Coverage Gate (>=85% bamabi_host_sys & bamabi_host)
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
@@ -358,12 +618,15 @@ jobs:
         with:
           key: llvm-cov
 
-      - name: Enforce >= 85% line coverage on `ffi/` and `system/`
+      # `crates/bamabi_watcher/` remains excluded because OS `notify` / filesystem watcher
+      # event-loop branches yield 76.38% line coverage (< 85%), whereas all `bamabi_host_sys`
+      # and `bamabi_host` files are >= 85% and combined `host_sys + host` coverage is ~93.36%.
+      - name: Enforce >= 85% line coverage on `bamabi_host_sys` & `bamabi_host`
         run: |
           cargo llvm-cov --no-report --all-features \
             -p bamabi_host_sys -p bamabi_host -p bamabi_watcher
           cargo llvm-cov report \
-            --ignore-filename-regex '(crates/bamabi_host_sys/src/(drop_trampoline|handle_header|lib|loader|registry|schedule|sync_ptr|ffi/validation)|crates/bamabi_(host|watcher)/|(tests|examples|xtask|benches)/|\.cargo/)' \
+            --ignore-filename-regex '(crates/bamabi_watcher/|(tests|examples|xtask|benches)/|\.cargo/)' \
             --fail-under-lines 85
 
   # ============================================================================
@@ -391,8 +654,14 @@ jobs:
         with:
           key: miri-tree-borrows
 
-      - name: Run Miri on `bamabi_host_sys` unit tests
-        run: cargo +nightly miri test -p bamabi_host_sys --lib
+      # Note: `signature-verification` (`signing_tests`) is intentionally excluded from Miri because
+      # its `TempDirGuard` filesystem tests fail under Miri isolation and `loader::signing` is
+      # `#[forbid(unsafe_code)]`; `bridge-reflect` (`ffi::validation`) exercises unsafe `ReflectFromPtr`
+      # slot casting under `-Zmiri-tree-borrows`.
+      - name: Run Miri on `bamabi_host_sys` unit tests (default and `bridge-reflect`)
+        run: |
+          cargo +nightly miri test -p bamabi_host_sys --lib
+          cargo +nightly miri test -p bamabi_host_sys --lib --features bridge-reflect -- ffi::validation
 
   # ============================================================================
   # 8. Loom Atomic Concurrency Verification
@@ -412,7 +681,7 @@ jobs:
         with:
           key: loom-concurrency
 
-      - name: Verify `DROP_PAGES` generation/epoch atomics under Loom
+      - name: Verify `DROP_PAGES` generation/epoch & ABA reuse models under Loom (3 models)
         run: cargo test -p bamabi_host_sys --test loom_drop_trampoline --release
 
   # ============================================================================

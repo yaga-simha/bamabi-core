@@ -2347,3 +2347,7 @@ impl ModRegistry {
         self.snapshot.relation_count()
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/catalog_coverage_tests.rs"]
+mod coverage_tests;

@@ -75,3 +75,8 @@ path = "tests/soak_10k_reloads.rs"
 name = "chunk_throughput"
 path = "benches/chunk_throughput.rs"
 harness = false
+
+[[bench]]
+name = "v03_subsystem_bench"
+path = "benches/v03_subsystem_bench.rs"
+harness = false

@@ -310,3 +310,7 @@ impl ModAppExt for App {
         self.world_mut().load_mods_dir_with(dir, options)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/app_ext_coverage_tests.rs"]
+mod coverage_tests;

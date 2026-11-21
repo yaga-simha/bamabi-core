@@ -23,13 +23,58 @@ use bamabi_host_sys::{
     ModErrorPolicy, ModErrorPolicyConfig, ModSystemFaulted, StartupCompleted,
     mark_startup_completed,
 };
-use bevy_app::{App, First, Last, Plugin, PostStartup, Update};
+use bevy_app::{App, First, Last, MainScheduleOrder, Plugin, PostStartup, Update};
 use bevy_ecs::message::{Message, Messages};
-use bevy_ecs::schedule::IntoScheduleConfigs;
+use bevy_ecs::prelude::Resource;
+use bevy_ecs::schedule::{IntoScheduleConfigs, ScheduleLabel};
+
+/// Dedicated safe-point schedule inserted into [`MainScheduleOrder`] after [`Last`] to drain
+/// deferred [`ModCommandsExt`] lifecycle operations once frame schedules have returned to
+/// [`Schedules`](bevy_ecs::schedule::Schedules).
+///
+/// Mods cannot target `ModLifecycleFlush` via built-in [`ScheduleId`](bamabi_sys::ScheduleId)s,
+/// so while it runs only `Main` and `ModLifecycleFlush` are leased.
+#[derive(ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModLifecycleFlush;
+
+#[derive(Resource, Default)]
+struct ModLifecycleFlushInstalled;
+
+/// Idempotently initializes [`ModLifecycleFlush`], orders it after [`Last`] in
+/// [`MainScheduleOrder`] (when present), initializes `PendingModLifecycleOps`, and registers
+/// `flush_pending_mod_lifecycle_ops` into [`ModLifecycleFlush`] exactly once.
+pub fn ensure_mod_lifecycle_flush_schedule(app: &mut App) {
+    app.init_schedule(ModLifecycleFlush);
+    let flush_label = ModLifecycleFlush.intern();
+    if let Some(mut order) = app.world_mut().get_resource_mut::<MainScheduleOrder>()
+        && !order.labels.contains(&flush_label)
+    {
+        let last_label = Last.intern();
+        if order.labels.contains(&last_label) {
+            order.insert_after(Last, ModLifecycleFlush);
+        } else {
+            order.labels.push(flush_label);
+        }
+    }
+    app.init_resource::<PendingModLifecycleOps>();
+    if !app
+        .world()
+        .contains_resource::<ModLifecycleFlushInstalled>()
+    {
+        app.init_resource::<ModLifecycleFlushInstalled>();
+        app.add_systems(ModLifecycleFlush, flush_pending_mod_lifecycle_ops);
+    }
+}
+
+#[derive(Resource, Default)]
+struct StartupTrackerInstalled;
 
 pub(crate) fn ensure_startup_tracker(app: &mut App) {
     if !app.world().contains_resource::<StartupCompleted>() {
         app.insert_resource(StartupCompleted(false));
+    }
+    if !app.world().contains_resource::<StartupTrackerInstalled>() {
+        app.init_resource::<StartupTrackerInstalled>();
         app.add_systems(PostStartup, mark_startup_completed);
     }
 }
@@ -156,10 +201,7 @@ impl Plugin for ConfiguredAbiModPlugin {
             app.add_systems(First, sync_mod_budget_policy.before(ModSystemSet::All));
             app.add_systems(Last, flush_mod_budgets);
         }
-        if !app.world().contains_resource::<PendingModLifecycleOps>() {
-            app.init_resource::<PendingModLifecycleOps>();
-            app.add_systems(Last, flush_pending_mod_lifecycle_ops);
-        }
+        ensure_mod_lifecycle_flush_schedule(app);
 
         #[cfg(feature = "diagnostics")]
         app.add_systems(
@@ -168,3 +210,7 @@ impl Plugin for ConfiguredAbiModPlugin {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/plugin_coverage_tests.rs"]
+mod coverage_tests;

@@ -24,7 +24,10 @@
 //!    fan-out traversal (`1k` parents × `10` = `10k` edges) vs Native Bevy `Query<&Children>`.
 
 #![deny(unsafe_op_in_unsafe_fn)]
-#![allow(clippy::cast_ptr_alignment, unreachable_pub)]
+#![expect(
+    clippy::cast_ptr_alignment,
+    reason = "FFI column pointers returned by host_iter_column_* are host-aligned for the declared component types."
+)]
 
 use bamabi_host::{AbiModPlugin, ComponentOptions, ModAppExt, ModComponent, ModRegistry};
 use bamabi_host_sys::{

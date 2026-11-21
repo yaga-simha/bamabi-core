@@ -29,7 +29,7 @@ jobs:
         with:
           key: tsan-loom
 
-      - name: Run `loom` drop-trampoline publish/reclaim model tests
+      - name: Run `loom` drop-trampoline publish/reclaim & ABA reuse model tests (3 models)
         run: cargo +nightly test -p bamabi_host_sys --test loom_drop_trampoline --release
 
       - name: Stage uninstrumented guest fixtures before enabling TSan
@@ -47,6 +47,7 @@ jobs:
             cc -std=c99 -O2 -shared -fPIC -I target/include "$src" -o "target/fixtures/lib${stem}.so"
           done
 
+      # `--test lifecycle` includes `leased_schedule_soundness` (alongside `tests/fixtures/c_mods/ordered_sets_mod.c`).
       - name: Run multi-threaded scheduler & lifecycle suites under ThreadSanitizer
         env:
           RUSTFLAGS: "-Zsanitizer=thread"

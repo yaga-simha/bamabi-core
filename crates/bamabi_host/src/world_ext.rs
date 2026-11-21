@@ -7,8 +7,9 @@ use crate::events::{LoadedModInfo, ModLoaded, ModSystemFaulted, ModUnloaded};
 pub use crate::mod_dag::{DirectoryLoadReport, ModDagError, ModDependencyGraph, ModTomlManifest};
 use crate::mod_dag::{discover_mod_manifests, resolve_dependency_dag};
 use crate::schedule_sets::{
-    ModScheduleMap, ModVisibleSets, StartupCompleted, prevalidate_mod_schedules_and_ordering,
-    run_late_startup_systems_in_world, schedule_mod_systems_in_world,
+    ModScheduleMap, ModVisibleSets, StartupCompleted, leased_schedules, mod_schedule_labels,
+    prevalidate_mod_schedules_and_ordering, run_late_startup_systems_in_world,
+    schedule_mod_systems_in_world,
 };
 pub use bamabi_host_sys::loader::ModScoped;
 use bamabi_host_sys::loader::{
@@ -24,7 +25,6 @@ use bamabi_host_sys::{
     PersistentMessageCursors, WorldDropGuard, ensure_children_registered_in_world,
     ensure_dynamic_hook_map_in_world, excise_and_unload_mod_in_world, load_mod_in_world,
     restore_mod_state_in_world, rollback_unscheduled_mod_in_world, save_mod_state_in_world,
-    unload_all_mods_in_world,
 };
 #[cfg(feature = "signature-verification")]
 use bamabi_host_sys::{ModTrustPolicy, default_signature_path_for, preverify_mod_on_disk};
@@ -308,6 +308,7 @@ fn load_mod_with_optional_state_and_migration(
 
     if let Err(err) = prevalidate_mod_schedules_and_ordering(
         world,
+        mod_id,
         &path_buf,
         &mod_name,
         options.strict,
@@ -412,6 +413,34 @@ fn resolve_cascade_ids(world: &World, id: ModId) -> Result<Vec<ModId>, ModLoadEr
         .unwrap_or_else(|| vec![id]))
 }
 
+fn ensure_cascade_schedules_not_leased(
+    world: &World,
+    root_id: ModId,
+    cascade_ids: &[ModId],
+) -> Result<(), ModLoadError> {
+    let leased = leased_schedules(world);
+    if leased.is_empty() {
+        return Ok(());
+    }
+    let mod_labels = mod_schedule_labels(world, cascade_ids);
+    if let Some(label) = leased.intersection(&mod_labels).next().copied() {
+        let offending_id = world
+            .get_resource::<ModHost>()
+            .and_then(|host| {
+                cascade_ids.iter().copied().find(|&tid| {
+                    host.get_mod(tid)
+                        .is_some_and(|m| m.registered_schedule_labels().any(|l| l == label))
+                })
+            })
+            .unwrap_or(root_id);
+        return Err(ModLoadError::ScheduleLeased {
+            id: offending_id,
+            schedule: format!("{label:?}"),
+        });
+    }
+    Ok(())
+}
+
 fn reload_mod_cascade(
     world: &mut World,
     id: ModId,
@@ -420,6 +449,7 @@ fn reload_mod_cascade(
 ) -> Result<ModId, ModLoadError> {
     ensure_world_mod_resources(world);
     let forward_ids = resolve_cascade_ids(world, id)?;
+    ensure_cascade_schedules_not_leased(world, id, &forward_ids)?;
 
     let mut plan = Vec::with_capacity(forward_ids.len());
     for tid in forward_ids {
@@ -753,7 +783,9 @@ impl ModWorldExt for World {
         }
         let interned = label.intern();
         self.init_resource::<Schedules>();
-        if let Some(mut schedules) = self.get_resource_mut::<Schedules>() {
+        if let Some(mut schedules) = self.get_resource_mut::<Schedules>()
+            && !schedules.get_temporarily_removed().contains(&interned)
+        {
             let _ = schedules.entry(interned);
         }
         self.init_resource::<ModScheduleMap>();
@@ -837,6 +869,7 @@ impl ModWorldExt for World {
     fn unload_mod(&mut self, id: ModId) -> Result<(), ModLoadError> {
         ensure_world_mod_resources(self);
         let forward_ids = resolve_cascade_ids(self, id)?;
+        ensure_cascade_schedules_not_leased(self, id, &forward_ids)?;
         for target_id in forward_ids.into_iter().rev() {
             unload_single_mod_in_world(self, target_id, false)?;
         }
@@ -845,12 +878,40 @@ impl ModWorldExt for World {
 
     fn unload_all_mods(&mut self) -> &mut Self {
         ensure_world_mod_resources(self);
-        unload_all_mods_in_world(self, |world, id, name, path, removed_systems| {
-            despawn_loaded_mod_entities(world, id);
-            run_mod_unload_hooks(world, id);
-            emit_mod_unloaded_once(world, id, &name, path, removed_systems);
-        });
-        if let Some(mut dag) = self.get_resource_mut::<ModDependencyGraph>() {
+        let ids_lifo: Vec<ModId> = self
+            .get_resource::<ModHost>()
+            .map(|h| h.loaded_mods().iter().rev().map(LoadedMod::id).collect())
+            .unwrap_or_default();
+
+        for id in ids_lifo {
+            if !self
+                .get_resource::<ModHost>()
+                .is_some_and(|h| h.contains_mod(id))
+            {
+                continue;
+            }
+            let check_ids = resolve_cascade_ids(self, id).unwrap_or_else(|_| vec![id]);
+            if let Err(err) = ensure_cascade_schedules_not_leased(self, id, &check_ids) {
+                tracing::warn!(
+                    mod_id = ?id,
+                    error = %err,
+                    "skipping mod unload in unload_all_mods because a target schedule is currently leased"
+                );
+                continue;
+            }
+            if let Err(err) = unload_single_mod_in_world(self, id, false) {
+                tracing::warn!(
+                    mod_id = ?id,
+                    error = %err,
+                    "skipping mod unload in unload_all_mods due to unload error"
+                );
+            }
+        }
+        if self
+            .get_resource::<ModHost>()
+            .is_some_and(ModHost::is_empty)
+            && let Some(mut dag) = self.get_resource_mut::<ModDependencyGraph>()
+        {
             dag.clear();
         }
         self
@@ -1010,3 +1071,7 @@ fn preverify_reload_target(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/world_ext_coverage_tests.rs"]
+mod coverage_tests;

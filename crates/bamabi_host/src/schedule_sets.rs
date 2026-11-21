@@ -19,13 +19,38 @@ use bevy_ecs::world::World;
 use bevy_platform::collections::HashSet;
 use std::path::Path;
 
-fn resolve_schedule_in_world(world: &World, id: ScheduleId) -> Option<InternedScheduleLabel> {
+pub(crate) fn resolve_schedule_in_world(
+    world: &World,
+    id: ScheduleId,
+) -> Option<InternedScheduleLabel> {
     if let Some(builtin) = resolve_builtin_schedule_id(id) {
         return Some(builtin);
     }
     world
         .get_resource::<ModScheduleMap>()
         .and_then(|map| map.resolve(id))
+}
+
+/// Returns the set of [`InternedScheduleLabel`]s currently leased out of `world`'s [`Schedules`]
+/// resource (for example while running inside `World::run_schedule` or `World::try_schedule_scope`).
+pub fn leased_schedules(world: &World) -> HashSet<InternedScheduleLabel> {
+    world
+        .get_resource::<Schedules>()
+        .map(Schedules::get_temporarily_removed)
+        .unwrap_or_default()
+}
+
+pub(crate) fn mod_schedule_labels(world: &World, ids: &[ModId]) -> HashSet<InternedScheduleLabel> {
+    let mut labels = HashSet::default();
+    let Some(host) = world.get_resource::<ModHost>() else {
+        return labels;
+    };
+    for &id in ids {
+        if let Some(loaded) = host.get_mod(id) {
+            labels.extend(loaded.registered_schedule_labels());
+        }
+    }
+    labels
 }
 
 fn resolve_mod_generation_in_world(world: &World, mod_name: &str) -> u64 {
@@ -67,10 +92,12 @@ fn target_exists_in_batch_or_world(
 }
 
 /// Validates that all systems in `systems` target built-in schedules (`0..=5`) or custom schedules
-/// (`>= 1024`) registered in `world`'s [`ModScheduleMap`], and (when `strict == true`) that all
-/// `before`/`after` ordering targets resolve.
+/// (`>= 1024`) registered in `world`'s [`ModScheduleMap`], that no non-late-startup system targets a
+/// currently leased schedule, and (when `strict == true`) that all `before`/`after` ordering targets
+/// resolve.
 pub(crate) fn prevalidate_mod_schedules_and_ordering(
     world: &World,
+    mod_id: ModId,
     path: &Path,
     mod_name: &str,
     strict: bool,
@@ -80,6 +107,7 @@ pub(crate) fn prevalidate_mod_schedules_and_ordering(
         .get_resource::<StartupCompleted>()
         .is_some_and(|s| s.has_run());
     let own_gen = resolve_mod_generation_in_world(world, mod_name);
+    let leased = leased_schedules(world);
 
     let mut batch_sets: HashSet<(InternedScheduleLabel, ModNamedSystemSet)> = HashSet::default();
     let mut late_startup_names: HashSet<&str> = HashSet::default();
@@ -97,6 +125,12 @@ pub(crate) fn prevalidate_mod_schedules_and_ordering(
         if startup_already_ran && sys.schedule() == ScheduleId::STARTUP {
             late_startup_names.insert(sys.system_name());
         } else {
+            if leased.contains(&interned) {
+                return Err(ModLoadError::ScheduleLeased {
+                    id: mod_id,
+                    schedule: format!("{interned:?}"),
+                });
+            }
             batch_sets.insert((
                 interned,
                 ModNamedSystemSet::with_generation(mod_name, sys.system_name(), own_gen),
@@ -391,6 +425,13 @@ pub fn configure_weak_set_chain(
     }
     world.init_resource::<Schedules>();
     if let Some(mut schedules) = world.get_resource_mut::<Schedules>() {
+        if schedules.get_temporarily_removed().contains(&schedule) {
+            tracing::error!(
+                ?schedule,
+                "refusing to configure weak set chain on currently leased schedule"
+            );
+            return;
+        }
         for pair in sets.windows(2) {
             schedules.configure_sets(schedule, (pair[0].clone(), pair[1].clone()).chain_weak());
         }
@@ -446,6 +487,19 @@ pub(crate) fn schedule_mod_systems_in_world(
     let has_schedule_sets = world.contains_resource::<ModScheduleSetRegistry>();
     let mut recorded_sets = Vec::with_capacity(to_schedule.len());
     for (sched_id, interned, sys) in to_schedule {
+        if world
+            .get_resource::<Schedules>()
+            .is_some_and(|s| s.get_temporarily_removed().contains(&interned))
+        {
+            tracing::error!(
+                mod_id = ?mod_id,
+                mod_name = %mod_name,
+                schedule = ?interned,
+                system = %sys.system_name(),
+                "skipping scheduling guest system into currently leased schedule"
+            );
+            continue;
+        }
         let cfg = OrderingCtx {
             world,
             mod_name,
@@ -501,3 +555,7 @@ pub(crate) fn run_late_startup_systems_in_world(
 
     temp_schedule.run(world);
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/schedule_sets_coverage_tests.rs"]
+mod coverage_tests;

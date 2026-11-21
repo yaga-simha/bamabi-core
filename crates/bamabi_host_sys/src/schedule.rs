@@ -1217,6 +1217,13 @@ pub(crate) fn ensure_mod_schedule_set_pass_if_schedules_present(
         return;
     };
     if let Some(mut schedules) = world.get_resource_mut::<Schedules>() {
+        if schedules.get_temporarily_removed().contains(&label) {
+            tracing::warn!(
+                schedule = ?label,
+                "skipping schedule-set pass installation because target schedule is currently leased"
+            );
+            return;
+        }
         let schedule = schedules.entry(label);
         install_mod_schedule_set_pass(schedule, schedule_id);
     }
@@ -1305,19 +1312,51 @@ pub fn mount_mod_systems_in_world(
 ) -> Result<(), ScheduleBuildError> {
     world.init_resource::<Schedules>();
     let mut touched: Vec<(ScheduleId, InternedScheduleLabel)> = Vec::new();
+    let mut recorded_sets: Vec<(ModId, InternedScheduleLabel, ModNamedSystemSet)> = Vec::new();
     for sys in systems {
         let sched_id = sys.schedule();
         let Some(label) = resolve_schedule_id_in_world(world, sched_id) else {
             continue;
         };
+        let is_leased = world
+            .get_resource::<Schedules>()
+            .is_some_and(|s| s.get_temporarily_removed().contains(&label));
+        if is_leased {
+            tracing::error!(
+                mod_name = %mod_name,
+                schedule = ?label,
+                system = %sys.system_name(),
+                "skipping mounting guest system into currently leased schedule"
+            );
+            continue;
+        }
+        let sys_mod_id = sys.mod_id();
+        let sys_name_arc = sys.system_name_arc();
         let cfg = configure_guest_system_for_schedule(world, mod_name, generation, sys);
         if let Some(mut schedules) = world.get_resource_mut::<Schedules>() {
             let sched = schedules.entry(label);
             install_mod_schedule_set_pass(sched, sched_id);
             sched.add_systems(cfg);
         }
+        if let Some(mod_id) = sys_mod_id {
+            recorded_sets.push((
+                mod_id,
+                label,
+                ModNamedSystemSet::with_generation(mod_name, sys_name_arc, generation),
+            ));
+        }
         if !touched.iter().any(|&(id, _)| id == sched_id) {
             touched.push((sched_id, label));
+        }
+    }
+    if !recorded_sets.is_empty() {
+        let mut by_mod: HashMap<ModId, Vec<(InternedScheduleLabel, ModNamedSystemSet)>> =
+            HashMap::default();
+        for (mod_id, label, named_set) in recorded_sets {
+            by_mod.entry(mod_id).or_default().push((label, named_set));
+        }
+        for (mod_id, sets) in by_mod {
+            crate::loader::record_mod_named_sets_in_world(world, mod_id, sets);
         }
     }
     for (sched_id, label) in touched {
@@ -1362,6 +1401,16 @@ pub fn rewire_mod_schedule_sets_in_world(
         return Ok(None);
     };
     world.init_resource::<Schedules>();
+    if world
+        .get_resource::<Schedules>()
+        .is_some_and(|s| s.get_temporarily_removed().contains(&label))
+    {
+        tracing::warn!(
+            schedule = ?label,
+            "skipping rewire_mod_schedule_sets_in_world because target schedule is currently leased"
+        );
+        return Ok(None);
+    }
     let mut schedule = world
         .get_resource_mut::<Schedules>()
         .and_then(|mut s| s.remove_temporarily(label))
@@ -1372,3 +1421,7 @@ pub fn rewire_mod_schedule_sets_in_world(
     }
     res
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/schedule_coverage_tests.rs"]
+mod coverage_tests;

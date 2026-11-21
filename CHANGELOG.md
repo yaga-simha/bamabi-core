@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Safe-Point Lifecycle Schedule (`ModLifecycleFlush`) & Leased-Schedule Introspection:**
+  - Added [`ModLifecycleFlush`](crates/bamabi_host/src/plugin.rs) (`ScheduleLabel`) and idempotent [`ensure_mod_lifecycle_flush_schedule(app)`](crates/bamabi_host/src/plugin.rs), inserting `ModLifecycleFlush` immediately after `Last` in `MainScheduleOrder` (or appending if `Last` is absent) and draining `PendingModLifecycleOps` safely once frame schedules have returned to `Schedules`.
+  - Added [`leased_schedules(world)`](crates/bamabi_host/src/schedule_sets.rs) and [`LoadedMod::registered_schedule_labels()`](crates/bamabi_host_sys/src/loader/mod_host.rs) to inspect active leased schedules and per-mod registered schedule labels.
+  - **Breaking:** Added [`ModLoadError::ScheduleLeased { id, schedule }`](crates/bamabi_host_sys/src/loader/error.rs) variant to the exhaustive `ModLoadError` enum; direct `ModWorldExt` load/unload/reload calls (including cascading reloads/unloads) reject leased target schedules atomically with `ScheduleLeased`.
+- **Trust API Non-`keygen` Parity (`bamabi_host_sys::loader::signing` & `bamabi_host`):**
+  - Added `ModTrustPolicy` delegates [`add_krl_signer_openssh`](crates/bamabi_host_sys/src/loader/signing.rs), `add_krl_signer_file`, `with_krl_signer_principal`, `verify_bampack_bytes`, and `verify_bampack_file`, alongside `From<&bamabi_trust::VerifiedModSignature>` and `From<&VerifiedModSignature>` conversions and documented all 16 `Deref` read-only getters.
+  - Re-exported `bampack`, `embedded_sig`, `ssh_key`, `LineEnding`, `Algorithm`, `Certificate`, `Fingerprint`, `HashAlg`, `PrivateKey`, `PublicKey`, `DEFAULT_KRL_SIGNER_PRINCIPAL`, `MAX_BAMPACK_PATH_LEN`, `MAX_BAMPACK_PATH_DEPTH`, `DEFAULT_MAX_BAMPACK_UNCOMPRESSED_BYTES`, `BamPackExtractLimits`, `BamPackExtractError`, `validate_bampack_entry_path`, and `parse_bampack_entries_unverified` across `bamabi_host_sys` and `bamabi_host` (note: `bamabi_trust::keygen` items remain upstream-gated because `bamabi_host_sys/signature-verification` does not enable `bamabi_trust/keygen`).
+- **Structured DAG Diagnostics (`ModDagErrorKind` & Accessors):**
+  - Added [`ModDagErrorKind`](crates/bamabi_host/src/mod_dag.rs) with `ModDagErrorKind::as_str() -> &'static str` and 13 structured accessors on [`ModDagError`](crates/bamabi_host/src/mod_dag.rs): `kind`, `path`, `related_paths`, `mod_name`, `dependency`, `required_version`, `found_version`, `cycle_members`, `load_error`, `mod_id`, `is_cycle`, `is_io`, and `is_recoverable`.
+- **Benchmarks, Loom ABA Model, Parser Proptests & Coverage Suites:**
+  - Added [`v03_subsystem_bench`](crates/bamabi_host/benches/v03_subsystem_bench.rs) Criterion-compatible benchmark harness covering all 8 ABI `0.3.0` subsystems (`relations`, `intern_symbol`, `iter_count`, `checkpoint_rollback`, `migrate_column`, `par_readonly`, `up_cascade`, `schedule_set_rewire`) supporting `--bench`, `--test`, `--quick`, and substring filters.
+  - Added 3rd Loom ABA generation-reuse model (`loom_slot_reuse_aba_stale_reader_never_invokes_new_generation_drop`) in [`crates/bamabi_host_sys/tests/loom_drop_trampoline.rs`](crates/bamabi_host_sys/tests/loom_drop_trampoline.rs).
+  - Added `proptest` binary parser fuzzing (`proptest_shared_lib_parsers`) and truncation/oversized-offset regressions in [`crates/bamabi_host_sys/tests/unit/shared_lib_tests.rs`](crates/bamabi_host_sys/tests/unit/shared_lib_tests.rs).
+  - Added `leased_schedule_soundness` integration suite (`crates/bamabi_host/tests/lifecycle/leased_schedule_soundness.rs`), unit suites across `commands_ext_tests`, `mod_dag_tests`, `watcher_tests`, `hot_reload`, and coverage suites across `bamabi_host_sys` and `bamabi_host`.
+  - Added root [`GEMINI.md`](GEMINI.md), [`TESTS.md`](TESTS.md), and per-crate `ARCHITECTURE.md` / `TESTS.md` documentation across `bamabi_host_sys`, `bamabi_host`, and `bamabi_watcher`.
+
+### Changed / Hardened
+- **`ModCommandsExt` Safe-Point Execution & `unload_all_mods()` Skip-Leased Semantics:**
+  - [`ModCommandsExt`](crates/bamabi_host/src/commands_ext.rs) load/unload/reload operations now defer into `PendingModLifecycleOps` (drained in [`ModLifecycleFlush`](crates/bamabi_host/src/plugin.rs)) whenever `!(leased ⊆ {ModLifecycleFlush, Main} && (ModLifecycleFlush ∈ leased || Main ∉ leased))` (and execute immediately otherwise), re-queueing remaining ops if a running op leases a schedule mid-flush.
+  - [`ModWorldExt::unload_all_mods`](crates/bamabi_host/src/world_ext.rs) and [`unload_all_mods_in_world`](crates/bamabi_host_sys/src/loader/mod_host.rs) now skip mods whose target schedule is leased (emitting `tracing::warn!`) instead of aborting or leaving schedules inconsistent, so `ModHost` may remain non-empty.
+  - Added leased-schedule skip guards to [`mount_mod_systems_in_world`](crates/bamabi_host_sys/src/schedule.rs), `rewire_mod_schedule_sets_in_world`, `ensure_mod_schedule_set_pass_if_schedules_present`, `schedule_mod_systems_in_world`, and `configure_weak_set_chain`.
+- **`bamabi_watcher` Lifecycle & Resilience (`crates/bamabi_watcher/src/watcher.rs`):**
+  - Moved `ModHotReloadPlugin` polling from `PreUpdate` to `ModLifecycleFlush`.
+  - Executed `ModHotReloadPlugin::with_sync_on_start` synchronously during `Plugin::build` before any frame schedules are leased so `Startup` mod systems schedule into `Startup`.
+  - Deferred transient `ScheduleLeased` errors on load/reload/unload/sync into `pending_retries` without recording `ModHotReloadAction::Failed`, and surfaced `mpsc::TryRecvError::Disconnected` idempotently (one `tracing::error!` + one `ModHotReloadAction::Failed` outcome).
+- **Binary Parser & `bridge-reflect` Hardening:**
+  - Hardened ELF32/ELF64, Mach-O thin/fat, and PE32/PE32+ residency & RSDS CodeView parsers in [`crates/bamabi_host_sys/src/loader/shared_lib.rs`](crates/bamabi_host_sys/src/loader/shared_lib.rs) with checked arithmetic (`checked_add`, `checked_mul`, `usize::try_from`) and bounded `.get(...)` slicing.
+  - Removed non-test `.expect()` panics in [`crates/bamabi_host_sys/src/ffi/validation.rs`](crates/bamabi_host_sys/src/ffi/validation.rs) (`bridge-reflect` `BamFieldReflectSlot` pool) in favor of fallible `slot_core`/`slot_type_info` lookups with `UninitializedBamFieldReflectSlot` / `ApplyError::MismatchedTypes` fallbacks.
+  - Added `#![expect(clippy::cast_ptr_alignment)]` in [`crates/bamabi_host/benches/chunk_throughput.rs`](crates/bamabi_host/benches/chunk_throughput.rs).
+- **CI Coverage Gate, Source Audits & Rustdoc Parity:**
+  - Removed all `bamabi_host_sys` and `bamabi_host` exclusions from the `cargo llvm-cov` CI gate (`--ignore-filename-regex '(crates/bamabi_watcher/|(tests|examples|xtask|benches)/|\.cargo/)' --fail-under-lines 85`, achieving `93.36%` under the gate regex and `92.65%` across all measured files), and added CI audits enforcing zero `#[allow]` and zero non-test `.unwrap()`/`.expect()`/`panic!` in `crates/*/src`, `bridge-reflect` clippy, and `v03_subsystem_bench -- --test` in `benchmark-gate`.
+  - Expanded rustdoc comments (`///`, `//!`) in [`crates/bamabi_host_sys/src/ffi/assets_scene.rs`](crates/bamabi_host_sys/src/ffi/assets_scene.rs) to parity with the rest of `src/ffi/`.
+
+---
+
 ## [0.3.0] - 2026-11-19
 
 ### Added

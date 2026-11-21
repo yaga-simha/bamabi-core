@@ -2,11 +2,13 @@
 
 Crate guide for **`bamabi_host_sys`** (`v0.3.0`, ABI `0x0003_0000`, Bevy `0.20.1+`) — the low-level host FFI execution engine, CoW registry, chunk/sparse iterators, command arena, and dynamic loader.
 
+Documentation index: [`README.md`](README.md) · [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`TESTS.md`](TESTS.md).
+
 ---
 
 ## 1. Crate Identity
 - **Name:** `bamabi_host_sys` (`version = "0.3.0"`, `edition = "2024"`, MSRV `1.95`)
-- **Role:** Isolates ALL host-side `unsafe` FFI and Bevy ECS raw storage access behind documented safety contracts so `bamabi_host`, companion crates, and `bamabi` enforce `#![forbid(unsafe_code)]`.
+- **Role:** Isolates ALL host-side `unsafe` FFI and Bevy ECS raw storage access behind documented safety contracts so `bamabi_host`, `bamabi_watcher`, companion crates, and `bamabi` enforce `#![forbid(unsafe_code)]`.
 
 ---
 
@@ -18,30 +20,31 @@ Crate guide for **`bamabi_host_sys`** (`v0.3.0`, ABI `0x0003_0000`, Bevy `0.20.1
 
 ## 3. Owned Surface & Feature Flags
 - **Features:** `strict-ffi-checks`, `test-utils`, `diagnostics`, `signature-verification`, `bridge-reflect`.
-- **68/68 `HOST_API` (`ffi/`):** Sealed `pub(crate)` FFI submodules (`host_api`, `iter`, `commands`, `register`, `relations`, `observers_ext`, `v03_ext`, `validation`), consolidated `handle_header.rs` (`AlignedBuf`), `ffi_try!`, and `HostIter` + `CascadeHierarchyCache` + zero-arena `par_for_each_chunk_readonly`.
+- **68/68 `HOST_API` (`ffi/`):** Sealed `pub(crate)` FFI submodules (`host_api`, `iter`, `iter_ext`, `commands`, `commands_ext`, `register`, `relations`, `hierarchy_ext`, `observers_ext`, `assets_scene`, `proc_address`, `v03_ext`, `validation`), consolidated `handle_header.rs` (`AlignedBuf`), `ffi_try!`, `HostIter` + `CascadeHierarchyCache` + zero-arena `par_for_each_chunk_readonly`, and panic/expect-free `bridge-reflect` `BamFieldReflectSlot` pool (`UninitializedBamFieldReflectSlot` fallback in `ffi/validation.rs`).
 - **Registry & Drop Safety (`registry/`, `drop_trampoline.rs`, `sync_ptr.rs`):** Generation-tracked `Arc<RegistrySnapshot>` `ModRegistry`, `ComponentOptions::with_summary_tick()` (auto-inheriting `T::HAS_SUMMARY_TICK` in `ComponentOptions::<T>::new()`), `ModRelationGraph` (`allows_self_referential()`, opt-in `__bam_rel_bind` self-referential hook), `BamSymbolTable`, `ModNamedObjects`, `DROP_PAGES` (`ArcSwapOption` wait-free drop trampolines) & `WorldDropGuard`.
-- **Scheduling, Commands & Loader (`system/`, `schedule.rs`, `loader/`):** `GuestSystem` with exact `FilteredAccessSet<ComponentId>`, `ModScheduleSetRegistry` + `ModScheduleSetRewirePass` (`ScheduleSetConfig`, Bevy `0.20` `.chain_weak()`), observer & system fault routing through Bevy `0.20.1` `FallbackErrorHandler` (`ErrorContext::Observer` / `ErrorContext::System`), `CommandArena` (`cmd_checkpoint`/`cmd_rollback`), `ModHost` shadow-copy loading, transactional rollback, `despawn_all_where`, and `migrate_component_column`.
+- **Scheduling, Commands & Loader (`system/`, `schedule.rs`, `loader/`):** `GuestSystem` with exact `FilteredAccessSet<ComponentId>`, `ModScheduleSetRegistry` + `ModScheduleSetRewirePass` (`ScheduleSetConfig`, Bevy `0.20` `.chain_weak()`) with leased-schedule skip guards (`mount_mod_systems_in_world`, `rewire_mod_schedule_sets_in_world`, `ensure_mod_schedule_set_pass_if_schedules_present`), observer & system fault routing through Bevy `0.20.1` `FallbackErrorHandler` (`ErrorContext::Observer` / `ErrorContext::System`), `CommandArena` (`cmd_checkpoint`/`cmd_rollback`), `ModHost` shadow-copy loading, checked-arithmetic ELF/Mach-O/PE parsers (`shared_lib.rs`), `LoadedMod::registered_schedule_labels()`, `ModLoadError::ScheduleLeased` / `unload_all_mods_in_world` skip-leased guards, transactional rollback, `despawn_all_where`, and `migrate_component_column`.
+- **Trust Parity (`loader/signing.rs`):** Exposes full non-`keygen` `bamabi_trust` parity (`add_krl_signer_openssh`, `add_krl_signer_file`, `with_krl_signer_principal`, `verify_bampack_bytes`, `verify_bampack_file`, 16 `Deref` getters, `VerifiedModSignature` `&` conversions, and `bampack`/`embedded_sig`/`ssh_key`/`LineEnding`/`PublicKey`/`PrivateKey`/`Certificate`/`Algorithm`/`Fingerprint`/`HashAlg`/`BamPackExtract*` re-exports). Note: `bamabi_trust::keygen` remains upstream-gated because `bamabi_trust/keygen` (`ssh-key/getrandom`) is not enabled by `signature-verification` in `Cargo.toml`.
 
 ---
 
 ## 4. Strict Engineering Rules
 1. **ABI & Allocator Isolation:** Host allocations are freed only by the host; guest allocations only by the guest. Never change `BamHostApi` (`68` slots) or `ABI 0.3.0` wire layouts.
-2. **Zero Non-Test Panics:** Keep non-test `.unwrap()` / `unreachable!()` / `#[allow(...)]` at zero; only explicit trait-boundary `.expect()`s on Bevy invariants are acceptable.
-3. **Miri & Loom Parity:** Any change to `drop_trampoline`, `sync_ptr`, `handle_header`, `ffi/iter`, `ffi/commands`, or `ffi/validation` MUST pass Miri (`-Zmiri-tree-borrows`) and `loom_drop_trampoline`.
+2. **Zero Non-Test Panics & No `#[allow]`:** Maintain zero `.unwrap()` / `.expect()` / `panic!` / `unreachable!` / `todo!` and zero `#[allow(...)]` suppressions in `src/`.
+3. **Miri, Proptest & Loom Parity:** Any change to `drop_trampoline`, `sync_ptr`, `handle_header`, `ffi/*`, `loader/shared_lib.rs`, or `loader/schema_migration.rs` MUST pass Miri (`-Zmiri-tree-borrows`), parser `proptest` fuzzing (`shared_lib_tests.rs`), and all 3 models in `loom_drop_trampoline` (including `loom_slot_reuse_aba_stale_reader_never_invokes_new_generation_drop`).
 
 ---
 
 ## 5. Standalone Verification Commands
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo clippy --all-targets --no-default-features -- -D warnings
-BAM_FIXTURE_DIR="/path/to/fixtures" cargo test --all-features
-cargo test --test loom_drop_trampoline --release
-MIRIFLAGS="-Zmiri-tree-borrows" rustup run nightly cargo miri test --lib
-MIRIFLAGS="-Zmiri-tree-borrows" rustup run nightly cargo miri test --lib --features bridge-reflect
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo fmt --all -- --check
+cargo clippy -p bamabi_host_sys --all-targets --all-features -- -D warnings
+cargo clippy -p bamabi_host_sys --all-targets --no-default-features -- -D warnings
+BAM_FIXTURE_DIR="/path/to/fixtures" cargo test -p bamabi_host_sys --all-features
+cargo test -p bamabi_host_sys --test loom_drop_trampoline --release
+MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bamabi_host_sys --lib
+MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bamabi_host_sys --lib --features bridge-reflect
+RUSTDOCFLAGS="-D warnings" cargo doc -p bamabi_host_sys --no-deps --all-features
 typos
 ```
 

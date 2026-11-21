@@ -972,18 +972,32 @@ fn inspect_elf_residency(bytes: &[u8]) -> LibraryResidencyInfo {
             info.has_tls = true;
         } else if p_type == PT_DYNAMIC {
             let (dyn_off, dyn_size) = if is_64 {
-                let Some(off) = read_u64_end(bytes, entry_off + 8, le) else {
+                let Some(off) = entry_off
+                    .checked_add(8)
+                    .and_then(|o| read_u64_end(bytes, o, le))
+                else {
                     continue;
                 };
-                let Some(sz) = read_u64_end(bytes, entry_off + 32, le) else {
+                let Some(sz) = entry_off
+                    .checked_add(32)
+                    .and_then(|o| read_u64_end(bytes, o, le))
+                else {
                     continue;
                 };
                 (off, sz)
             } else {
-                let Some(off) = read_u32_end(bytes, entry_off + 4, le).map(u64::from) else {
+                let Some(off) = entry_off
+                    .checked_add(4)
+                    .and_then(|o| read_u32_end(bytes, o, le))
+                    .map(u64::from)
+                else {
                     continue;
                 };
-                let Some(sz) = read_u32_end(bytes, entry_off + 16, le).map(u64::from) else {
+                let Some(sz) = entry_off
+                    .checked_add(16)
+                    .and_then(|o| read_u32_end(bytes, o, le))
+                    .map(u64::from)
+                else {
                     continue;
                 };
                 (off, sz)
@@ -1029,39 +1043,55 @@ fn inspect_elf_residency(bytes: &[u8]) -> LibraryResidencyInfo {
 }
 
 fn inspect_macho_fat_residency(bytes: &[u8], is_64: bool) -> LibraryResidencyInfo {
-    let Some(nfat_arch) = read_u32_end(bytes, 4, false).map(|n| n as usize) else {
+    let Some(nfat_arch) = read_u32_end(bytes, 4, false).and_then(|n| usize::try_from(n).ok())
+    else {
         return LibraryResidencyInfo::default();
     };
     if nfat_arch == 0 || nfat_arch > 32 {
         return LibraryResidencyInfo::default();
     }
-    let arch_size = if is_64 { 32 } else { 20 };
+    let arch_size = if is_64 { 32usize } else { 20usize };
     let mut info = LibraryResidencyInfo {
         format: BinaryFormat::MachOFat,
         ..Default::default()
     };
     let mut matched_slice = false;
     for idx in 0..nfat_arch {
-        let Some(arch_off) = 8usize.checked_add(idx * arch_size) else {
+        let Some(arch_off) = idx
+            .checked_mul(arch_size)
+            .and_then(|d| 8usize.checked_add(d))
+        else {
             break;
         };
         let (slice_off, slice_size) = if is_64 {
-            let Some(o) =
-                read_u64_end(bytes, arch_off + 8, false).and_then(|v| usize::try_from(v).ok())
+            let Some(o) = arch_off
+                .checked_add(8)
+                .and_then(|off| read_u64_end(bytes, off, false))
+                .and_then(|v| usize::try_from(v).ok())
             else {
                 continue;
             };
-            let Some(s) =
-                read_u64_end(bytes, arch_off + 16, false).and_then(|v| usize::try_from(v).ok())
+            let Some(s) = arch_off
+                .checked_add(16)
+                .and_then(|off| read_u64_end(bytes, off, false))
+                .and_then(|v| usize::try_from(v).ok())
             else {
                 continue;
             };
             (o, s)
         } else {
-            let Some(o) = read_u32_end(bytes, arch_off + 8, false).map(|v| v as usize) else {
+            let Some(o) = arch_off
+                .checked_add(8)
+                .and_then(|off| read_u32_end(bytes, off, false))
+                .and_then(|v| usize::try_from(v).ok())
+            else {
                 continue;
             };
-            let Some(s) = read_u32_end(bytes, arch_off + 12, false).map(|v| v as usize) else {
+            let Some(s) = arch_off
+                .checked_add(12)
+                .and_then(|off| read_u32_end(bytes, off, false))
+                .and_then(|v| usize::try_from(v).ok())
+            else {
                 continue;
             };
             (o, s)
@@ -1116,10 +1146,10 @@ fn inspect_macho_thin_residency(bytes: &[u8]) -> LibraryResidencyInfo {
     };
 
     let hdr_size: usize = if is_64 { 32 } else { 28 };
-    let Some(ncmds) = read_u32_end(bytes, 16, le).map(|v| v as usize) else {
+    let Some(ncmds) = read_u32_end(bytes, 16, le).and_then(|v| usize::try_from(v).ok()) else {
         return LibraryResidencyInfo::default();
     };
-    let Some(sizeofcmds) = read_u32_end(bytes, 20, le).map(|v| v as usize) else {
+    let Some(sizeofcmds) = read_u32_end(bytes, 20, le).and_then(|v| usize::try_from(v).ok()) else {
         return LibraryResidencyInfo::default();
     };
     let Some(flags) = read_u32_end(bytes, 24, le) else {
@@ -1136,16 +1166,26 @@ fn inspect_macho_thin_residency(bytes: &[u8]) -> LibraryResidencyInfo {
     let cmds_end = hdr_size.saturating_add(sizeofcmds).min(bytes.len());
     let mut cursor = hdr_size;
     for _ in 0..ncmds.min(4096) {
-        if cursor + 8 > cmds_end {
+        let Some(cmd_hdr_end) = cursor.checked_add(8) else {
+            break;
+        };
+        if cmd_hdr_end > cmds_end {
             break;
         }
         let Some(cmd) = read_u32_end(bytes, cursor, le) else {
             break;
         };
-        let Some(cmdsize) = read_u32_end(bytes, cursor + 4, le).map(|v| v as usize) else {
+        let Some(cmdsize) = cursor
+            .checked_add(4)
+            .and_then(|off| read_u32_end(bytes, off, le))
+            .and_then(|v| usize::try_from(v).ok())
+        else {
             break;
         };
-        if cmdsize < 8 || cursor.saturating_add(cmdsize) > cmds_end {
+        let Some(cmd_end) = cursor.checked_add(cmdsize) else {
+            break;
+        };
+        if cmdsize < 8 || cmd_end > cmds_end {
             break;
         }
 
@@ -1157,20 +1197,36 @@ fn inspect_macho_thin_residency(bytes: &[u8]) -> LibraryResidencyInfo {
             } else {
                 (56usize, 68usize, 48usize, 56usize)
             };
-            let nsects = read_u32_end(bytes, cursor + nsects_off, le).unwrap_or(0) as usize;
-            let mut sec_cursor = cursor + seg_hdr_size;
+            let nsects = cursor
+                .checked_add(nsects_off)
+                .and_then(|off| read_u32_end(bytes, off, le))
+                .map_or(0, |v| usize::try_from(v).unwrap_or(usize::MAX));
+            let Some(mut sec_cursor) = cursor.checked_add(seg_hdr_size) else {
+                break;
+            };
             for _ in 0..nsects.min(4096) {
-                if sec_cursor + sect_size > cursor + cmdsize {
+                let Some(sec_end) = sec_cursor.checked_add(sect_size) else {
+                    break;
+                };
+                if sec_end > cmd_end {
                     break;
                 }
-                let sect_name_bytes = &bytes[sec_cursor..sec_cursor + 16];
+                let Some(name_end) = sec_cursor.checked_add(16) else {
+                    break;
+                };
+                let Some(sect_name_bytes) = bytes.get(sec_cursor..name_end) else {
+                    break;
+                };
                 let sect_name_len = sect_name_bytes
                     .iter()
                     .position(|&b| b == 0)
                     .unwrap_or(sect_name_bytes.len());
                 let sect_name =
                     core::str::from_utf8(&sect_name_bytes[..sect_name_len]).unwrap_or("");
-                let sect_flags = read_u32_end(bytes, sec_cursor + sect_flags_rel, le).unwrap_or(0);
+                let sect_flags = sec_cursor
+                    .checked_add(sect_flags_rel)
+                    .and_then(|off| read_u32_end(bytes, off, le))
+                    .unwrap_or(0);
                 let sect_type = sect_flags & SECTION_TYPE_MASK;
                 if matches!(
                     sect_type,
@@ -1185,10 +1241,10 @@ fn inspect_macho_thin_residency(bytes: &[u8]) -> LibraryResidencyInfo {
                 ) {
                     info.has_tls = true;
                 }
-                sec_cursor += sect_size;
+                sec_cursor = sec_end;
             }
         }
-        cursor += cmdsize;
+        cursor = cmd_end;
     }
 
     info
@@ -1198,7 +1254,7 @@ fn pe_header_offset(bytes: &[u8]) -> Option<usize> {
     if !bytes.starts_with(b"MZ") {
         return None;
     }
-    let lfanew = read_u32_end(bytes, 0x3c, true)? as usize;
+    let lfanew = read_u32_end(bytes, 0x3c, true).and_then(|v| usize::try_from(v).ok())?;
     if bytes.get(lfanew..lfanew.checked_add(4)?)? != b"PE\0\0" {
         return None;
     }
@@ -1216,16 +1272,30 @@ fn pe_rva_to_file_offset(
     rva: u32,
 ) -> Option<usize> {
     for idx in 0..num_sections.min(256) {
-        let off = sections_off.checked_add(idx * 40)?;
-        let virt_size = read_u32_end(bytes, off + 8, true)?;
-        let virt_addr = read_u32_end(bytes, off + 12, true)?;
-        let raw_size = read_u32_end(bytes, off + 16, true)?;
-        let raw_ptr = read_u32_end(bytes, off + 20, true)?;
+        let off = idx
+            .checked_mul(40)
+            .and_then(|d| sections_off.checked_add(d))?;
+        let virt_size = off
+            .checked_add(8)
+            .and_then(|o| read_u32_end(bytes, o, true))?;
+        let virt_addr = off
+            .checked_add(12)
+            .and_then(|o| read_u32_end(bytes, o, true))?;
+        let raw_size = off
+            .checked_add(16)
+            .and_then(|o| read_u32_end(bytes, o, true))?;
+        let raw_ptr = off
+            .checked_add(20)
+            .and_then(|o| read_u32_end(bytes, o, true))?;
         let span = virt_size.max(raw_size);
         if rva >= virt_addr && rva < virt_addr.saturating_add(span) {
             let delta = rva - virt_addr;
             if delta < raw_size {
-                return Some(raw_ptr as usize + delta as usize);
+                return usize::try_from(raw_ptr).ok().and_then(|base| {
+                    usize::try_from(delta)
+                        .ok()
+                        .and_then(|d| base.checked_add(d))
+                });
             }
         }
     }
@@ -1241,37 +1311,62 @@ pub fn patch_pe_codeview_pdb_path(pe_bytes: &mut [u8], shadow_pdb_path: &Path) -
     let Some(lfanew) = pe_header_offset(pe_bytes) else {
         return false;
     };
-    let coff_off = lfanew + 4;
-    let Some(num_sections) = read_u16_end(pe_bytes, coff_off + 2, true).map(usize::from) else {
+    let Some(coff_off) = lfanew.checked_add(4) else {
         return false;
     };
-    let Some(opt_size) = read_u16_end(pe_bytes, coff_off + 16, true).map(usize::from) else {
+    let Some(num_sections) = coff_off
+        .checked_add(2)
+        .and_then(|off| read_u16_end(pe_bytes, off, true))
+        .map(usize::from)
+    else {
         return false;
     };
-    let opt_off = coff_off + 20;
-    if opt_size < 96 || opt_off + opt_size > pe_bytes.len() {
+    let Some(opt_size) = coff_off
+        .checked_add(16)
+        .and_then(|off| read_u16_end(pe_bytes, off, true))
+        .map(usize::from)
+    else {
+        return false;
+    };
+    let Some(opt_off) = coff_off.checked_add(20) else {
+        return false;
+    };
+    let Some(opt_end) = opt_off.checked_add(opt_size) else {
+        return false;
+    };
+    if opt_size < 96 || opt_end > pe_bytes.len() {
         return false;
     }
     let Some(opt_magic) = read_u16_end(pe_bytes, opt_off, true) else {
         return false;
     };
-    let (num_rva_off, data_dir_off) = match opt_magic {
-        0x10b => (opt_off + 92, opt_off + 96),
-        0x20b => (opt_off + 108, opt_off + 112),
+    let (Some(num_rva_off), Some(data_dir_off)) = (match opt_magic {
+        0x10b => (opt_off.checked_add(92), opt_off.checked_add(96)),
+        0x20b => (opt_off.checked_add(108), opt_off.checked_add(112)),
         _ => return false,
+    }) else {
+        return false;
     };
     let Some(num_rva) = read_u32_end(pe_bytes, num_rva_off, true) else {
         return false;
     };
     // IMAGE_DIRECTORY_ENTRY_DEBUG == 6
-    if num_rva <= 6 || data_dir_off + 7 * 8 > opt_off + opt_size {
-        return false;
-    }
-    let Some(debug_rva) = read_u32_end(pe_bytes, data_dir_off + 6 * 8, true) else {
+    let Some(debug_dir_entry_end) = data_dir_off.checked_add(7 * 8) else {
         return false;
     };
-    let Some(debug_size) =
-        read_u32_end(pe_bytes, data_dir_off + 6 * 8 + 4, true).map(|v| v as usize)
+    if num_rva <= 6 || debug_dir_entry_end > opt_end {
+        return false;
+    }
+    let Some(debug_rva) = data_dir_off
+        .checked_add(6 * 8)
+        .and_then(|off| read_u32_end(pe_bytes, off, true))
+    else {
+        return false;
+    };
+    let Some(debug_size) = data_dir_off
+        .checked_add(6 * 8 + 4)
+        .and_then(|off| read_u32_end(pe_bytes, off, true))
+        .and_then(|v| usize::try_from(v).ok())
     else {
         return false;
     };
@@ -1279,7 +1374,7 @@ pub fn patch_pe_codeview_pdb_path(pe_bytes: &mut [u8], shadow_pdb_path: &Path) -
         return false;
     }
 
-    let sections_off = opt_off + opt_size;
+    let sections_off = opt_end;
     let Some(debug_file_off) =
         pe_rva_to_file_offset(pe_bytes, sections_off, num_sections, debug_rva)
     else {
@@ -1301,27 +1396,54 @@ pub fn patch_pe_codeview_pdb_path(pe_bytes: &mut [u8], shadow_pdb_path: &Path) -
     let mut patched = false;
     let entry_count = debug_size / 28;
     for i in 0..entry_count {
-        let entry_off = debug_file_off + i * 28;
-        let Some(dbg_type) = read_u32_end(pe_bytes, entry_off + 12, true) else {
+        let Some(entry_off) = i
+            .checked_mul(28)
+            .and_then(|d| debug_file_off.checked_add(d))
+        else {
+            break;
+        };
+        let Some(dbg_type) = entry_off
+            .checked_add(12)
+            .and_then(|off| read_u32_end(pe_bytes, off, true))
+        else {
             continue;
         };
         // IMAGE_DEBUG_TYPE_CODEVIEW == 2
         if dbg_type != 2 {
             continue;
         }
-        let Some(cv_size) = read_u32_end(pe_bytes, entry_off + 16, true).map(|v| v as usize) else {
+        let Some(cv_size) = entry_off
+            .checked_add(16)
+            .and_then(|off| read_u32_end(pe_bytes, off, true))
+            .and_then(|v| usize::try_from(v).ok())
+        else {
             continue;
         };
-        let Some(cv_ptr) = read_u32_end(pe_bytes, entry_off + 24, true).map(|v| v as usize) else {
+        let Some(cv_ptr) = entry_off
+            .checked_add(24)
+            .and_then(|off| read_u32_end(pe_bytes, off, true))
+            .and_then(|v| usize::try_from(v).ok())
+        else {
             continue;
         };
-        if cv_size <= 25 || cv_ptr.saturating_add(cv_size) > pe_bytes.len() {
+        let Some(cv_end) = cv_ptr.checked_add(cv_size) else {
+            continue;
+        };
+        if cv_size <= 25 || cv_end > pe_bytes.len() {
             continue;
         }
-        if &pe_bytes[cv_ptr..cv_ptr + 4] != b"RSDS" {
+        let Some(sig_end) = cv_ptr.checked_add(4) else {
+            continue;
+        };
+        if pe_bytes.get(cv_ptr..sig_end) != Some(b"RSDS") {
             continue;
         }
-        let path_slot = &mut pe_bytes[cv_ptr + 24..cv_ptr + cv_size];
+        let Some(slot_start) = cv_ptr.checked_add(24) else {
+            continue;
+        };
+        let Some(path_slot) = pe_bytes.get_mut(slot_start..cv_end) else {
+            continue;
+        };
         let replacement = if full_pdb.len() < path_slot.len() {
             full_pdb.as_bytes()
         } else if file_only.len() < path_slot.len() {
@@ -1334,9 +1456,13 @@ pub fn patch_pe_codeview_pdb_path(pe_bytes: &mut [u8], shadow_pdb_path: &Path) -
         patched = true;
     }
 
-    if patched && opt_off + 68 <= pe_bytes.len() {
+    if patched
+        && let Some(csum_start) = opt_off.checked_add(64)
+        && let Some(csum_end) = opt_off.checked_add(68)
+        && let Some(csum_slice) = pe_bytes.get_mut(csum_start..csum_end)
+    {
         // Clear PE OptionalHeader CheckSum so Windows loader does not reject modified DLL.
-        pe_bytes[opt_off + 64..opt_off + 68].copy_from_slice(&0u32.to_le_bytes());
+        csum_slice.copy_from_slice(&0u32.to_le_bytes());
     }
     patched
 }

@@ -1,22 +1,37 @@
 //! Deferred [`ModCommandsExt`] helpers on Bevy [`Commands`] for parallel systems.
 
+use crate::plugin::ModLifecycleFlush;
+use crate::schedule_sets::leased_schedules;
 use crate::world_ext::ModWorldExt;
 use bamabi_host_sys::{LoadOptions, ModId};
-use bevy_app::Update;
+use bevy_app::Main;
 use bevy_ecs::prelude::Resource;
-use bevy_ecs::schedule::Schedules;
+use bevy_ecs::schedule::ScheduleLabel;
 use bevy_ecs::system::Commands;
 use bevy_ecs::world::World;
 use std::path::Path;
 
 type DeferredLifecycleFn = Box<dyn FnOnce(&mut World) + Send + Sync>;
 
-/// Internal queue holding deferred [`ModCommandsExt`] operations that flushed while `Update` was
-/// leased out of [`Schedules`] by `World::try_schedule_scope(Update, ...)`, replaying them in
-/// `Last` once `Update` has been returned to [`Schedules`].
+/// Internal queue holding deferred [`ModCommandsExt`] operations that flushed while a frame or
+/// mod schedule (or `Main` outside [`ModLifecycleFlush`]) was leased out of
+/// [`Schedules`](bevy_ecs::schedule::Schedules), replaying them in [`ModLifecycleFlush`] once all
+/// active schedules have returned to `Schedules`.
 #[derive(Resource, Default)]
 pub(crate) struct PendingModLifecycleOps {
     queue: Vec<DeferredLifecycleFn>,
+}
+
+fn is_safe_to_run_lifecycle_op_now(world: &World) -> bool {
+    let leased = leased_schedules(world);
+    let main_label = Main.intern();
+    let flush_label = ModLifecycleFlush.intern();
+    let only_flush_or_main = leased
+        .iter()
+        .all(|&label| label == flush_label || label == main_label);
+    let inside_flush_or_outside_main =
+        leased.contains(&flush_label) || !leased.contains(&main_label);
+    only_flush_or_main && inside_flush_or_outside_main
 }
 
 pub(crate) fn flush_pending_mod_lifecycle_ops(world: &mut World) {
@@ -24,7 +39,34 @@ pub(crate) fn flush_pending_mod_lifecycle_ops(world: &mut World) {
         .get_resource_mut::<PendingModLifecycleOps>()
         .map(|mut pending| core::mem::take(&mut pending.queue))
         .unwrap_or_default();
-    for op in ops {
+    if ops.is_empty() {
+        return;
+    }
+
+    let main_label = Main.intern();
+    let flush_label = ModLifecycleFlush.intern();
+    let mut iter = ops.into_iter();
+    while let Some(op) = iter.next() {
+        let leased = leased_schedules(world);
+        if let Some(blocking) = leased
+            .iter()
+            .copied()
+            .find(|&label| label != main_label && label != flush_label)
+        {
+            tracing::warn!(
+                schedule = ?blocking,
+                remaining_ops = iter.len() + 1,
+                "deferring remaining pending mod lifecycle ops because a mod schedule is currently leased"
+            );
+            let mut requeued = Vec::with_capacity(iter.len() + 1);
+            requeued.push(op);
+            requeued.extend(iter);
+            if let Some(mut pending) = world.get_resource_mut::<PendingModLifecycleOps>() {
+                requeued.extend(core::mem::take(&mut pending.queue));
+                pending.queue = requeued;
+            }
+            return;
+        }
         op(world);
     }
 }
@@ -33,14 +75,12 @@ fn run_or_defer_lifecycle_op<F>(world: &mut World, op: F)
 where
     F: FnOnce(&mut World) + Send + Sync + 'static,
 {
-    let update_leased_out = world.contains_resource::<PendingModLifecycleOps>()
-        && world
-            .get_resource::<Schedules>()
-            .is_some_and(|schedules| !schedules.contains(Update));
-    if update_leased_out
-        && let Some(mut pending) = world.get_resource_mut::<PendingModLifecycleOps>()
+    if world.contains_resource::<PendingModLifecycleOps>()
+        && !is_safe_to_run_lifecycle_op_now(world)
     {
-        pending.queue.push(Box::new(op));
+        if let Some(mut pending) = world.get_resource_mut::<PendingModLifecycleOps>() {
+            pending.queue.push(Box::new(op));
+        }
         return;
     }
     op(world);
@@ -49,8 +89,8 @@ where
 /// Deferred mod load, unload, and reload commands usable from any normal parallel Bevy system.
 ///
 /// Queued operations execute during an exclusive `&mut World` point once active schedules are
-/// resident in [`Schedules`], preserving the safety invariant that shared libraries are never
-/// opened or unmapped while worker threads run schedule systems.
+/// resident in [`Schedules`](bevy_ecs::schedule::Schedules), preserving the safety invariant that
+/// shared libraries are never opened or unmapped while worker threads run schedule systems.
 pub trait ModCommandsExt {
     /// Queues a deferred [`ModWorldExt::load_mod`] operation with [`LoadOptions::default()`].
     fn load_mod<P: AsRef<Path>>(&mut self, path: P);
@@ -109,3 +149,7 @@ impl ModCommandsExt for Commands<'_, '_> {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/commands_ext_tests.rs"]
+mod tests;

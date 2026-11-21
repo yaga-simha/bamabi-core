@@ -785,3 +785,7 @@ impl RegistrySnapshot {
         (id != 0).then_some(id)
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/bridge_coverage_tests.rs"]
+mod coverage_tests;

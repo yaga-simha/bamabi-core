@@ -176,6 +176,18 @@ pub enum ModLoadError {
         id: ModId,
     },
 
+    /// Attempted to load, reload, or unload a mod while one of its target Bevy schedules is
+    /// currently leased out of [`bevy_ecs::schedule::Schedules`] (executing on the call stack).
+    #[error(
+        "mod {id:?} has systems in schedule '{schedule}' which is currently running; defer unload/reload via ModCommandsExt or run it from ModLifecycleFlush"
+    )]
+    ScheduleLeased {
+        /// Identifier of the mod whose target schedule is currently leased.
+        id: ModId,
+        /// Debug-formatted label of the leased schedule.
+        schedule: String,
+    },
+
     /// Optional `BamManifest::save_state` callback returned a non-OK [`FfiResult`] during hot-reload.
     #[error("mod '{mod_name}' ({id:?}) save_state failed with {status}")]
     StateSaveFailed {
@@ -209,3 +221,7 @@ pub enum ModLoadError {
         detail: String,
     },
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/loader_error_coverage_tests.rs"]
+mod coverage_tests;

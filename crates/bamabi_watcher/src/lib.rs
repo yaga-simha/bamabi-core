@@ -6,7 +6,8 @@
 //!
 //! Monitors a mods directory recursively for native shared libraries (`.so`, `.dylib`, `.dll`)
 //! and declarative `mod.toml` manifests via `notify-debouncer-full`, validates SemVer DAG
-//! constraints, and drives cascading topological reloads and unloads in Bevy `PreUpdate`.
+//! constraints, and drives cascading topological reloads and unloads in Bevy
+//! [`ModLifecycleFlush`](bamabi_host::ModLifecycleFlush).
 
 pub mod watcher;
 

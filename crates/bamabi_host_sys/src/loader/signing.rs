@@ -1,24 +1,33 @@
 //! Thin Bevy ECS adapters over [`bamabi_trust`], storing cryptographic mod receipts
 //! ([`VerifiedModSignature`]) and trust policies ([`ModTrustPolicy`]) as Bevy `Component` / `Resource`.
+//!
+//! Note: `bamabi_trust`'s optional `keygen` module (`GeneratedKeypair`, `IssuedCertificate`,
+//! `generate_ed25519_keypair`, `issue_ed25519_certificate_openssh`, `write_openssh_keypair`) is
+//! gated behind the `bamabi_trust/keygen` feature, which `bamabi_host_sys`'s
+//! `signature-verification` feature does not enable.
 
 use bevy_ecs::prelude::{Component, Resource};
 use core::ops::Deref;
 use std::path::Path;
 
 pub use bamabi_trust::bampack::{
-    BAMPACK_MAGIC, BAMPACK_VERSION, BamPackBuilder, BamPackEntry, DEFAULT_BAMPACK_NAMESPACE,
-    MAX_BAMPACK_ENTRIES, VerifiedBamPack,
+    BAMPACK_MAGIC, BAMPACK_VERSION, BamPackBuilder, BamPackEntry, BamPackExtractError,
+    BamPackExtractLimits, DEFAULT_BAMPACK_NAMESPACE, DEFAULT_MAX_BAMPACK_UNCOMPRESSED_BYTES,
+    MAX_BAMPACK_ENTRIES, MAX_BAMPACK_PATH_DEPTH, MAX_BAMPACK_PATH_LEN, VerifiedBamPack,
+    parse_bampack_entries_unverified, validate_bampack_entry_path,
 };
 pub use bamabi_trust::embedded_sig::{
     BAM_SIG_MACHO_SECTION_NAME, BAM_SIG_SECTION_NAME, EmbeddedSignatureSection,
     extract_embedded_bam_sig, zeroed_binary_for_bam_sig,
 };
 pub use bamabi_trust::{
-    CertificateValidityPolicy, DEFAULT_KRL_SIGNATURE_NAMESPACE, DEFAULT_MAX_MOD_BINARY_BYTES,
-    DEFAULT_SIGNATURE_NAMESPACE, KrlBuilder, MAX_KRL_BYTES, MAX_SIGNATURE_SIDECAR_BYTES,
-    ModSigningError, ModTrustConfigError, SignatureEnforcement, SignatureVerificationError,
-    default_signature_path_for, sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
-    sign_mod_bytes_with_openssh_certificate,
+    Algorithm, Certificate, CertificateValidityPolicy, DEFAULT_KRL_SIGNATURE_NAMESPACE,
+    DEFAULT_KRL_SIGNER_PRINCIPAL, DEFAULT_MAX_MOD_BINARY_BYTES, DEFAULT_SIGNATURE_NAMESPACE,
+    Fingerprint, HashAlg, KrlBuilder, LineEnding, MAX_KRL_BYTES, MAX_SIGNATURE_SIDECAR_BYTES,
+    ModSigningError, ModTrustConfigError, PrivateKey, PublicKey, SignatureEnforcement,
+    SignatureVerificationError, bampack, default_signature_path_for, embedded_sig,
+    sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
+    sign_mod_bytes_with_openssh_certificate, ssh_key,
 };
 
 /// Verified cryptographic identity attached as an ECS [`Component`] to each spawned
@@ -52,6 +61,21 @@ impl From<bamabi_trust::VerifiedModSignature> for VerifiedModSignature {
             principals: v.principals,
             serial: v.serial,
             namespace: v.namespace,
+            binary_sha256: v.binary_sha256,
+        }
+    }
+}
+
+impl From<&bamabi_trust::VerifiedModSignature> for VerifiedModSignature {
+    #[inline]
+    fn from(v: &bamabi_trust::VerifiedModSignature) -> Self {
+        Self {
+            signer_fingerprint: v.signer_fingerprint.clone(),
+            ca_fingerprint: v.ca_fingerprint.clone(),
+            key_id: v.key_id.clone(),
+            principals: v.principals.clone(),
+            serial: v.serial,
+            namespace: v.namespace.clone(),
             binary_sha256: v.binary_sha256,
         }
     }
@@ -92,6 +116,27 @@ impl From<VerifiedModSignature> for bamabi_trust::VerifiedModSignature {
 /// Stored as a Bevy [`Resource`] in `World` (defaults to [`ModTrustPolicy::disabled`] when
 /// omitted unless explicit enforcement is configured). Backed by zero-Bevy
 /// [`bamabi_trust::ModTrustPolicy`].
+///
+/// # Read-Only Policy Getters (via [`Deref`])
+///
+/// All read-only inspection methods on [`bamabi_trust::ModTrustPolicy`] are directly reachable
+/// through [`Deref`] without separate wrapper methods:
+/// - [`krl_signer_principal`](bamabi_trust::ModTrustPolicy::krl_signer_principal)
+/// - [`trusted_ca_count`](bamabi_trust::ModTrustPolicy::trusted_ca_count)
+/// - [`trusted_public_key_count`](bamabi_trust::ModTrustPolicy::trusted_public_key_count)
+/// - [`trusted_krl_signer_count`](bamabi_trust::ModTrustPolicy::trusted_krl_signer_count)
+/// - [`min_krl_version`](bamabi_trust::ModTrustPolicy::min_krl_version)
+/// - [`applied_krl_version`](bamabi_trust::ModTrustPolicy::applied_krl_version)
+/// - [`is_cert_serial_revoked`](bamabi_trust::ModTrustPolicy::is_cert_serial_revoked)
+/// - [`is_cert_key_id_revoked`](bamabi_trust::ModTrustPolicy::is_cert_key_id_revoked)
+/// - [`enforcement`](bamabi_trust::ModTrustPolicy::enforcement)
+/// - [`is_enforced`](bamabi_trust::ModTrustPolicy::is_enforced)
+/// - [`namespace`](bamabi_trust::ModTrustPolicy::namespace)
+/// - [`required_principal`](bamabi_trust::ModTrustPolicy::required_principal)
+/// - [`validity_policy`](bamabi_trust::ModTrustPolicy::validity_policy)
+/// - [`max_binary_bytes`](bamabi_trust::ModTrustPolicy::max_binary_bytes)
+/// - [`binds_manifest_name_to_principal`](bamabi_trust::ModTrustPolicy::binds_manifest_name_to_principal)
+/// - [`has_trust_anchors`](bamabi_trust::ModTrustPolicy::has_trust_anchors)
 #[derive(Resource, Clone, Debug)]
 pub struct ModTrustPolicy(bamabi_trust::ModTrustPolicy);
 
@@ -202,6 +247,14 @@ impl ModTrustPolicy {
         fn add_public_key_openssh(openssh_pub: &str) -> Result<Self>;
         /// Reads and adds a pinned OpenSSH Ed25519 `.pub` file from disk.
         fn add_public_key_file(path: impl AsRef<Path>) -> Result<Self>;
+        /// Adds an explicitly trusted Ed25519 public key authorized to sign Key Revocation Lists
+        /// without granting mod-signing authority.
+        fn add_krl_signer_openssh(openssh_pub: &str) -> Result<Self>;
+        /// Reads and adds an explicitly trusted KRL signer `.pub` file from disk.
+        fn add_krl_signer_file(path: impl AsRef<Path>) -> Result<Self>;
+        /// Sets the certificate principal required on CA-delegated KRL signing certificates
+        /// (defaults to [`DEFAULT_KRL_SIGNER_PRINCIPAL`], `"krl-signer"`). Rejects empty strings.
+        fn with_krl_signer_principal(principal: impl Into<String>) -> Result<Self>;
         /// Sets the expected `SSHSIG` domain-separation namespace (rejects empty strings).
         fn with_namespace(namespace: impl Into<String>) -> Result<Self>;
         /// Revokes an inclusive certificate serial range `[min, max]` across all trusted CAs.
@@ -292,6 +345,23 @@ impl ModTrustPolicy {
         let trust_receipt = bamabi_trust::VerifiedModSignature::from(receipt);
         self.0
             .verify_manifest_principal(&trust_receipt, manifest_name)
+    }
+
+    /// Parses and cryptographically verifies a `.bampack` archive in memory against this policy.
+    pub fn verify_bampack_bytes(
+        &self,
+        archive_bytes: &[u8],
+    ) -> Result<VerifiedBamPack, SignatureVerificationError> {
+        self.0.verify_bampack_bytes(archive_bytes)
+    }
+
+    /// Reads (bounded by [`bamabi_trust::ModTrustPolicy::max_binary_bytes`]) and cryptographically
+    /// verifies a `.bampack` file on disk.
+    pub fn verify_bampack_file(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<VerifiedBamPack, SignatureVerificationError> {
+        self.0.verify_bampack_file(path)
     }
 }
 

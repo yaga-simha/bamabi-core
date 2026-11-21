@@ -28,6 +28,7 @@ mod handshake_and_strict_load;
 mod host_unit_basics;
 mod hot_reload_and_excision;
 mod isolation_and_rollback;
+mod leased_schedule_soundness;
 mod mod_dag_and_cascade;
 mod schema_evolution;
 mod scoped_cleanup_and_slab;

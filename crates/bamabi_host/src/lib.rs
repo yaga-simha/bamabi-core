@@ -69,15 +69,19 @@ pub use bamabi_host_sys::loader::{
 };
 #[cfg(feature = "signature-verification")]
 pub use bamabi_host_sys::{
-    BAM_SIG_MACHO_SECTION_NAME, BAM_SIG_SECTION_NAME, BAMPACK_MAGIC, BAMPACK_VERSION,
-    BamPackBuilder, BamPackEntry, CertificateValidityPolicy, DEFAULT_BAMPACK_NAMESPACE,
-    DEFAULT_KRL_SIGNATURE_NAMESPACE, DEFAULT_MAX_MOD_BINARY_BYTES, DEFAULT_SIGNATURE_NAMESPACE,
-    EmbeddedSignatureSection, KrlBuilder, MAX_BAMPACK_ENTRIES, MAX_KRL_BYTES,
-    MAX_SIGNATURE_SIDECAR_BYTES, ModSigningError, ModTrustConfigError, ModTrustPolicy,
-    SignatureEnforcement, SignatureVerificationError, VerifiedBamPack, VerifiedModSignature,
-    default_signature_path_for, extract_embedded_bam_sig, preverify_mod_on_disk,
-    sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
-    sign_mod_bytes_with_openssh_certificate, zeroed_binary_for_bam_sig,
+    Algorithm, BAM_SIG_MACHO_SECTION_NAME, BAM_SIG_SECTION_NAME, BAMPACK_MAGIC, BAMPACK_VERSION,
+    BamPackBuilder, BamPackEntry, BamPackExtractError, BamPackExtractLimits, Certificate,
+    CertificateValidityPolicy, DEFAULT_BAMPACK_NAMESPACE, DEFAULT_KRL_SIGNATURE_NAMESPACE,
+    DEFAULT_KRL_SIGNER_PRINCIPAL, DEFAULT_MAX_BAMPACK_UNCOMPRESSED_BYTES,
+    DEFAULT_MAX_MOD_BINARY_BYTES, DEFAULT_SIGNATURE_NAMESPACE, EmbeddedSignatureSection,
+    Fingerprint, HashAlg, KrlBuilder, LineEnding, MAX_BAMPACK_ENTRIES, MAX_BAMPACK_PATH_DEPTH,
+    MAX_BAMPACK_PATH_LEN, MAX_KRL_BYTES, MAX_SIGNATURE_SIDECAR_BYTES, ModSigningError,
+    ModTrustConfigError, ModTrustPolicy, PrivateKey, PublicKey, SignatureEnforcement,
+    SignatureVerificationError, VerifiedBamPack, VerifiedModSignature, bampack,
+    default_signature_path_for, embedded_sig, extract_embedded_bam_sig,
+    parse_bampack_entries_unverified, preverify_mod_on_disk, sign_mod_bytes_with_certificate,
+    sign_mod_bytes_with_key, sign_mod_bytes_with_openssh_certificate, ssh_key,
+    validate_bampack_entry_path, zeroed_binary_for_bam_sig,
 };
 pub use bamabi_host_sys::{
     BinaryFormat, ComponentCollisionError, ComponentOptions, LibraryResidencyInfo, LoadOptions,
@@ -101,10 +105,13 @@ pub use events::{
     LoadedModInfo, ModLoaded, ModSystemError, ModSystemFaulted, ModUnloaded, SystemInitError,
 };
 pub use mod_dag::{
-    DagResolution, DirectoryLoadReport, ManifestError, ModDagError, ModDagNode, ModDependencyGraph,
-    ModTomlManifest, discover_mod_manifests, host_abi_semver, resolve_dependency_dag,
+    DagResolution, DirectoryLoadReport, ManifestError, ModDagError, ModDagErrorKind, ModDagNode,
+    ModDependencyGraph, ModTomlManifest, discover_mod_manifests, host_abi_semver,
+    resolve_dependency_dag,
 };
-pub use plugin::{AbiModPlugin, ConfiguredAbiModPlugin};
+pub use plugin::{
+    AbiModPlugin, ConfiguredAbiModPlugin, ModLifecycleFlush, ensure_mod_lifecycle_flush_schedule,
+};
 pub use schedule_sets::{
     ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
     configure_guest_system_in_world, configure_weak_set_chain,
@@ -128,9 +135,12 @@ pub mod prelude {
         LoadedModInfo, ModLoaded, ModSystemError, ModSystemFaulted, ModUnloaded, SystemInitError,
     };
     pub use crate::mod_dag::{
-        DirectoryLoadReport, ModDagError, ModDependencyGraph, ModTomlManifest,
+        DirectoryLoadReport, ModDagError, ModDagErrorKind, ModDependencyGraph, ModTomlManifest,
     };
-    pub use crate::plugin::{AbiModPlugin, ConfiguredAbiModPlugin};
+    pub use crate::plugin::{
+        AbiModPlugin, ConfiguredAbiModPlugin, ModLifecycleFlush,
+        ensure_mod_lifecycle_flush_schedule,
+    };
     pub use crate::schedule_sets::{
         ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
         configure_guest_system_in_world, configure_weak_set_chain,
