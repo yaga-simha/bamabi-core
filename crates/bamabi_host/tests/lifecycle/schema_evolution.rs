@@ -110,11 +110,15 @@ crate-type = ["cdylib"]
 
         let shared_target_dir =
             std::env::temp_dir().join(format!("bam_schema_evo_target_{}", std::process::id()));
+        // Guest fixtures are built uninstrumented, matching the nightly "Stage uninstrumented guest
+        // fixtures before enabling TSan" step (avoids `-Zsanitizer=thread` ABI mismatch without `-Zbuild-std`).
         let output = Command::new(env!("CARGO"))
             .arg("build")
             .arg("--offline")
             .current_dir(&dir)
             .env("CARGO_TARGET_DIR", &shared_target_dir)
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
             .output()
             .expect("invoke cargo build for temp cdylib fixture");
         assert!(

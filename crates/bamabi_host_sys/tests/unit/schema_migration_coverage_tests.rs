@@ -603,7 +603,7 @@ fn migrate_component_column_ffi_covers_validation_errors_and_zst_sparse_dense() 
         FfiResult::UNSUPPORTED
     );
     // 4. Invalid UTF-8 name -> INVALID_UTF8
-    let bad_name: [c_char; 2] = [-1, 0];
+    let bad_name: [c_char; 2] = [c_char::from_ne_bytes([0xFF]), 0];
     let bad_name_desc = ComponentDesc::new(
         bad_name.as_ptr(),
         ComponentUuid::from_parts("bad", 8, 4, 0),
