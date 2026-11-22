@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+- **Bounded Message & Removed-Component Cursor Conservation (`bamabi_host_sys`):**
+  - Added [`clamp_batch_max_count`](crates/bamabi_host_sys/src/registry/catalog.rs) (clamping `max_count` to `isize::MAX / elem_size` while preserving ZST counts) and [`drain_cursor_bounded`](crates/bamabi_host_sys/src/registry/catalog.rs) (`iter.take(max_count).enumerate()`), eliminating cursor over-consumption where `MessageCursor::read` advanced inside `Iterator::next()` past the final yielded item (`msg_read_batch_impl` and `msg_read_batch_non_pod_impl` in `registry/catalog.rs`, and `host_iter_read_removed` in [`crates/bamabi_host_sys/src/ffi/iter_ext.rs`](crates/bamabi_host_sys/src/ffi/iter_ext.rs)).
+  - Added conservation-law integration tests (`pod_messages_boundary_sweep_conserves_all_items`, `multi_reader_rollover_and_hot_reload_cursor_persistence`, `non_pod_messages_and_removed_components_conservation`) and a `proptest` multi-frame differential oracle (`proptest_multi_reader_cursor_differential_oracle`) in [`crates/bamabi_host/tests/ffi/cursor_conservation.rs`](crates/bamabi_host/tests/ffi/cursor_conservation.rs), Miri-verified unit tests in `registry/catalog.rs` and `iter_ext_tests.rs`, and `#[cfg(kani)]` conservation/overflow proofs in `registry/catalog.rs` (`2/2` PASS).
+
 ### Added
 - **Safe-Point Lifecycle Schedule (`ModLifecycleFlush`) & Leased-Schedule Introspection:**
   - Added [`ModLifecycleFlush`](crates/bamabi_host/src/plugin.rs) (`ScheduleLabel`) and idempotent [`ensure_mod_lifecycle_flush_schedule(app)`](crates/bamabi_host/src/plugin.rs), inserting `ModLifecycleFlush` immediately after `Last` in `MainScheduleOrder` (or appending if `Last` is absent) and draining `PendingModLifecycleOps` safely once frame schedules have returned to `Schedules`.

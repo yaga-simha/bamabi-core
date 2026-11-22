@@ -53,15 +53,15 @@ cargo llvm-cov report --ignore-filename-regex '(tests|examples|xtask|benches)/|\
    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
    ```
 
-### Tier 2: Complete Test Inventory per Crate (`446` total tests with `--all-features`, `417` default)
+### Tier 2: Complete Test Inventory per Crate (`455` total tests with `--all-features`, incl. `2` doctests)
 
 No tests in `bamabi-core` carry `#[ignore]`; optional tests gate on `--features signature-verification`, `--features keygen`, `--features diagnostics`, or `--features bridge-reflect`, and [`soak_10k_reloads`](crates/bamabi_host/tests/soak_10k_reloads.rs) scales its iteration count via `BAM_SOAK_CYCLES` (`250` default, `10000` in CI Linux `--release`).
 
-#### `bamabi_host_sys` (`151` tests — [`crates/bamabi_host_sys/TESTS.md`](crates/bamabi_host_sys/TESTS.md))
+#### `bamabi_host_sys` (`156` tests — [`crates/bamabi_host_sys/TESTS.md`](crates/bamabi_host_sys/TESTS.md))
 
 | Suite / Binary | Command | Tests | Scope |
 |---|---|---|---|
-| **Unit (`--lib`)** (`27` files in `tests/unit/`) | `cargo test -p bamabi_host_sys --lib --all-features` | `104` | `drop_trampoline`, `ffi/*` (incl. `validation` reflection pool), `registry/*`, `schedule`, `system/*`, `loader/*` (incl. `schema_migration` `IsResource` reload test, `shared_lib` `proptest` fuzzers & `signing` / `keygen` parity) |
+| **Unit (`--lib`)** (`27` files in `tests/unit/` + `cursor_tests`) | `cargo test -p bamabi_host_sys --lib --all-features` | `109` | `drop_trampoline`, `ffi/*` (incl. `validation` reflection pool & `iter_ext` partial-batch conservation), `registry/*` (incl. `cursor_tests` POD/ZST/non-POD conservation), `schedule`, `system/*`, `loader/*` (incl. `schema_migration` `IsResource` reload test, `shared_lib` `proptest` fuzzers & `signing` / `keygen` parity) |
 | `ffi_v03_coverage` | `cargo test -p bamabi_host_sys --test ffi_v03_coverage --all-features` | `7` | Exhaustive ABI `0.3.0`, `assets_scene`, `commands*`, `iter*`, `observers_ext`, `hierarchy_ext`, `system/*` edge paths |
 | `host_sys_integration_tests` | `cargo test -p bamabi_host_sys --test host_sys_integration_tests --all-features` | `10` | World-scoped `last_error` & symbols, handle poisoning, `WorldDropGuard`, `SparseSet`, `thiserror` chains |
 | `loom_drop_trampoline` | `cargo test -p bamabi_host_sys --test loom_drop_trampoline --release` | `3` | Exhaustive atomic interleaving proofs for `DROP_PAGES` (incl. 3rd ABA generation-reuse model) |
@@ -72,12 +72,12 @@ No tests in `bamabi-core` carry `#[ignore]`; optional tests gate on `--features 
 | `v03_schedules_error_bridge` | `cargo test -p bamabi_host_sys --test v03_schedules_error_bridge` | `6` | Decoupled schedule sets (`.chain()`/`.chain_weak()`), `<400us` hot-rewire, `FallbackErrorHandler` |
 | `zero_alloc_commands` | `cargo test -p bamabi_host_sys --test zero_alloc_commands` | `1` | `CountingAllocator` proof of zero steady-state heap allocations in `CommandArena` + `cmd_spawn` |
 
-#### `bamabi_host` (`268` tests + `2` benches — [`crates/bamabi_host/TESTS.md`](crates/bamabi_host/TESTS.md))
+#### `bamabi_host` (`272` tests + `2` benches — [`crates/bamabi_host/TESTS.md`](crates/bamabi_host/TESTS.md))
 
 | Suite / Binary | Command | Tests | Scope |
 |---|---|---|---|
 | **Unit (`--lib`)** (`8` files in `tests/unit/`) | `cargo test -p bamabi_host --lib --all-features` | `15` | `app_ext`, `budgets`, `commands_ext` (`ModLifecycleFlush` deferral), `mod_dag` (`ModDagErrorKind` + 13 accessors), `plugin`, `schedule_sets`, `world_ext` |
-| `ffi` (`tests/ffi/main.rs`) | `cargo test -p bamabi_host --test ffi --all-features` | `121` | `10` submodules: FFI boundaries, chunk/commands, filters (`Allow`/`Has`/`Or`), C99 VTable, `SparseSet`, UUID parity |
+| `ffi` (`tests/ffi/main.rs`) | `cargo test -p bamabi_host --test ffi --all-features` | `125` | `11` submodules: FFI boundaries, chunk/commands, filters (`Allow`/`Has`/`Or`), C99 VTable, `SparseSet`, UUID parity, `cursor_conservation` (`4` tests incl. `proptest` oracle) |
 | `scheduling` (`tests/scheduling/main.rs`) | `cargo test -p bamabi_host --test scheduling --all-features` | `47` | `6` submodules: parallel conflicts, `proptest` Bevy differential parity, multi-query, ordering sets, `diagnostics` |
 | `lifecycle` (`tests/lifecycle/main.rs`) | `cargo test -p bamabi_host --test lifecycle --all-features` | `59` | `11` submodules: `leased_schedule_soundness`, `drop_trampolines`, hot-reload, rollback, `mod_dag`, `schema_evolution`, `signature_verification` (`11`, feature-gated) |
 | `e2e` (`tests/e2e/main.rs`) | `cargo test -p bamabi_host --test e2e --all-features` | `12` | Asymmetric Rust & ISO C99 shared-library end-to-end execution |
@@ -116,11 +116,12 @@ CI (`asymmetry-rust`, `asymmetry-c`, `sanitizers`) builds guests across Rust `1.
 
 ### Tier 5: Loom Concurrency & Miri Soundness
 
-- **Loom (`DROP_PAGES` 3-model verification):**
+- **Loom (`DROP_PAGES` 3-model verification) & Kani (`bamabi_host_sys` `2/2` proofs):**
   ```bash
   cargo test -p bamabi_host_sys --test loom_drop_trampoline --release
+  cargo kani -p bamabi_host_sys -Z unstable-options --harness-timeout 15m --output-format terse -j
   ```
-  Covers: (1) concurrent publish vs. drop vs. `WorldDropGuard::drop`, (2) two concurrent drops vs. `WorldDropGuard::drop`, and (3) the 3rd **ABA generation-reuse model** (`loom_slot_reuse_aba_stale_reader_never_invokes_new_generation_drop`).
+  Loom covers: (1) concurrent publish vs. drop vs. `WorldDropGuard::drop`, (2) two concurrent drops vs. `WorldDropGuard::drop`, and (3) the 3rd **ABA generation-reuse model** (`loom_slot_reuse_aba_stale_reader_never_invokes_new_generation_drop`). Kani proofs (`src/registry/catalog.rs`) verify `kani_proof_drain_cursor_bounded_conservation` and `kani_proof_clamp_batch_max_count_no_isize_overflow`.
 - **Miri (`-Zmiri-tree-borrows`):**
   ```bash
   MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bamabi_host_sys --lib

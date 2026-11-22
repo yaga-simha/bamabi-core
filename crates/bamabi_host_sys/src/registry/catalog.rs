@@ -178,6 +178,39 @@ fn create_msg_cursor_impl<M: Message>() -> Box<dyn Any + Send + Sync> {
     Box::new(MessageCursor::<M>::default())
 }
 
+/// Clamps a batch `max_count` so `max_count * elem_size` never exceeds `isize::MAX` bytes.
+#[inline]
+pub(crate) const fn clamp_batch_max_count(max_count: usize, elem_size: usize) -> usize {
+    if let Some(max_elems) = (isize::MAX as usize).checked_div(elem_size) {
+        if max_count < max_elems {
+            max_count
+        } else {
+            max_elems
+        }
+    } else {
+        max_count
+    }
+}
+
+/// Drains at most `max_count` items from `iter` without advancing past the boundary.
+///
+/// Uses [`Iterator::take`] so iterators whose `next()` advances cursor state before yielding
+/// (such as Bevy's `MessageCursor::read`) never consume and silently drop an extra item when
+/// stopping at `max_count`.
+#[inline]
+pub(crate) fn drain_cursor_bounded<T, I: Iterator<Item = T>>(
+    iter: I,
+    max_count: usize,
+    mut visit: impl FnMut(usize, T),
+) -> usize {
+    let mut written = 0usize;
+    for (idx, item) in iter.take(max_count).enumerate() {
+        visit(idx, item);
+        written = idx + 1;
+    }
+    written
+}
+
 unsafe fn msg_read_batch_impl<M: Message + AbiPod>(
     world: UnsafeWorldCell<'_>,
     msg_res_id: ComponentId,
@@ -196,7 +229,8 @@ unsafe fn msg_read_batch_impl<M: Message + AbiPod>(
     if max_count == 0 {
         return FfiResult::OK;
     }
-    if core::mem::size_of::<M>() > 0 && out_buf.is_null() {
+    let elem_size = core::mem::size_of::<M>();
+    if elem_size > 0 && out_buf.is_null() {
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: `MESSAGE_READ` or `MESSAGE_WRITE` on `msg_res_id` (`Messages<M>`) was declared in `FilteredAccessSet`.
@@ -205,20 +239,18 @@ unsafe fn msg_read_batch_impl<M: Message + AbiPod>(
     };
     // SAFETY: `msg_res_id` was registered from `world.register_component::<Messages<M>>()`.
     let messages: &Messages<M> = unsafe { res_ptr.deref::<Messages<M>>() };
-    let mut written = 0usize;
-    for msg in typed_cursor.read(messages) {
-        if written >= max_count {
-            break;
-        }
-        if core::mem::size_of::<M>() > 0 {
-            // SAFETY: `out_buf` is writable for `max_count * size_of::<M>()` bytes; `write_unaligned`
+    let effective_max = clamp_batch_max_count(max_count, elem_size);
+    let written = drain_cursor_bounded(typed_cursor.read(messages), effective_max, |idx, msg| {
+        if elem_size > 0 {
+            // SAFETY: `idx < effective_max <= max_count` and `effective_max * elem_size <= isize::MAX`,
+            // so `out_buf.add(idx * elem_size)` stays within `out_buf`'s `max_count * size_of::<M>()`
+            // writable byte allocation without `isize` offset overflow; `write_unaligned`
             // supports arbitrary guest buffer alignments cleanly.
             unsafe {
-                core::ptr::write_unaligned(out_buf.cast::<M>().add(written), *msg);
+                core::ptr::write_unaligned(out_buf.add(idx * elem_size).cast::<M>(), *msg);
             }
         }
-        written += 1;
-    }
+    });
     // SAFETY: `out_count` is non-null and writable.
     unsafe {
         *out_count = written;
@@ -307,21 +339,21 @@ unsafe fn msg_read_batch_non_pod_impl<M: Message>(
     };
     // SAFETY: `msg_res_id` was registered from `world.register_component::<Messages<M>>()`.
     let messages: &Messages<M> = unsafe { res_ptr.deref::<Messages<M>>() };
-    let mut written = 0usize;
-    for msg in typed_cursor.read(messages).take(max_count) {
+    let ptr_size = core::mem::size_of::<*const c_void>();
+    let effective_max = clamp_batch_max_count(max_count, ptr_size);
+    let written = drain_cursor_bounded(typed_cursor.read(messages), effective_max, |idx, msg| {
         let msg_ptr = core::ptr::from_ref(msg).cast::<c_void>();
-        // SAFETY: `out_buf` is writable for `max_count * size_of::<*const c_void>()` bytes;
-        // `write_unaligned` preserves full pointer provenance regardless of `out_buf` alignment.
+        // SAFETY: `idx < effective_max <= max_count` and `effective_max * ptr_size <= isize::MAX`,
+        // so `out_buf.add(idx * ptr_size)` stays within `out_buf`'s `max_count * ptr_size`
+        // writable byte allocation without `isize` offset overflow; `write_unaligned` preserves
+        // full pointer provenance regardless of `out_buf` alignment.
         unsafe {
             core::ptr::write_unaligned(
-                out_buf
-                    .add(written * core::mem::size_of::<*const c_void>())
-                    .cast::<*const c_void>(),
+                out_buf.add(idx * ptr_size).cast::<*const c_void>(),
                 msg_ptr,
             );
         }
-        written += 1;
-    }
+    });
     // SAFETY: `out_count` is non-null and writable.
     unsafe {
         *out_count = written;
@@ -2351,3 +2383,512 @@ impl ModRegistry {
 #[cfg(test)]
 #[path = "../../tests/unit/catalog_coverage_tests.rs"]
 mod coverage_tests;
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::{
+        FfiResult, Message, World, c_void, clamp_batch_max_count, create_msg_cursor_impl,
+        drain_cursor_bounded, msg_read_batch_impl, msg_read_batch_non_pod_impl,
+    };
+    use bamabi_macros::AbiPod;
+    use bevy_ecs::message::Messages;
+
+    struct NextAdvancesCursor {
+        pos: usize,
+        total: usize,
+    }
+
+    impl Iterator for NextAdvancesCursor {
+        type Item = usize;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.pos >= self.total {
+                return None;
+            }
+            let item = self.pos;
+            self.pos += 1;
+            Some(item)
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Message, Clone, Copy, Debug, Default, PartialEq, Eq, AbiPod)]
+    struct SeqPod {
+        seq: u64,
+        tag: u32,
+        pad: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Message, Clone, Copy, Debug, Default, PartialEq, Eq, AbiPod)]
+    struct ZstPod;
+
+    #[repr(C, align(16))]
+    #[derive(Message, Clone, Copy, Debug, Default, PartialEq, Eq, AbiPod)]
+    struct Simd16Pod {
+        lanes: [u32; 4],
+    }
+
+    #[derive(Message, Clone, Debug, Default, PartialEq, Eq)]
+    struct NonPodItem {
+        label: String,
+        tags: Vec<u32>,
+        seq: u64,
+    }
+
+    #[test]
+    fn drain_cursor_bounded_conserves_all_items_across_boundary_batches() {
+        for total in [0usize, 1, 2, 7, 63, 64, 65, 127, 128, 129, 250] {
+            let mut zero_cursor = NextAdvancesCursor { pos: 0, total };
+            let mut visited_zero = false;
+            let zero_n = drain_cursor_bounded(&mut zero_cursor, 0, |_, _| {
+                visited_zero = true;
+            });
+            assert_eq!(zero_n, 0);
+            assert!(!visited_zero);
+            assert_eq!(zero_cursor.pos, 0);
+
+            for batch_size in [1usize, 2, 3, 7, 63, 64, 65, 128, usize::MAX] {
+                let mut cursor = NextAdvancesCursor { pos: 0, total };
+                let mut collected = Vec::with_capacity(total);
+                loop {
+                    let expected_start = collected.len();
+                    let n = drain_cursor_bounded(&mut cursor, batch_size, |idx, item| {
+                        assert_eq!(item, expected_start + idx);
+                        collected.push(item);
+                    });
+                    assert!(n <= batch_size);
+                    if n == 0 {
+                        break;
+                    }
+                }
+                assert_eq!(cursor.pos, total);
+                assert_eq!(collected.len(), total);
+                for (idx, &val) in collected.iter().enumerate() {
+                    assert_eq!(val, idx);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clamp_batch_max_count_zst_and_overflow_bounds() {
+        assert_eq!(clamp_batch_max_count(0, 0), 0);
+        assert_eq!(clamp_batch_max_count(7, 0), 7);
+        assert_eq!(clamp_batch_max_count(usize::MAX, 0), usize::MAX);
+        assert_eq!(clamp_batch_max_count(100, 16), 100);
+        assert_eq!(
+            clamp_batch_max_count(usize::MAX, 16),
+            (isize::MAX as usize) / 16
+        );
+
+        for elem_size in [
+            1usize,
+            4,
+            8,
+            16,
+            64,
+            isize::MAX as usize,
+            (isize::MAX as usize) + 1,
+        ] {
+            for max_count in [0usize, 1, 64, isize::MAX as usize, usize::MAX] {
+                let eff = clamp_batch_max_count(max_count, elem_size);
+                assert!(eff <= max_count);
+                assert!(
+                    eff.checked_mul(elem_size)
+                        .is_some_and(|bytes| bytes <= isize::MAX as usize)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn msg_read_batch_impl_pod_zst_unaligned_simd_and_usize_max() {
+        // (a) POD struct drained across partial batches
+        {
+            let mut world = World::new();
+            let msg_res_id = world.register_component::<Messages<SeqPod>>();
+            world.init_resource::<Messages<SeqPod>>();
+            let total = 130usize;
+            let sent: Vec<SeqPod> = (0..total)
+                .map(|i| SeqPod {
+                    seq: i as u64,
+                    tag: (i as u32).wrapping_mul(17),
+                    pad: 0xA5A5_5A5A,
+                })
+                .collect();
+            {
+                let mut msgs = world.resource_mut::<Messages<SeqPod>>();
+                for &m in &sent {
+                    msgs.write(m);
+                }
+            }
+
+            let cell = world.as_unsafe_world_cell_readonly();
+            for batch_size in [1usize, 7, 64, 65] {
+                let mut cursor = create_msg_cursor_impl::<SeqPod>();
+                let mut collected = Vec::with_capacity(total);
+                let mut out_buf = vec![SeqPod::default(); batch_size];
+                loop {
+                    let mut out_count = usize::MAX;
+                    // SAFETY: `cell` grants shared read access to `Messages<SeqPod>`, `cursor` was
+                    // created by `create_msg_cursor_impl::<SeqPod>`, and `out_buf` has `batch_size`
+                    // writable `SeqPod` elements.
+                    let rc = unsafe {
+                        msg_read_batch_impl::<SeqPod>(
+                            cell,
+                            msg_res_id,
+                            cursor.as_mut(),
+                            out_buf.as_mut_ptr().cast::<u8>(),
+                            batch_size,
+                            &raw mut out_count,
+                        )
+                    };
+                    assert_eq!(rc, FfiResult::OK);
+                    assert!(out_count <= batch_size);
+                    if out_count == 0 {
+                        break;
+                    }
+                    collected.extend_from_slice(&out_buf[..out_count]);
+                }
+                assert_eq!(collected, sent);
+            }
+
+            // (d) `max_count = usize::MAX` on a small valid buffer sized to queued messages.
+            {
+                let mut cursor = create_msg_cursor_impl::<SeqPod>();
+                let mut out_buf = vec![SeqPod::default(); total];
+                let mut out_count = 0usize;
+                // SAFETY: `out_buf` has `total` writable elements and `Messages<SeqPod>` holds `total`
+                // messages, so `msg_read_batch_impl` writes at most `total` slots without reading or
+                // writing beyond `out_buf`.
+                let rc = unsafe {
+                    msg_read_batch_impl::<SeqPod>(
+                        cell,
+                        msg_res_id,
+                        cursor.as_mut(),
+                        out_buf.as_mut_ptr().cast::<u8>(),
+                        usize::MAX,
+                        &raw mut out_count,
+                    )
+                };
+                assert_eq!(rc, FfiResult::OK);
+                assert_eq!(out_count, total);
+                assert_eq!(out_buf, sent);
+
+                let mut trailing = usize::MAX;
+                // SAFETY: Trailing read after drain yields 0 items without writing to `out_buf`.
+                let rc_end = unsafe {
+                    msg_read_batch_impl::<SeqPod>(
+                        cell,
+                        msg_res_id,
+                        cursor.as_mut(),
+                        out_buf.as_mut_ptr().cast::<u8>(),
+                        usize::MAX,
+                        &raw mut trailing,
+                    )
+                };
+                assert_eq!(rc_end, FfiResult::OK);
+                assert_eq!(trailing, 0);
+            }
+        }
+
+        // (b) ZST `Messages<ZstPod>` with null `out_buf`
+        {
+            let mut world = World::new();
+            let msg_res_id = world.register_component::<Messages<ZstPod>>();
+            world.init_resource::<Messages<ZstPod>>();
+            {
+                let mut msgs = world.resource_mut::<Messages<ZstPod>>();
+                for _ in 0..5 {
+                    msgs.write(ZstPod);
+                }
+            }
+            let cell = world.as_unsafe_world_cell_readonly();
+            let mut cursor = create_msg_cursor_impl::<ZstPod>();
+            let mut out_count = 0usize;
+            // SAFETY: `ZstPod` is zero-sized so `msg_read_batch_impl` permits a null `out_buf`.
+            let rc1 = unsafe {
+                msg_read_batch_impl::<ZstPod>(
+                    cell,
+                    msg_res_id,
+                    cursor.as_mut(),
+                    core::ptr::null_mut(),
+                    3,
+                    &raw mut out_count,
+                )
+            };
+            assert_eq!(rc1, FfiResult::OK);
+            assert_eq!(out_count, 3);
+
+            // SAFETY: Remaining 2 ZST messages drained with null `out_buf` and `max_count = usize::MAX`.
+            let rc2 = unsafe {
+                msg_read_batch_impl::<ZstPod>(
+                    cell,
+                    msg_res_id,
+                    cursor.as_mut(),
+                    core::ptr::null_mut(),
+                    usize::MAX,
+                    &raw mut out_count,
+                )
+            };
+            assert_eq!(rc2, FfiResult::OK);
+            assert_eq!(out_count, 2);
+
+            // SAFETY: Drained cursor returns 0.
+            let rc3 = unsafe {
+                msg_read_batch_impl::<ZstPod>(
+                    cell,
+                    msg_res_id,
+                    cursor.as_mut(),
+                    core::ptr::null_mut(),
+                    3,
+                    &raw mut out_count,
+                )
+            };
+            assert_eq!(rc3, FfiResult::OK);
+            assert_eq!(out_count, 0);
+        }
+
+        // (c) `align(16)` SIMD message written into an unaligned destination buffer
+        {
+            let mut world = World::new();
+            let msg_res_id = world.register_component::<Messages<Simd16Pod>>();
+            world.init_resource::<Messages<Simd16Pod>>();
+            let total = 17usize;
+            let sent: Vec<Simd16Pod> = (0..total)
+                .map(|i| {
+                    let b = i as u32;
+                    Simd16Pod {
+                        lanes: [b, b + 100, b + 200, b + 300],
+                    }
+                })
+                .collect();
+            {
+                let mut msgs = world.resource_mut::<Messages<Simd16Pod>>();
+                for &m in &sent {
+                    msgs.write(m);
+                }
+            }
+
+            let cell = world.as_unsafe_world_cell_readonly();
+            let mut cursor = create_msg_cursor_impl::<Simd16Pod>();
+            let batch_size = 5usize;
+            let elem_size = core::mem::size_of::<Simd16Pod>();
+            let mut raw = vec![0u8; batch_size * elem_size + 16];
+            let offset = 3usize;
+            let mut collected = Vec::with_capacity(total);
+            loop {
+                let mut out_count = 0usize;
+                // SAFETY: `raw[offset..]` provides `batch_size * size_of::<Simd16Pod>()` writable
+                // bytes at an unaligned `+3` offset; `msg_read_batch_impl` uses `write_unaligned`.
+                let unaligned_ptr = unsafe { raw.as_mut_ptr().add(offset) };
+                // SAFETY: `cell` provides shared read access to `Messages<Simd16Pod>` and `unaligned_ptr`
+                // is writable for `batch_size * elem_size` bytes.
+                let rc = unsafe {
+                    msg_read_batch_impl::<Simd16Pod>(
+                        cell,
+                        msg_res_id,
+                        cursor.as_mut(),
+                        unaligned_ptr,
+                        batch_size,
+                        &raw mut out_count,
+                    )
+                };
+                assert_eq!(rc, FfiResult::OK);
+                if out_count == 0 {
+                    break;
+                }
+                for i in 0..out_count {
+                    // SAFETY: `msg_read_batch_impl` initialized slot `i` at `unaligned_ptr + i * elem_size`.
+                    let item = unsafe {
+                        core::ptr::read_unaligned(
+                            unaligned_ptr.add(i * elem_size).cast::<Simd16Pod>(),
+                        )
+                    };
+                    collected.push(item);
+                }
+            }
+            assert_eq!(collected, sent);
+        }
+    }
+
+    #[test]
+    fn msg_read_batch_non_pod_impl_preserves_provenance_across_batches() {
+        let mut world = World::new();
+        let msg_res_id = world.register_component::<Messages<NonPodItem>>();
+        world.init_resource::<Messages<NonPodItem>>();
+        let total = 19usize;
+        let sent: Vec<NonPodItem> = (0..total)
+            .map(|i| NonPodItem {
+                label: format!("msg_{i}"),
+                tags: vec![i as u32, (i as u32) * 3],
+                seq: i as u64,
+            })
+            .collect();
+        {
+            let mut msgs = world.resource_mut::<Messages<NonPodItem>>();
+            for item in &sent {
+                msgs.write(item.clone());
+            }
+        }
+
+        let cell = world.as_unsafe_world_cell_readonly();
+
+        // Pass 1: aligned pointer buffer in partial batches of 3.
+        {
+            let mut cursor = create_msg_cursor_impl::<NonPodItem>();
+            let mut ptrs = [core::ptr::null::<c_void>(); 3];
+            let mut collected = Vec::with_capacity(total);
+            loop {
+                let mut out_count = 0usize;
+                // SAFETY: `ptrs` holds 3 writable `*const c_void` slots and `cell` keeps `Messages<NonPodItem>`
+                // alive without mutation while returned pointers are read.
+                let rc = unsafe {
+                    msg_read_batch_non_pod_impl::<NonPodItem>(
+                        cell,
+                        msg_res_id,
+                        cursor.as_mut(),
+                        ptrs.as_mut_ptr().cast::<u8>(),
+                        ptrs.len(),
+                        &raw mut out_count,
+                    )
+                };
+                assert_eq!(rc, FfiResult::OK);
+                if out_count == 0 {
+                    break;
+                }
+                for &p in &ptrs[..out_count] {
+                    // SAFETY: `p` preserves provenance to a live `NonPodItem` inside `Messages<NonPodItem>`.
+                    let item_ref = unsafe { &*p.cast::<NonPodItem>() };
+                    collected.push(item_ref.clone());
+                }
+            }
+            assert_eq!(collected, sent);
+        }
+
+        // Pass 2: unaligned byte buffer (+3 offset) in partial batches of 7 (Miri Strict Provenance).
+        {
+            let mut cursor = create_msg_cursor_impl::<NonPodItem>();
+            let batch_size = 7usize;
+            let ptr_size = core::mem::size_of::<*const c_void>();
+            let mut raw = vec![0u8; batch_size * ptr_size + 16];
+            let offset = 3usize;
+            let mut collected = Vec::with_capacity(total);
+            loop {
+                let mut out_count = 0usize;
+                // SAFETY: `raw[offset..]` has `batch_size * ptr_size` writable bytes at an unaligned offset.
+                let unaligned_ptr = unsafe { raw.as_mut_ptr().add(offset) };
+                // SAFETY: `msg_read_batch_non_pod_impl` writes `out_count` pointers with provenance via
+                // `write_unaligned` into `unaligned_ptr`.
+                let rc = unsafe {
+                    msg_read_batch_non_pod_impl::<NonPodItem>(
+                        cell,
+                        msg_res_id,
+                        cursor.as_mut(),
+                        unaligned_ptr,
+                        batch_size,
+                        &raw mut out_count,
+                    )
+                };
+                assert_eq!(rc, FfiResult::OK);
+                if out_count == 0 {
+                    break;
+                }
+                for i in 0..out_count {
+                    // SAFETY: `read_unaligned` reconstructs the exact `*const c_void` with provenance
+                    // written into `unaligned_ptr + i * ptr_size`, pointing to a live `NonPodItem`.
+                    let p = unsafe {
+                        core::ptr::read_unaligned(
+                            unaligned_ptr.add(i * ptr_size).cast::<*const c_void>(),
+                        )
+                    };
+                    // SAFETY: `Messages<NonPodItem>` remains borrowed via `cell` without mutation.
+                    let item_ref = unsafe { &*p.cast::<NonPodItem>() };
+                    collected.push(item_ref.clone());
+                }
+            }
+            assert_eq!(collected, sent);
+        }
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::{clamp_batch_max_count, drain_cursor_bounded};
+
+    struct NextAdvancesCursor {
+        pos: usize,
+        total: usize,
+    }
+
+    impl Iterator for NextAdvancesCursor {
+        type Item = usize;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.pos >= self.total {
+                return None;
+            }
+            let item = self.pos;
+            self.pos += 1;
+            Some(item)
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(19)]
+    fn kani_proof_drain_cursor_bounded_conservation() {
+        let total: usize = kani::any();
+        kani::assume(total <= 16);
+        let max_count: usize = kani::any();
+        kani::assume(max_count <= 16);
+
+        let mut cursor = NextAdvancesCursor { pos: 0, total };
+        let mut out = [0usize; 16];
+        let mut collected = 0usize;
+
+        loop {
+            let base = collected;
+            let n = drain_cursor_bounded(&mut cursor, max_count, |idx, item| {
+                out[base + idx] = item;
+            });
+            if n == 0 {
+                break;
+            }
+            collected += n;
+        }
+
+        if max_count == 0 {
+            assert!(collected == 0 && cursor.pos == 0);
+        } else {
+            assert!(collected == total && cursor.pos == total);
+            let mut i = 0usize;
+            while i < total {
+                assert!(out[i] == i);
+                i += 1;
+            }
+        }
+    }
+
+    #[kani::proof]
+    fn kani_proof_clamp_batch_max_count_no_isize_overflow() {
+        let max_count: usize = kani::any();
+        let elem_size: usize = kani::any();
+        kani::assume(
+            elem_size <= 64
+                || matches!(elem_size, 128 | 256 | 512 | 1024 | 4096)
+                || elem_size == (isize::MAX as usize) - 1
+                || elem_size == isize::MAX as usize
+                || elem_size == (isize::MAX as usize) + 1
+                || elem_size == usize::MAX,
+        );
+        let eff = clamp_batch_max_count(max_count, elem_size);
+        assert!(eff <= max_count);
+        if elem_size > 0 {
+            assert!(
+                eff.checked_mul(elem_size)
+                    .is_some_and(|bytes| bytes <= isize::MAX as usize)
+            );
+        }
+    }
+}

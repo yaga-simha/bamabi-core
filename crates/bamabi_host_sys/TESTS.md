@@ -8,7 +8,7 @@ This document inventories every unit test suite, integration test binary, Loom c
 
 | Layer | Location | Count | Command |
 |---|---|---|---|
-| **Unit tests (`--lib`)** | `27` `#[path = ...]` files in [`tests/unit/`](tests/unit/) | `104` tests | `cargo test -p bamabi_host_sys --lib --all-features` |
+| **Unit tests (`--lib`)** | `27` `#[path = ...]` files in [`tests/unit/`](tests/unit/) + `cursor_tests` | `109` tests | `cargo test -p bamabi_host_sys --lib --all-features` |
 | **ABI 0.3.0 / FFI coverage** | [`tests/ffi_v03_coverage.rs`](tests/ffi_v03_coverage.rs) | `7` tests | `cargo test -p bamabi_host_sys --test ffi_v03_coverage --all-features` |
 | **Core host_sys integration** | [`tests/host_sys_integration_tests.rs`](tests/host_sys_integration_tests.rs) | `10` tests | `cargo test -p bamabi_host_sys --test host_sys_integration_tests --all-features` |
 | **Loom concurrency models** | [`tests/loom_drop_trampoline.rs`](tests/loom_drop_trampoline.rs) | `3` models | `cargo test -p bamabi_host_sys --test loom_drop_trampoline --release` |
@@ -19,9 +19,10 @@ This document inventories every unit test suite, integration test binary, Loom c
 | **Schedule sets & error bridge** | [`tests/v03_schedules_error_bridge.rs`](tests/v03_schedules_error_bridge.rs) | `6` tests | `cargo test -p bamabi_host_sys --test v03_schedules_error_bridge` |
 | **Zero-alloc commands** | [`tests/zero_alloc_commands.rs`](tests/zero_alloc_commands.rs) | `1` test | `cargo test -p bamabi_host_sys --test zero_alloc_commands` |
 | **Doctests** | `src/` | `0` tests | `cargo test --doc -p bamabi_host_sys --all-features` |
-| **Miri UB checks** | `--lib` (default & `bridge-reflect`) | `92` default / `94` `bridge-reflect` unit tests | `MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bamabi_host_sys --lib` |
+| **Miri UB checks** | `--lib` (default & `bridge-reflect`) | `96` default (`cargo +nightly miri test -p bamabi_host_sys --lib`) | `MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bamabi_host_sys --lib` |
+| **Kani proofs** | [`src/registry/catalog.rs`](src/registry/catalog.rs) (`#[cfg(kani)]`) | `2` harnesses | `cargo kani -p bamabi_host_sys -Z unstable-options --harness-timeout 15m --output-format terse -j` |
 
-> **Total with `--all-features`:** `104` unit tests + `47` integration tests = `151` tests (`0` `#[ignore]`; `136` under default features). Under `cfg!(miri)`, tests in `iter.rs`, `hierarchy_ext.rs`, `symbols.rs`, and `shared_lib_tests.rs` automatically adjust thread pools, page limits, and `proptest` case counts so Miri executes cleanly without OS-thread or timeout failures.
+> **Total with `--all-features`:** `109` unit tests + `47` integration tests = `156` tests (`0` `#[ignore]`). Under `cfg!(miri)`, tests in `iter.rs`, `hierarchy_ext.rs`, `symbols.rs`, and `shared_lib_tests.rs` automatically adjust thread pools, page limits, and `proptest` case counts so Miri executes cleanly without OS-thread or timeout failures.
 
 ---
 
@@ -36,7 +37,7 @@ Every source module links its unit tests cleanly via `#[cfg(test)] #[path = "...
 | `src/ffi/commands.rs` | [`commands_tests.rs`](tests/unit/commands_tests.rs) | `3` | Command quota arena/spawn caps + rewind, FIFO `queue_custom`, stale drop-handle rejection on recycled slots. |
 | `src/ffi/commands_ext.rs` | [`commands_ext_tests.rs`](tests/unit/commands_ext_tests.rs) | `1` | Extended guards and execution for `spawn_persistent`, `spawn_batch`, `despawn_all`, `insert_if_new`. |
 | `src/ffi/hierarchy_ext.rs` | [`hierarchy_ext_tests.rs`](tests/unit/hierarchy_ext_tests.rs) | `11` | `CascadeHierarchyCache` strata reuse/invalidation, Brent cycle guards, `iter_up_cascade`, `sys_entity_children`, `FfiChildOf`, custom `RelationshipTarget`. |
-| `src/ffi/iter_ext.rs` | [`iter_ext_tests.rs`](tests/unit/iter_ext_tests.rs) | `2` | `iter_read_removed` guards/batching; `par_for_each_chunk_readonly` dense/sparse permissions & error propagation. |
+| `src/ffi/iter_ext.rs` | [`iter_ext_tests.rs`](tests/unit/iter_ext_tests.rs) | `3` | `iter_read_removed` guards, partial-batch conservation (`iter_read_removed_partial_batch_conservation`), and `par_for_each_chunk_readonly` dense/sparse permissions & error propagation. |
 | `src/ffi/observers_ext.rs` | [`observers_ext_tests.rs`](tests/unit/observers_ext_tests.rs) | `6` | `ADD`/`INSERT`/`DISCARD`/`REMOVE`/`DESPAWN`/`READY` observers, mutable & propagating observers, cycle guard, `FallbackErrorHandler` (`ErrorContext::Observer`). |
 | `src/ffi/register.rs` | [`register_tests.rs`](tests/unit/register_tests.rs) | `10` | 5 lifecycle hooks, `clone_fn`, `required_init_descs`, `SUMMARY_TICK` validation, recycled drop slots, opt-in self-referential relations. |
 | `src/ffi/relations.rs` | [`relations_tests.rs`](tests/unit/relations_tests.rs) | `7` | `EXCLUSIVE`/`SYMMETRIC`/`ACYCLIC`/`CASCADE_DELETE`/`CLEANUP_REMOVE`, `RelationFlushPolicy`, self-referential non-acyclic bindings, checkpoint/rollback. |
@@ -50,7 +51,7 @@ Every source module links its unit tests cleanly via `#[cfg(test)] #[path = "...
 | `src/loader/symbols.rs` | [`symbols_tests.rs`](tests/unit/symbols_tests.rs) | `4` | Sharded lock-free `BamSymbolTable` deduplication and `ModNamedObjects` reload persistence + `World` cleanup. |
 | `src/loader/transaction.rs` | [`transaction_tests.rs`](tests/unit/transaction_tests.rs) | `1` | `LoadTransaction::drop` reclaims fresh slots across `1,100` failed inits in one live `World`. |
 | `src/registry/bridge.rs` | [`bridge_coverage_tests.rs`](tests/unit/bridge_coverage_tests.rs) | `1` | `HostWireBridge`, `HostStringBridge`, resource/event/relationship shims and error paths. |
-| `src/registry/catalog.rs` | [`catalog_coverage_tests.rs`](tests/unit/catalog_coverage_tests.rs) | `2` | `TargetEntity`, `ComponentOptions`, snapshot eviction/restore, collision errors, message/event/hierarchy edges. |
+| `src/registry/catalog.rs` | [`catalog_coverage_tests.rs`](tests/unit/catalog_coverage_tests.rs) & inline `cursor_tests` (`#[cfg(kani)] kani_proofs`) | `2` + `4` (+ `2` Kani) | `TargetEntity`, `ComponentOptions`, snapshot eviction/restore, collision errors, message/event/hierarchy edges, plus POD/ZST/SIMD/`usize::MAX`/non-POD cursor conservation (`cursor_tests`) and Kani proofs (`kani_proof_drain_cursor_bounded_conservation`, `kani_proof_clamp_batch_max_count_no_isize_overflow`). |
 | `src/schedule.rs` | [`schedule_coverage_tests.rs`](tests/unit/schedule_coverage_tests.rs) | `3` | `ModScheduleMap`, `ModVisibleSets`, `ModScheduleSetRewirePass`, and leased-schedule skip guards. |
 | `src/system/access_builder.rs` | [`access_builder_tests.rs`](tests/unit/access_builder_tests.rs) | `3` | `FilteredAccessSet` conflict diagnostics and persistent message/removed cursors across reloads. |
 | `src/system/error_policy.rs` | [`error_policy_tests.rs`](tests/unit/error_policy_tests.rs) | `2` | `ModErrorPolicy`, `ModQuarantine`, `ActiveGuestFaultGuard`, `ModBudgetRuntime` delegation. |

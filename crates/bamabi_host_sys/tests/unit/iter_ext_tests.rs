@@ -596,3 +596,83 @@ fn iter_read_removed_guards_and_batch_read() {
         }
     }
 }
+
+#[test]
+fn iter_read_removed_partial_batch_conservation() {
+    use super::host_iter_read_removed;
+    use bamabi_sys::FfiEntity;
+    use bevy_ecs::entity::Entity;
+    use bevy_ecs::lifecycle::RemovedComponentEntity;
+    use bevy_ecs::message::MessageCursor;
+
+    let mut world = World::new();
+    let val_cid = world.register_component::<ParRoVal>();
+    let plan = QueryPlan::from_terms(vec![QueryTermMeta {
+        component: BamComponent::from_raw(1),
+        component_id: val_cid,
+        mode: AccessMode::REMOVED_READ,
+        uuid: ComponentUuid::from_canonical_name("iter_ext::removed_cons"),
+        size: core::mem::size_of::<ParRoVal>(),
+        align: 8,
+        storage_flags: 0,
+        msg_read_batch_fn: None,
+        msg_send_fn: None,
+        msg_write_batch_fn: None,
+    }]);
+
+    let total = 15usize;
+    let mut spawned = Vec::with_capacity(total);
+    for i in 0..total {
+        spawned.push(world.spawn(ParRoVal(i as i64)).id());
+    }
+    for &e in &spawned {
+        world.despawn(e);
+    }
+
+    for batch_size in [1usize, 2, 7, 15, usize::MAX] {
+        let mut cursors: Vec<Option<Box<dyn core::any::Any + Send + Sync>>> = vec![Some(Box::new(
+            MessageCursor::<RemovedComponentEntity>::default(),
+        ))];
+        let buf_len = if batch_size == usize::MAX {
+            total
+        } else {
+            batch_size
+        };
+        let mut out_entities = vec![FfiEntity::NULL; buf_len];
+        let mut collected = Vec::with_capacity(total);
+
+        let mut iter = HostIter::new_dense(
+            &world.storages().tables,
+            &[],
+            &plan,
+            Tick::new(0),
+            Tick::new(1),
+        )
+        .with_world(world.as_unsafe_world_cell_readonly())
+        .with_msg_cursors(&mut cursors);
+
+        loop {
+            let mut out_read = 0usize;
+            // SAFETY: Valid `HostIter`, `out_entities` has `buf_len` writable slots (and at least
+            // `total` slots when `batch_size == usize::MAX`).
+            let rc = unsafe {
+                host_iter_read_removed(
+                    iter.as_ffi_ptr(),
+                    0,
+                    out_entities.as_mut_ptr(),
+                    batch_size,
+                    &raw mut out_read,
+                )
+            };
+            assert_eq!(rc, FfiResult::OK);
+            assert!(out_read <= buf_len);
+            if out_read == 0 {
+                break;
+            }
+            for &ffi_e in &out_entities[..out_read] {
+                collected.push(Entity::try_from_bits(ffi_e.to_bits()).unwrap());
+            }
+        }
+        assert_eq!(collected, spawned);
+    }
+}

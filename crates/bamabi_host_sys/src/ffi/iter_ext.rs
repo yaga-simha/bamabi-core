@@ -12,6 +12,7 @@ use bevy_ecs::message::MessageCursor;
 use crate::{
     ffi::iter::par_for_each_chunk_impl,
     handle_header::{ffi_try, init_out_ptr, validate_iter_mut},
+    registry::catalog::{clamp_batch_max_count, drain_cursor_bounded},
 };
 
 /// Reads up to `max_count` removed-component [`FfiEntity`] values for `term_index` (`REMOVED_READ`).
@@ -66,19 +67,19 @@ pub unsafe extern "C" fn host_iter_read_removed(
         return FfiResult::OK;
     };
 
-    let mut written = 0usize;
-    for removed in cursor.read(messages).take(max_count) {
+    let effective_max = clamp_batch_max_count(max_count, core::mem::size_of::<FfiEntity>());
+    let written = drain_cursor_bounded(cursor.read(messages), effective_max, |idx, removed| {
         let entity: Entity = removed.clone().into();
         // SAFETY: `out_entities` is non-null, aligned, and caller guarantees `max_count` writable
-        // `FfiEntity` slots while `written < max_count`.
+        // `FfiEntity` slots; `idx < effective_max <= max_count` and
+        // `effective_max * size_of::<FfiEntity>() <= isize::MAX`.
         unsafe {
             core::ptr::write(
-                out_entities.add(written),
+                out_entities.add(idx),
                 FfiEntity::from_bits(entity.to_bits()),
             );
         }
-        written += 1;
-    }
+    });
     // SAFETY: `out_read` is non-null, aligned, and writable.
     unsafe {
         *out_read = written;

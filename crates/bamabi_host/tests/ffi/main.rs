@@ -20,6 +20,7 @@ mod batch_cmds_and_messages;
 mod boundary_validation;
 mod c_vtable_interop;
 mod chunk_and_commands;
+mod cursor_conservation;
 mod engine_bridge;
 mod events_hierarchy_and_parallel;
 mod query_filters;
