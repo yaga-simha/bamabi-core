@@ -1252,50 +1252,64 @@ impl HostCommandsStorage {
                         continue;
                     }
                     let nn = self.arena.ptr_mut(slice);
-                    if let Some(entity_trigger_fn) = meta.entity_event_trigger_fn {
-                        let resolved_target = if let Some(t) = target {
-                            Some(t)
-                        } else if meta.size == core::mem::size_of::<FfiEntity>() {
-                            // SAFETY: `nn` holds `meta.size == 8` initialized `FfiEntity` bytes in `self.arena`.
-                            let bits =
-                                unsafe { core::ptr::read_unaligned(nn.as_ptr().cast::<u64>()) };
-                            Entity::try_from_bits(bits)
-                        } else {
-                            None
-                        };
-                        if let Some(t) = resolved_target
-                            && t != Entity::PLACEHOLDER
-                            && world.entities().contains(t)
-                        {
-                            entity_trigger_fn(world, t);
-                        }
-                    } else if let Some(trigger_fn) = meta.trigger_event_fn {
-                        // SAFETY: `nn` holds `meta.size` bytes for `meta`'s registered event type.
-                        unsafe {
-                            let _ = trigger_fn(world, target, nn.as_ptr().cast_const());
-                        }
-                    } else if let Some(event_key) = meta.event_key {
-                        // SAFETY: `nn` is aligned to `meta.align` and valid for `meta.size` bytes
-                        // inside `self.arena` for the duration of this synchronous `trigger_dynamic*`.
-                        let event_mut = unsafe { PtrMut::new(nn) };
-                        if let Some(t) = target {
-                            let mut trigger = EntityTrigger;
-                            let trigger_mut = PtrMut::from(&mut trigger);
-                            // SAFETY: `event_key` was registered from `ComponentId` with `(meta.size, meta.align)`
-                            // and `trigger_mut` points to ZST `EntityTrigger`.
-                            unsafe {
-                                world.trigger_dynamic_targets(event_key, t, event_mut, trigger_mut);
+                    crate::ffi::observers_ext::with_dynamic_trigger_state(
+                        world,
+                        target,
+                        false,
+                        &[],
+                        |w| {
+                            if let Some(entity_trigger_fn) = meta.entity_event_trigger_fn {
+                                let resolved_target = if let Some(t) = target {
+                                    Some(t)
+                                } else if meta.size == core::mem::size_of::<FfiEntity>() {
+                                    // SAFETY: `nn` holds `meta.size == 8` initialized `FfiEntity` bytes in `self.arena`.
+                                    let bits = unsafe {
+                                        core::ptr::read_unaligned(nn.as_ptr().cast::<u64>())
+                                    };
+                                    Entity::try_from_bits(bits)
+                                } else {
+                                    None
+                                };
+                                if let Some(t) = resolved_target
+                                    && t != Entity::PLACEHOLDER
+                                    && w.entities().contains(t)
+                                {
+                                    entity_trigger_fn(w, t);
+                                }
+                            } else if let Some(trigger_fn) = meta.trigger_event_fn {
+                                // SAFETY: `nn` holds `meta.size` bytes for `meta`'s registered event type.
+                                unsafe {
+                                    let _ = trigger_fn(w, target, nn.as_ptr().cast_const());
+                                }
+                            } else if let Some(event_key) = meta.event_key {
+                                // SAFETY: `nn` is aligned to `meta.align` and valid for `meta.size` bytes
+                                // inside `self.arena` for the duration of this synchronous `trigger_dynamic*`.
+                                let event_mut = unsafe { PtrMut::new(nn) };
+                                if let Some(t) = target {
+                                    let mut trigger = EntityTrigger;
+                                    let trigger_mut = PtrMut::from(&mut trigger);
+                                    // SAFETY: `event_key` was registered from `ComponentId` with `(meta.size, meta.align)`
+                                    // and `trigger_mut` points to ZST `EntityTrigger`.
+                                    unsafe {
+                                        w.trigger_dynamic_targets(
+                                            event_key,
+                                            t,
+                                            event_mut,
+                                            trigger_mut,
+                                        );
+                                    }
+                                } else {
+                                    let mut trigger = GlobalTrigger;
+                                    let trigger_mut = PtrMut::from(&mut trigger);
+                                    // SAFETY: `event_key` was registered from `ComponentId` with `(meta.size, meta.align)`
+                                    // and `trigger_mut` points to ZST `GlobalTrigger`.
+                                    unsafe {
+                                        w.trigger_dynamic(event_key, event_mut, trigger_mut);
+                                    }
+                                }
                             }
-                        } else {
-                            let mut trigger = GlobalTrigger;
-                            let trigger_mut = PtrMut::from(&mut trigger);
-                            // SAFETY: `event_key` was registered from `ComponentId` with `(meta.size, meta.align)`
-                            // and `trigger_mut` points to ZST `GlobalTrigger`.
-                            unsafe {
-                                world.trigger_dynamic(event_key, event_mut, trigger_mut);
-                            }
-                        }
-                    }
+                        },
+                    );
                 }
                 RecordedCommand::SpawnScene {
                     entity,
@@ -1471,6 +1485,8 @@ impl HostCommandsStorage {
         }
 
         self.clear();
+        // Flush deferred commands queued synchronously by guest observers during `Trigger` dispatch.
+        world.flush();
     }
 }
 

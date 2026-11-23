@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "bamabi_guest"
 version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#7a32b7bd329167c8dda82259659b3da54a5ab748"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#23053a118f530112e729fa6252a9070cf9f169a9"
 dependencies = [
  "bamabi_guest_sys",
  "bamabi_sys",
@@ -14,7 +14,7 @@ dependencies = [
 [[package]]
 name = "bamabi_guest_sys"
 version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#7a32b7bd329167c8dda82259659b3da54a5ab748"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#23053a118f530112e729fa6252a9070cf9f169a9"
 dependencies = [
  "bamabi_sys",
 ]
@@ -22,7 +22,7 @@ dependencies = [
 [[package]]
 name = "bamabi_sys"
 version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#7a32b7bd329167c8dda82259659b3da54a5ab748"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#23053a118f530112e729fa6252a9070cf9f169a9"
 
 [[package]]
 name = "panic_abort_mod"

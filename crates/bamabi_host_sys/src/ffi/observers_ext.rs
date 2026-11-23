@@ -3,13 +3,14 @@
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, TryLockError};
 
 use bamabi_sys::{
-    BamCommands, BamEventKind, BamObserverDesc, BamTriggerDesc, FfiBool, FfiEntity, FfiResult,
-    read_descriptor,
+    BamCommands, BamEventKind, BamIter, BamObserverDesc, BamTriggerDesc, FfiBool, FfiEntity,
+    FfiResult, read_descriptor,
 };
 use bevy_ecs::{
+    change_detection::Tick,
     component::{Component, ComponentId},
     entity::Entity,
     event::{EntityComponentsTrigger, EntityTrigger, EventKey, GlobalTrigger},
@@ -37,9 +38,19 @@ use crate::{
     sync_ptr::GuestFnPtr,
     system::{
         ModErrorPolicy, ModErrorPolicyConfig, ModSystemError, ModSystemFaulted,
+        access_builder::initialize_query_groups_in_world,
         dispatch_mod_observer_fault_to_fallback_handler,
+        error_policy::{ActiveGuestFaultGuard, dispatch_mod_fault_to_fallback_handler},
+        guest_system::{HostSystemCtx, build_query_slot_iters},
+        query_group::{CachedQueryGroup, MAX_SYSTEM_QUERIES},
     },
 };
+
+struct ObserverCtxState {
+    query_groups: Vec<CachedQueryGroup>,
+    last_run: Tick,
+    last_error_buf: String,
+}
 
 /// ECS [`Component`] storing the shared [`GuestObserverBinding`] and per-observer enablement flag
 /// on each spawned guest observer entity.
@@ -47,6 +58,7 @@ use crate::{
 pub(crate) struct ModObserverState {
     pub(crate) binding: Arc<GuestObserverBinding>,
     pub(crate) enabled: Arc<AtomicBool>,
+    ctx_state: Option<Arc<Mutex<ObserverCtxState>>>,
 }
 
 impl ModObserverState {
@@ -54,17 +66,140 @@ impl ModObserverState {
         Self {
             binding: Arc::new(binding),
             enabled: Arc::new(AtomicBool::new(true)),
+            ctx_state: None,
+        }
+    }
+
+    pub(crate) fn new_in_world(world: &mut World, binding: GuestObserverBinding) -> Self {
+        if binding.ctx_callback.is_none() {
+            return Self::new(binding);
+        }
+
+        let mod_id = binding.mod_id;
+        let (mod_namespace, generation) = mod_id
+            .and_then(|id| {
+                world.get_resource::<ModHost>().and_then(|mh| {
+                    mh.get_mod(id).map(|m| {
+                        (
+                            Some(Arc::<str>::from(m.name.as_ref())),
+                            mh.mod_generation(&m.name),
+                        )
+                    })
+                })
+            })
+            .unwrap_or((None, 0));
+
+        let snap = world
+            .get_resource::<ModRegistry>()
+            .map(ModRegistry::snapshot_arc)
+            .unwrap_or_else(|| binding.registry.latest_snapshot_arc());
+
+        let mut query_groups: Vec<CachedQueryGroup> = binding
+            .query_specs
+            .iter()
+            .cloned()
+            .map(|spec| {
+                let mut group = CachedQueryGroup::new(spec);
+                if let Some(ns) = mod_namespace.as_ref() {
+                    group.set_system_identity(Some(Arc::clone(ns)), Arc::clone(&binding.name));
+                }
+                group
+            })
+            .collect();
+
+        match initialize_query_groups_in_world(world, &snap, &mut query_groups) {
+            Ok(_access) => {
+                let cell = world.as_unsafe_world_cell();
+                for group in &mut query_groups {
+                    group.update_archetypes(cell);
+                }
+                let change_tick = world.change_tick();
+                let last_run = Tick::new(change_tick.get().wrapping_sub(Tick::MAX.get()));
+                Self {
+                    binding: Arc::new(binding),
+                    enabled: Arc::new(AtomicBool::new(true)),
+                    ctx_state: Some(Arc::new(Mutex::new(ObserverCtxState {
+                        query_groups,
+                        last_run,
+                        last_error_buf: String::new(),
+                    }))),
+                }
+            }
+            Err(err) => {
+                let obs_name = binding.name.to_string();
+                let status = err.status_code();
+                let err_detail = err.to_string();
+                let mod_ns_owned = mod_namespace.as_deref().map(str::to_owned);
+                let ns_label = mod_ns_owned.as_deref().unwrap_or("unscoped");
+                let last_run = world.change_tick();
+
+                tracing::error!(
+                    observer = %obs_name,
+                    mod_id = ?mod_id,
+                    namespace = %ns_label,
+                    generation,
+                    error = %err,
+                    "guest mod ctx observer failed query initialization and was quarantined"
+                );
+
+                if let Some(id) = mod_id {
+                    ModHost::record_fault_in_world(world, id);
+                }
+
+                let fault_msg = ModSystemFaulted {
+                    mod_id,
+                    mod_namespace: mod_ns_owned.clone(),
+                    generation,
+                    system_name: obs_name.clone(),
+                    status,
+                    panicked: false,
+                    last_error: Some(err_detail.clone()),
+                    init_error: Some(err),
+                };
+                if let Some(mut msgs) = world.get_resource_mut::<Messages<ModSystemFaulted>>() {
+                    msgs.write(fault_msg);
+                }
+
+                let policy = world
+                    .get_resource::<ModErrorPolicyConfig>()
+                    .map_or(ModErrorPolicy::default(), |c| c.0);
+                if matches!(
+                    policy,
+                    ModErrorPolicy::ReportToBevy | ModErrorPolicy::DelegateToBevyFallback
+                ) {
+                    dispatch_mod_fault_to_fallback_handler(
+                        world,
+                        ModSystemError {
+                            mod_id,
+                            mod_namespace: mod_ns_owned,
+                            generation,
+                            system_name: obs_name,
+                            status,
+                            panicked: false,
+                            last_error: Some(err_detail),
+                        },
+                        last_run,
+                    );
+                }
+
+                Self {
+                    binding: Arc::new(binding),
+                    enabled: Arc::new(AtomicBool::new(false)),
+                    ctx_state: None,
+                }
+            }
         }
     }
 }
 
-/// Per-`World` transient state for an active [`host_cmd_trigger_ex`] dispatch, conveying the
-/// current target entity (for dynamic observers without `extract_target_fn`) and mutable
-/// propagation flag across `guest_observer_runner`.
-#[derive(Resource, Clone, Copy, Debug)]
+/// Per-`World` transient state for an active trigger dispatch (`cmd_trigger`, `cmd_trigger_ex`, or
+/// lifecycle trigger), conveying the current target entity, mutable propagation flag, and explicit
+/// watched component IDs across `guest_observer_runner`.
+#[derive(Resource, Clone, Debug)]
 struct DynamicTriggerState {
     current_target: Option<Entity>,
     propagate: bool,
+    watched_ids: Vec<ComponentId>,
 }
 
 struct DynamicTriggerGuard<'w> {
@@ -92,7 +227,7 @@ impl<'w> DynamicTriggerGuard<'w> {
 
 impl Drop for DynamicTriggerGuard<'_> {
     fn drop(&mut self) {
-        if let Some(prev) = self.previous {
+        if let Some(prev) = self.previous.take() {
             self.world.insert_resource(prev);
         } else {
             self.world.remove_resource::<DynamicTriggerState>();
@@ -100,9 +235,45 @@ impl Drop for DynamicTriggerGuard<'_> {
     }
 }
 
+/// Executes `f` with a scoped [`DynamicTriggerState`] installed on `world`, restoring any prior
+/// nested trigger state when `f` returns.
+pub(crate) fn with_dynamic_trigger_state<R>(
+    world: &mut World,
+    current_target: Option<Entity>,
+    propagate: bool,
+    watched_ids: &[ComponentId],
+    f: impl FnOnce(&mut World) -> R,
+) -> R {
+    let mut guard = DynamicTriggerGuard::enter(
+        world,
+        DynamicTriggerState {
+            current_target,
+            propagate,
+            watched_ids: watched_ids.to_vec(),
+        },
+    );
+    f(guard.world_mut())
+}
+
+/// Selects the read-only payload pointer passed to `BamObserverFn` or `BamObserverCtxFn`.
+#[inline]
+fn observer_read_data_ptr(
+    binding: &GuestObserverBinding,
+    wire_entity: &FfiEntity,
+    event_read_ptr: *const c_void,
+) -> *const c_void {
+    if binding.synthesizes_ffi_entity_payload || binding.event_kind.is_component_lifecycle() {
+        core::ptr::from_ref(wire_entity).cast::<c_void>()
+    } else if binding.event_size == 0 {
+        core::ptr::null()
+    } else {
+        event_read_ptr
+    }
+}
+
 /// Dynamic [`ObserverRunner`](bevy_ecs::observer::ObserverRunner) dispatching Bevy `Event`,
-/// `EntityEvent`, `Ready`, or lifecycle events into a registered guest [`BamObserverFn`] or
-/// [`BamObserverMutFn`].
+/// `EntityEvent`, `Ready`, or lifecycle events into a registered guest [`BamObserverFn`],
+/// [`BamObserverMutFn`], or [`BamObserverCtxFn`].
 ///
 /// # Safety
 /// - `world` must be the [`DeferredWorld`] owning `observer`.
@@ -114,15 +285,31 @@ pub(crate) unsafe fn guest_observer_runner(
     event_ptr: PtrMut,
     _trigger_ptr: PtrMut,
 ) {
-    let Some((binding, enabled)) = world
-        .get::<ModObserverState>(observer)
-        .map(|state| (Arc::clone(&state.binding), Arc::clone(&state.enabled)))
+    let Some((binding, enabled, ctx_state)) =
+        world.get::<ModObserverState>(observer).map(|state| {
+            (
+                Arc::clone(&state.binding),
+                Arc::clone(&state.enabled),
+                state.ctx_state.clone(),
+            )
+        })
     else {
         return;
     };
     if !binding.is_active.load(Ordering::Acquire) || !enabled.load(Ordering::Acquire) {
         return;
     }
+
+    let trigger_info = world.get_resource::<DynamicTriggerState>().map(|s| {
+        let watched = if !binding.event_kind.is_component_lifecycle()
+            && !binding.watched_components.is_empty()
+        {
+            s.watched_ids.clone()
+        } else {
+            Vec::new()
+        };
+        (s.current_target, s.propagate, watched)
+    });
 
     let target_ffi = if binding.event_kind.is_component_lifecycle() {
         let entity = match binding.event_kind {
@@ -153,10 +340,7 @@ pub(crate) unsafe fn guest_observer_runner(
             Some(entity) => FfiEntity::from_bits(entity.to_bits()),
             None => FfiEntity::NULL,
         }
-    } else if let Some(active_target) = world
-        .get_resource::<DynamicTriggerState>()
-        .and_then(|s| s.current_target)
-    {
+    } else if let Some(active_target) = trigger_info.as_ref().and_then(|(t, _, _)| *t) {
         FfiEntity::from_bits(active_target.to_bits())
     } else if let Some(watched) = binding.target_entity {
         FfiEntity::from_bits(watched.to_bits())
@@ -164,15 +348,42 @@ pub(crate) unsafe fn guest_observer_runner(
         FfiEntity::NULL
     };
 
-    let initial_propagate = world
-        .get_resource::<DynamicTriggerState>()
-        .map_or(binding.is_propagating, |s| s.propagate);
+    if !binding.event_kind.is_component_lifecycle() && !binding.watched_components.is_empty() {
+        let active_watched = trigger_info
+            .as_ref()
+            .map_or(&[][..], |(_, _, watched)| watched.as_slice());
+        let matched = if !active_watched.is_empty() {
+            binding
+                .watched_components
+                .iter()
+                .any(|cid| active_watched.contains(cid))
+        } else if let Some(target_ent) = Entity::try_from_bits(target_ffi.0)
+            .filter(|&ent| target_ffi != FfiEntity::NULL && ent != Entity::PLACEHOLDER)
+        {
+            world.get_entity(target_ent).is_ok_and(|ent_ref| {
+                binding
+                    .watched_components
+                    .iter()
+                    .all(|cid| ent_ref.contains_id(*cid))
+            })
+        } else {
+            false
+        };
+        if !matched {
+            return;
+        }
+    }
+
+    let initial_propagate = trigger_info
+        .as_ref()
+        .map_or(binding.is_propagating, |(_, p, _)| *p);
     let mut propagate_ffi = FfiBool::from_bool(initial_propagate);
 
     let mut storage = HostCommandsStorage::new();
     let snap = binding.registry.latest_snapshot_arc();
     let mut status = FfiResult::OK;
     let mut wire_entity = target_ffi;
+    let mut last_error: Option<String> = None;
 
     if let Some(GuestFnPtr(mut_cb)) = binding.mut_callback {
         let cell = world.as_unsafe_world_cell();
@@ -207,6 +418,8 @@ pub(crate) unsafe fn guest_observer_runner(
         trigger_state.propagate = propagate_ffi.get();
     }
 
+    let event_read_ptr = event_ptr.as_ptr().cast::<c_void>();
+
     if status == FfiResult::OK
         && let Some(GuestFnPtr(callback)) = binding.callback
     {
@@ -215,15 +428,7 @@ pub(crate) unsafe fn guest_observer_runner(
         let mut host_cmds = HostCommands::new(&mut storage, allocator, &snap)
             .with_mod_context(binding.mod_id, Some(Arc::clone(&binding.is_active)))
             .with_registry(&binding.registry);
-        let data_ptr = if binding.synthesizes_ffi_entity_payload
-            || binding.event_kind.is_component_lifecycle()
-        {
-            (&raw const wire_entity).cast::<c_void>()
-        } else if binding.event_size == 0 {
-            core::ptr::null()
-        } else {
-            event_ptr.as_ptr().cast::<c_void>()
-        };
+        let data_ptr = observer_read_data_ptr(&binding, &wire_entity, event_read_ptr);
         // SAFETY: `binding.is_active` is verified true and `host_cmds` is poisoned before exit.
         status = unsafe {
             callback(
@@ -233,6 +438,127 @@ pub(crate) unsafe fn guest_observer_runner(
                 binding.user_data.as_ptr(),
             )
         };
+    }
+
+    if status == FfiResult::OK
+        && let Some(GuestFnPtr(ctx_cb)) = binding.ctx_callback
+    {
+        let (mod_ns_arc, generation) = binding
+            .mod_id
+            .and_then(|id| {
+                world.get_resource::<ModHost>().and_then(|mh| {
+                    mh.get_mod(id).map(|m| {
+                        (
+                            Some(Arc::<str>::from(m.name.as_ref())),
+                            mh.mod_generation(&m.name),
+                        )
+                    })
+                })
+            })
+            .unwrap_or((None, 0));
+
+        if let Some(state_arc) = ctx_state.as_ref() {
+            match state_arc.try_lock() {
+                Ok(mut guard) => {
+                    let state = &mut *guard;
+                    let err_buf = core::mem::take(&mut state.last_error_buf);
+                    let last_run = state.last_run;
+
+                    let cell = world.as_unsafe_world_cell();
+                    let allocator = cell.entity_allocator();
+                    let change_tick = cell.increment_change_tick();
+                    for group in &mut state.query_groups {
+                        group.update_archetypes(cell);
+                    }
+
+                    // SAFETY: `cell` grants observer access and `query_groups` was validated at init.
+                    let (count, mut host_iters, query_views) = unsafe {
+                        build_query_slot_iters(cell, &mut state.query_groups, last_run, change_tick)
+                    };
+                    let mut iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES] =
+                        [core::ptr::null_mut(); MAX_SYSTEM_QUERIES];
+                    for i in 0..count {
+                        if let Some(ref mut it) = host_iters[i] {
+                            iter_ptrs[i] = it.as_ffi_ptr();
+                        }
+                    }
+
+                    let data_ptr = observer_read_data_ptr(&binding, &wire_entity, event_read_ptr);
+                    let (cb_status, reported_fault, reclaimed_err) = {
+                        let mut host_cmds = HostCommands::new(&mut storage, allocator, &snap)
+                            .with_mod_context(binding.mod_id, Some(Arc::clone(&binding.is_active)))
+                            .with_registry(&binding.registry);
+                        let cmds_ptr = host_cmds.as_ffi_ptr();
+                        let mut sys_ctx = HostSystemCtx::new(
+                            Arc::clone(&snap),
+                            mod_ns_arc.clone(),
+                            err_buf,
+                            iter_ptrs,
+                            count,
+                            cmds_ptr,
+                        )
+                        .with_world_and_queries(
+                            cell,
+                            query_views,
+                            last_run,
+                            change_tick,
+                        );
+                        let host_ctx_ptr = sys_ctx.host_ctx_ffi_ptr();
+                        let sys_ctx_ptr = sys_ctx.as_ffi_ptr();
+                        let fault_guard = ActiveGuestFaultGuard::enter(
+                            host_ctx_ptr,
+                            binding.mod_id,
+                            mod_ns_arc,
+                            generation,
+                            Arc::clone(&binding.name),
+                        );
+                        // SAFETY: `binding.is_active` is true, `data_ptr` satisfies event layout,
+                        // and `sys_ctx` / `host_cmds` / `host_iters` headers are poisoned before exit.
+                        let res = unsafe {
+                            ctx_cb(
+                                target_ffi,
+                                data_ptr,
+                                sys_ctx_ptr,
+                                binding.user_data.as_ptr(),
+                            )
+                        };
+                        let reported = fault_guard.finish();
+                        let reclaimed = sys_ctx.reclaim_error_buffer();
+                        (res, reported, reclaimed)
+                    };
+                    drop(host_iters);
+                    state.last_error_buf = reclaimed_err;
+
+                    if cb_status == FfiResult::PANIC_CAUGHT || cb_status.is_err() {
+                        status = cb_status;
+                    } else if reported_fault.is_some() {
+                        status = FfiResult::INTERNAL_ERROR;
+                    } else {
+                        state.last_run = change_tick;
+                    }
+
+                    if status != FfiResult::OK {
+                        last_error = reported_fault.filter(|s| !s.is_empty()).or_else(|| {
+                            (!state.last_error_buf.is_empty()).then(|| state.last_error_buf.clone())
+                        });
+                    }
+                }
+                Err(TryLockError::WouldBlock) => {
+                    status = FfiResult::ACCESS_CONFLICT;
+                    last_error =
+                        Some("re-entrant ctx_callback observer invocation rejected".to_string());
+                }
+                Err(TryLockError::Poisoned(poisoned)) => {
+                    let _guard = poisoned.into_inner();
+                    status = FfiResult::INTERNAL_ERROR;
+                    last_error =
+                        Some("ctx_callback observer query state mutex was poisoned".to_string());
+                }
+            }
+        } else {
+            status = FfiResult::INVALID_STATE;
+            last_error = Some("ctx_callback observer missing initialized query state".to_string());
+        }
     }
 
     if status == FfiResult::OK {
@@ -272,6 +598,7 @@ pub(crate) unsafe fn guest_observer_runner(
         generation,
         %status,
         panicked,
+        last_error = ?last_error,
         "guest mod observer faulted; discarding uncommitted commands and routing to FallbackErrorHandler"
     );
 
@@ -282,7 +609,7 @@ pub(crate) unsafe fn guest_observer_runner(
         system_name: obs_name.clone(),
         status,
         panicked,
-        last_error: None,
+        last_error: last_error.clone(),
         init_error: None,
     };
     if let Some(id) = mod_id {
@@ -308,7 +635,7 @@ pub(crate) unsafe fn guest_observer_runner(
             system_name: obs_name,
             status,
             panicked,
-            last_error: None,
+            last_error,
         },
         last_run,
     );
@@ -322,7 +649,7 @@ fn build_observer_component(binding: &GuestObserverBinding) -> Observer {
     if let Some(target) = binding.target_entity {
         obs.watch_entity(target);
     }
-    if !binding.watched_components.is_empty() {
+    if binding.event_kind.is_component_lifecycle() && !binding.watched_components.is_empty() {
         obs = obs.with_components(binding.watched_components.iter().copied());
     }
     obs
@@ -344,7 +671,8 @@ pub(crate) fn spawn_registered_observers_in_world(
         obs_binding.registry = registry.clone();
         obs_binding.mod_id = Some(mod_id);
         let obs = build_observer_component(&obs_binding);
-        let obs_entity = world.spawn((obs, ModObserverState::new(obs_binding))).id();
+        let obs_state = ModObserverState::new_in_world(world, obs_binding);
+        let obs_entity = world.spawn((obs, obs_state)).id();
         observer_entities.push(obs_entity);
     }
     world.flush();
@@ -389,6 +717,7 @@ impl CustomTriggerDispatch<'_> {
             DynamicTriggerState {
                 current_target: target,
                 propagate,
+                watched_ids: self.watched_ids.to_vec(),
             },
         );
         let w = guard.world_mut();
@@ -483,6 +812,7 @@ fn dispatch_lifecycle_at_target(
         DynamicTriggerState {
             current_target: Some(target),
             propagate,
+            watched_ids: watched_ids.to_vec(),
         },
     );
     let w = guard.world_mut();
@@ -879,8 +1209,9 @@ pub unsafe extern "C" fn host_cmd_observe(
             return;
         }
         let obs = build_observer_component(&binding);
+        let obs_state = ModObserverState::new_in_world(world, binding);
         if let Ok(mut e) = world.spawn_empty_at(obs_entity) {
-            e.insert((obs, ModObserverState::new(binding)));
+            e.insert((obs, obs_state));
         } else {
             return;
         }

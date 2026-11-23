@@ -99,6 +99,68 @@ pub(crate) struct RandomQueryView<'w> {
     pub(crate) has_query_state: bool,
 }
 
+/// Builds stack-local [`HostIter`] and [`RandomQueryView`] slots over `query_groups` for a single
+/// guest system or context-aware observer invocation.
+///
+/// # Safety
+/// Caller must hold scheduler or exclusive world access covering every component, resource, and
+/// message term referenced in `query_groups` for the duration of `'w`.
+pub(crate) unsafe fn build_query_slot_iters<'q, 'w: 'q>(
+    world: UnsafeWorldCell<'w>,
+    query_groups: &'q mut [CachedQueryGroup],
+    last_run: Tick,
+    this_run: Tick,
+) -> (
+    usize,
+    [Option<HostIter<'q>>; MAX_SYSTEM_QUERIES],
+    [Option<RandomQueryView<'q>>; MAX_SYSTEM_QUERIES],
+) {
+    // SAFETY: Caller guarantees declared query access on `world` for `'w`.
+    let storages = unsafe { world.storages() };
+    let archetypes = world.archetypes();
+
+    let count = query_groups.len().min(MAX_SYSTEM_QUERIES);
+    let mut host_iters: [Option<HostIter<'q>>; MAX_SYSTEM_QUERIES] =
+        [const { None }; MAX_SYSTEM_QUERIES];
+    let mut query_views: [Option<RandomQueryView<'q>>; MAX_SYSTEM_QUERIES] =
+        [None; MAX_SYSTEM_QUERIES];
+
+    for (i, group) in query_groups.iter_mut().take(count).enumerate() {
+        query_views[i] = Some(RandomQueryView {
+            plan: &group.plan,
+            is_dense: group.is_dense,
+            matched_tables: &group.matched_tables,
+            matched_archetypes: &group.matched_archetypes,
+            has_query_state: group.query_state.is_some(),
+        });
+        let iter = if group.is_dense {
+            HostIter::new_dense(
+                &storages.tables,
+                &group.matched_tables,
+                &group.plan,
+                last_run,
+                this_run,
+            )
+        } else {
+            HostIter::new_archetypal(
+                &storages.tables,
+                archetypes,
+                &storages.sparse_sets,
+                &group.matched_archetypes,
+                &group.plan,
+                &mut group.sparse_scratch,
+                last_run,
+                this_run,
+            )
+        }
+        .with_world(world)
+        .with_msg_cursors(&mut group.msg_cursors);
+        host_iters[i] = Some(iter);
+    }
+
+    (count, host_iters, query_views)
+}
+
 /// Concrete `#[repr(C)]` system invocation context backing opaque [`BamSystemCtx`].
 #[repr(C)]
 pub struct HostSystemCtx<'w> {
@@ -1531,44 +1593,9 @@ impl System for GuestSystem {
             )
         };
 
-        let count = self.query_groups.len().min(MAX_SYSTEM_QUERIES);
-        let mut host_iters: [Option<HostIter<'_>>; MAX_SYSTEM_QUERIES] =
-            [const { None }; MAX_SYSTEM_QUERIES];
-        let mut query_views: [Option<RandomQueryView<'_>>; MAX_SYSTEM_QUERIES] =
-            [None; MAX_SYSTEM_QUERIES];
-
-        for (i, group) in self.query_groups.iter_mut().take(count).enumerate() {
-            query_views[i] = Some(RandomQueryView {
-                plan: &group.plan,
-                is_dense: group.is_dense,
-                matched_tables: &group.matched_tables,
-                matched_archetypes: &group.matched_archetypes,
-                has_query_state: group.query_state.is_some(),
-            });
-            let iter = if group.is_dense {
-                HostIter::new_dense(
-                    &storages.tables,
-                    &group.matched_tables,
-                    &group.plan,
-                    last_run,
-                    change_tick,
-                )
-            } else {
-                HostIter::new_archetypal(
-                    &storages.tables,
-                    archetypes,
-                    &storages.sparse_sets,
-                    &group.matched_archetypes,
-                    &group.plan,
-                    &mut group.sparse_scratch,
-                    last_run,
-                    change_tick,
-                )
-            }
-            .with_world(world)
-            .with_msg_cursors(&mut group.msg_cursors);
-            host_iters[i] = Some(iter);
-        }
+        // SAFETY: Scheduler verified access via `FilteredAccessSet`; no intra-system conflict exists.
+        let (count, mut host_iters, query_views) =
+            unsafe { build_query_slot_iters(world, &mut self.query_groups, last_run, change_tick) };
 
         let mut iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES] =
             [core::ptr::null_mut(); MAX_SYSTEM_QUERIES];

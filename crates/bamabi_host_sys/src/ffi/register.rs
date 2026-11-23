@@ -23,10 +23,10 @@ use crate::system::{BamQuerySpecOwned, GuestSystem};
 use bamabi_sys::{
     BAM_QUERY_FLAG_PARAM_SET, BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN,
     BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BAM_REQUIRED_KNOWN_FLAGS, BamComponent, BamEventKind,
-    BamHostCtx, BamLoadCtx, BamObserverDesc, BamObserverFn, BamObserverMutFn, BamQueryDesc,
-    BamRequiredComponent, BamRequiredInitFn, BamSystem, BamSystemDesc, BamTermDesc,
+    BamHostCtx, BamLoadCtx, BamObserverCtxFn, BamObserverDesc, BamObserverFn, BamObserverMutFn,
+    BamQueryDesc, BamRequiredComponent, BamRequiredInitFn, BamSystem, BamSystemDesc, BamTermDesc,
     ComponentCloneFn, ComponentDesc, ComponentHookFn, ComponentUuid, FfiEntity, FfiResult,
-    read_descriptor,
+    MAX_QUERIES_PER_SYSTEM, read_descriptor,
 };
 use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, ComponentId, StorageType};
 use bevy_ecs::entity::{ComponentCloneCtx, Entity, SourceComponent};
@@ -70,6 +70,10 @@ pub struct GuestObserverBinding {
     pub callback: Option<GuestFnPtr<BamObserverFn>>,
     /// Optional mutable foreign C-ABI callback (`BamObserverMutFn`).
     pub mut_callback: Option<GuestFnPtr<BamObserverMutFn>>,
+    /// Optional [`BamSystemCtx`](bamabi_sys::BamSystemCtx)-aware foreign C-ABI callback (`BamObserverCtxFn`).
+    pub ctx_callback: Option<GuestFnPtr<BamObserverCtxFn>>,
+    /// Validated query/resource clauses backing `ctx_callback`.
+    pub query_specs: Vec<BamQuerySpecOwned>,
     /// Whether propagation control is enabled (`BAM_OBSERVER_FLAG_PROPAGATE`).
     pub is_propagating: bool,
     /// Optional relationship component ID for propagation (`None` defaults to `ChildOf`).
@@ -1865,6 +1869,100 @@ unsafe fn parse_ordering_targets(
     Ok(out)
 }
 
+/// Parses and validates an array of `query_count` extensible [`BamQueryDesc`] records against
+/// `snapshot`, returning owned [`BamQuerySpecOwned`] clauses.
+///
+/// # Safety
+/// If `query_count > 0` and `queries` is non-null, `queries` must point to `query_count`
+/// contiguous readable [`BamQueryDesc`] elements (each sized `first_size >= MIN_V0_2_SIZE`).
+unsafe fn parse_and_validate_query_descs(
+    queries: *const BamQueryDesc,
+    query_count: usize,
+    snapshot: &RegistrySnapshot,
+) -> Result<Vec<BamQuerySpecOwned>, (FfiResult, String)> {
+    if query_count == 0 {
+        return Ok(Vec::new());
+    }
+    if query_count > MAX_QUERIES_PER_SYSTEM {
+        return Err((
+            FfiResult::CAPACITY_EXCEEDED,
+            format!(
+                "query_count ({query_count}) exceeds MAX_QUERIES_PER_SYSTEM ({MAX_QUERIES_PER_SYSTEM})"
+            ),
+        ));
+    }
+    if queries.is_null() {
+        return Err((
+            FfiResult::NULL_POINTER,
+            "`queries` pointer is null with non-zero `query_count`".to_string(),
+        ));
+    }
+
+    let mut query_specs = Vec::with_capacity(query_count);
+    let base_ptr = queries.cast::<u8>();
+    // Determine element stride from the first `BamQueryDesc::struct_size` so forward-extended
+    // query arrays step accurately.
+    // SAFETY: Verified `!queries.is_null()` and `query_count > 0` above.
+    let first_size = unsafe { core::ptr::read_unaligned(base_ptr.cast::<u32>()) } as usize;
+    if first_size < BamQueryDesc::MIN_V0_2_SIZE {
+        return Err((
+            FfiResult::INVALID_VERSION,
+            format!("BamQueryDesc[0] struct_size ({first_size}) < MIN_V0_2_SIZE"),
+        ));
+    }
+
+    for q_idx in 0..query_count {
+        let Some(byte_offset) = q_idx.checked_mul(first_size) else {
+            return Err((
+                FfiResult::INVALID_ARGUMENT,
+                format!("BamQueryDesc[{q_idx}] byte offset overflow"),
+            ));
+        };
+        // SAFETY: Caller guarantees `queries` holds `query_count` contiguous elements.
+        let q_ptr = unsafe { base_ptr.add(byte_offset).cast::<c_void>() };
+        // SAFETY: Reading extensible `BamQueryDesc` element `q_idx`.
+        let q_desc = unsafe { read_descriptor::<BamQueryDesc>(q_ptr) }
+            .map_err(|err| (err, format!("invalid BamQueryDesc[{q_idx}] ({err})")))?;
+        let q_val = q_desc.validate();
+        if q_val.is_err() {
+            return Err((
+                q_val,
+                format!("BamQueryDesc[{q_idx}] validation failed ({q_val})"),
+            ));
+        }
+
+        if (q_desc.flags & BAM_QUERY_FLAG_PARAM_SET) != 0 && q_desc.param_set_group == 0 {
+            return Err((
+                FfiResult::INVALID_ARGUMENT,
+                format!(
+                    "BamQueryDesc[{q_idx}] sets BAM_QUERY_FLAG_PARAM_SET with param_set_group == 0"
+                ),
+            ));
+        }
+        let param_set_group =
+            if (q_desc.flags & BAM_QUERY_FLAG_PARAM_SET) != 0 || q_desc.param_set_group != 0 {
+                q_desc.param_set_group
+            } else {
+                0
+            };
+
+        let mut terms = Vec::with_capacity(q_desc.term_count);
+        for t_idx in 0..q_desc.term_count {
+            // SAFETY: `q_desc.validate()` verified `!q_desc.terms.is_null()` when `term_count > 0`.
+            let term: BamTermDesc = unsafe { core::ptr::read_unaligned(q_desc.terms.add(t_idx)) };
+            terms.push(term);
+        }
+        query_specs.push(BamQuerySpecOwned {
+            flags: q_desc.flags,
+            param_set_group,
+            terms,
+        });
+    }
+
+    validate_system_queries_against_snapshot(snapshot, &query_specs)?;
+    Ok(query_specs)
+}
+
 /// Registers a unified [`BamSystemDesc`] inside `load_ctx`, returning its 1-based [`BamSystem`] handle.
 ///
 /// # Safety
@@ -1913,76 +2011,16 @@ pub(crate) unsafe fn register_system_inner(
     }
 
     // Parse `queries[0..desc.query_count]`.
-    let mut query_specs = Vec::with_capacity(desc.query_count);
-    if desc.query_count > 0 {
-        let base_ptr = desc.queries.cast::<u8>();
-        // Determine element stride from the first `BamQueryDesc::struct_size` so forward-extended
-        // query arrays step accurately.
-        // SAFETY: `desc.validate()` verified `!desc.queries.is_null()` when `query_count > 0`.
-        let first_size = unsafe { core::ptr::read_unaligned(base_ptr.cast::<u32>()) } as usize;
-        if first_size < BamQueryDesc::MIN_V0_2_SIZE {
-            ctx.host_ctx.set_last_error(format!(
-                "BamQueryDesc[0] struct_size ({first_size}) < MIN_V0_2_SIZE"
-            ));
-            return Err(FfiResult::INVALID_VERSION);
+    // SAFETY: `desc.validate()` verified `!desc.queries.is_null()` when `desc.query_count > 0`.
+    let query_specs = match unsafe {
+        parse_and_validate_query_descs(desc.queries, desc.query_count, ctx.registry.snapshot())
+    } {
+        Ok(specs) => specs,
+        Err((status, msg)) => {
+            ctx.host_ctx.set_last_error(msg);
+            return Err(status);
         }
-
-        for q_idx in 0..desc.query_count {
-            let Some(byte_offset) = q_idx.checked_mul(first_size) else {
-                return Err(FfiResult::INVALID_ARGUMENT);
-            };
-            // SAFETY: Caller guarantees `desc.queries` holds `desc.query_count` contiguous elements.
-            let q_ptr = unsafe { base_ptr.add(byte_offset).cast::<c_void>() };
-            // SAFETY: Reading extensible `BamQueryDesc` element `q_idx`.
-            let q_desc = match unsafe { read_descriptor::<BamQueryDesc>(q_ptr) } {
-                Ok(q) => q,
-                Err(err) => {
-                    ctx.host_ctx
-                        .set_last_error(format!("invalid BamQueryDesc[{q_idx}] ({err})"));
-                    return Err(err);
-                }
-            };
-            let q_val = q_desc.validate();
-            if q_val.is_err() {
-                ctx.host_ctx
-                    .set_last_error(format!("BamQueryDesc[{q_idx}] validation failed ({q_val})"));
-                return Err(q_val);
-            }
-
-            if (q_desc.flags & BAM_QUERY_FLAG_PARAM_SET) != 0 && q_desc.param_set_group == 0 {
-                ctx.host_ctx.set_last_error(format!(
-                    "BamQueryDesc[{q_idx}] sets BAM_QUERY_FLAG_PARAM_SET with param_set_group == 0"
-                ));
-                return Err(FfiResult::INVALID_ARGUMENT);
-            }
-            let param_set_group =
-                if (q_desc.flags & BAM_QUERY_FLAG_PARAM_SET) != 0 || q_desc.param_set_group != 0 {
-                    q_desc.param_set_group
-                } else {
-                    0
-                };
-
-            let mut terms = Vec::with_capacity(q_desc.term_count);
-            for t_idx in 0..q_desc.term_count {
-                // SAFETY: `q_desc.validate()` verified `!q_desc.terms.is_null()` when `term_count > 0`.
-                let term: BamTermDesc =
-                    unsafe { core::ptr::read_unaligned(q_desc.terms.add(t_idx)) };
-                terms.push(term);
-            }
-            query_specs.push(BamQuerySpecOwned {
-                flags: q_desc.flags,
-                param_set_group,
-                terms,
-            });
-        }
-    }
-
-    if let Err((status, msg)) =
-        validate_system_queries_against_snapshot(ctx.registry.snapshot(), &query_specs)
-    {
-        ctx.host_ctx.set_last_error(msg);
-        return Err(status);
-    }
+    };
 
     if desc.run_if_ctx.is_none() && !desc.run_if_query.is_null() {
         ctx.host_ctx
@@ -2181,12 +2219,36 @@ pub(crate) unsafe fn build_observer_binding_from_desc(
         Arc::from(s)
     };
 
-    if desc.callback.is_none() && desc.mut_callback.is_none() {
+    if desc.callback.is_none() && desc.mut_callback.is_none() && desc.ctx_callback.is_none() {
         return Err((
             FfiResult::NULL_POINTER,
-            "BamObserverDesc requires `callback` or `mut_callback`".to_string(),
+            "BamObserverDesc requires `callback`, `mut_callback`, or `ctx_callback`".to_string(),
         ));
     }
+    if desc.query_count > MAX_QUERIES_PER_SYSTEM {
+        return Err((
+            FfiResult::CAPACITY_EXCEEDED,
+            format!(
+                "BamObserverDesc `query_count` ({}) exceeds MAX_QUERIES_PER_SYSTEM ({MAX_QUERIES_PER_SYSTEM})",
+                desc.query_count
+            ),
+        ));
+    }
+    if desc.query_count > 0 && desc.queries.is_null() {
+        return Err((
+            FfiResult::NULL_POINTER,
+            "BamObserverDesc `queries` is null with non-zero `query_count`".to_string(),
+        ));
+    }
+    if desc.query_count > 0 && desc.ctx_callback.is_none() {
+        return Err((
+            FfiResult::INVALID_ARGUMENT,
+            "BamObserverDesc `queries` requires non-null `ctx_callback`".to_string(),
+        ));
+    }
+    // SAFETY: Verified non-null `desc.queries` when `desc.query_count > 0`.
+    let query_specs =
+        unsafe { parse_and_validate_query_descs(desc.queries, desc.query_count, snapshot) }?;
 
     let target_entity = decode_optional_entity(desc.entity()).map_err(|status| {
         (
@@ -2376,6 +2438,8 @@ pub(crate) unsafe fn build_observer_binding_from_desc(
         extract_target_fn,
         callback: desc.callback.map(GuestFnPtr),
         mut_callback: desc.mut_callback.map(GuestFnPtr),
+        ctx_callback: desc.ctx_callback.map(GuestFnPtr),
+        query_specs,
         is_propagating: desc.is_propagating(),
         propagate_relationship,
         user_data: GuestUserData::new(desc.user_data),

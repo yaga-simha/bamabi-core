@@ -1179,6 +1179,7 @@ fn observers_ext_all_guard_branches_and_payload_edge_cases() {
     world.insert_resource(DynamicTriggerState {
         current_target: None,
         propagate: true,
+        watched_ids: Vec::new(),
     });
     storage.apply_to_world(&mut world, &snap);
     assert!(world.get_resource::<DynamicTriggerState>().is_some());
@@ -1213,6 +1214,8 @@ fn observers_ext_all_guard_branches_and_payload_edge_cases() {
             watched_components: Box::new([]),
             callback: Some(GuestFnPtr(obs_noop_cb)),
             mut_callback: None,
+            ctx_callback: None,
+            query_specs: Vec::new(),
             user_data: crate::sync_ptr::GuestUserData::new(null_mut()),
             is_active: Arc::clone(&active),
             registry: reg.clone(),
@@ -1251,6 +1254,8 @@ fn observers_ext_all_guard_branches_and_payload_edge_cases() {
             watched_components: Box::new([]),
             callback: Some(GuestFnPtr(obs_noop_cb)),
             mut_callback: None,
+            ctx_callback: None,
+            query_specs: Vec::new(),
             user_data: crate::sync_ptr::GuestUserData::new(null_mut()),
             is_active: Arc::clone(&active),
             registry: reg,
@@ -1521,4 +1526,942 @@ fn guest_observer_panic_and_error_route_to_fallback_handler_with_observer_contex
             .fault_count,
         3
     );
+}
+
+#[repr(C)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Default, bamabi_macros::ModComponent)]
+#[mod_component(name = "obs_v03_unit::TagA")]
+struct ObsTagA;
+
+#[repr(C)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Default, bamabi_macros::ModComponent)]
+#[mod_component(name = "obs_v03_unit::TagB")]
+struct ObsTagB;
+
+#[repr(C)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Default, bamabi_macros::ModComponent)]
+#[mod_component(name = "obs_v03_unit::Score")]
+struct ObsScore {
+    value: i32,
+}
+
+#[repr(C)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Default, bamabi_macros::ModComponent)]
+#[mod_component(name = "obs_v03_unit::Delta")]
+struct ObsDelta {
+    step: i32,
+}
+
+#[repr(C)]
+#[derive(
+    bevy_ecs::prelude::Resource,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Default,
+    bamabi_macros::ModComponent,
+)]
+#[mod_component(name = "obs_v03_unit::TelemetryRes")]
+struct ObsTelemetryRes {
+    hits: u32,
+    chained_hits: u32,
+    total_score: i32,
+    random_before: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChainedEvtPayload {
+    bonus: i32,
+}
+
+#[test]
+fn slot37_cmd_trigger_and_custom_watched_components_fire_once_without_double_dispatch() {
+    use crate::ffi::commands::host_cmd_trigger;
+    use core::sync::atomic::AtomicUsize;
+
+    struct CustomObsState {
+        direct_hits: Mutex<Vec<(FfiEntity, u32)>>,
+        watched_hits: AtomicUsize,
+    }
+
+    unsafe extern "C" fn record_direct(
+        entity: FfiEntity,
+        data: *const c_void,
+        _cmds: *mut BamCommands,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        // SAFETY: `data` points to initialized `u32` payload for `DynEvt`.
+        let payload = unsafe { core::ptr::read_unaligned(data.cast::<u32>()) };
+        // SAFETY: `user_data` points to live `CustomObsState`.
+        let st = unsafe { &*user_data.cast::<CustomObsState>() };
+        st.direct_hits.lock().unwrap().push((entity, payload));
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn record_watched(
+        _entity: FfiEntity,
+        _data: *const c_void,
+        _cmds: *mut BamCommands,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        // SAFETY: `user_data` points to live `CustomObsState`.
+        let st = unsafe { &*user_data.cast::<CustomObsState>() };
+        st.watched_hits.fetch_add(1, Ordering::SeqCst);
+        FfiResult::OK
+    }
+
+    let mut world = World::new();
+    let tag_a_cid = world.register_component::<ObsTagA>();
+    let tag_b_cid = world.register_component::<ObsTagB>();
+    let mut reg = ModRegistry::new();
+    let tag_a_h = reg
+        .register_component::<ObsTagA>(tag_a_cid, Default::default())
+        .unwrap();
+    let tag_b_h = reg
+        .register_component::<ObsTagB>(tag_b_cid, Default::default())
+        .unwrap();
+    let active = Arc::new(AtomicBool::new(true));
+    let state = Box::new(CustomObsState {
+        direct_hits: Mutex::new(Vec::new()),
+        watched_hits: AtomicUsize::new(0),
+    });
+    let state_ptr = core::ptr::from_ref(&*state).cast_mut().cast::<c_void>();
+
+    let mut dyn_evt_h = BamComponent::INVALID;
+    let (reg, bindings) = {
+        let mut ctx = LoadContext::with_world_and_mod_id(
+            reg,
+            Arc::clone(&active),
+            &mut world as *mut World,
+            Some(ModId(71)),
+        );
+        let d_evt = ComponentDesc::new(
+            c"obs_v03_unit::Slot37DynEvt".as_ptr(),
+            ComponentUuid::from_parts("obs_v03_unit::Slot37DynEvt", 4, 4, 0),
+            4,
+            4,
+        );
+        // SAFETY: Valid `LoadContext` and descriptors.
+        unsafe {
+            assert_eq!(
+                host_register_component(ctx.as_ffi_ptr(), &d_evt, &mut dyn_evt_h),
+                FfiResult::OK
+            );
+            let direct_desc = BamObserverDesc::new(dyn_evt_h, record_direct, state_ptr)
+                .with_name(c"slot37_direct".as_ptr());
+            assert_eq!(
+                host_register_observer(ctx.as_ffi_ptr(), &direct_desc),
+                FfiResult::OK
+            );
+            let watched_desc = BamObserverDesc::new(dyn_evt_h, record_watched, state_ptr)
+                .with_name(c"custom_watched_a".as_ptr())
+                .with_watched_components(&tag_a_h, 1);
+            assert_eq!(
+                host_register_observer(ctx.as_ffi_ptr(), &watched_desc),
+                FfiResult::OK
+            );
+        }
+        let r = ctx.registry.clone();
+        ctx.finish_init();
+        (r, core::mem::take(&mut ctx.registered_observers))
+    };
+    let _spawned = spawn_registered_observers_in_world(&mut world, bindings, &reg, ModId(71));
+
+    let with_a = world.spawn(ObsTagA).id();
+    let without_a = world.spawn(ObsTagB).id();
+    let with_a_ffi = FfiEntity::from_bits(with_a.to_bits());
+    let without_a_ffi = FfiEntity::from_bits(without_a.to_bits());
+    let snap = reg.snapshot_arc();
+    let mut storage = HostCommandsStorage::new();
+
+    {
+        let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+            .with_mod_context(Some(ModId(71)), Some(active))
+            .with_registry(&reg);
+        let cp = cmds.as_ffi_ptr();
+        let p1: u32 = 11;
+        let p2: u32 = 22;
+        let p3: u32 = 33;
+        let mut p4: u32 = 44;
+        let mut p5: u32 = 55;
+        // SAFETY: Valid `HostCommands`, payload pointers, and `BamTriggerDesc`s.
+        unsafe {
+            // 1. Slot-37 trigger on entity WITH TagA: direct sees `with_a_ffi`, watched fires once.
+            assert_eq!(
+                host_cmd_trigger(cp, dyn_evt_h, with_a_ffi, (&raw const p1).cast::<u8>(), 4),
+                FfiResult::OK
+            );
+            // 2. Slot-37 trigger on entity WITHOUT TagA: direct sees `without_a_ffi`, watched skipped.
+            assert_eq!(
+                host_cmd_trigger(
+                    cp,
+                    dyn_evt_h,
+                    without_a_ffi,
+                    (&raw const p2).cast::<u8>(),
+                    4
+                ),
+                FfiResult::OK
+            );
+            // 3. Global Slot-37 trigger (`FfiEntity::NULL`): direct sees `NULL`, watched skipped.
+            assert_eq!(
+                host_cmd_trigger(
+                    cp,
+                    dyn_evt_h,
+                    FfiEntity::NULL,
+                    (&raw const p3).cast::<u8>(),
+                    4
+                ),
+                FfiResult::OK
+            );
+            // 4. `cmd_trigger_ex` with matching `watched_components = [TagA]`: watched fires ONCE (no double fire!).
+            assert_eq!(
+                host_cmd_trigger_ex(
+                    cp,
+                    &BamTriggerDesc::new(dyn_evt_h, (&raw mut p4).cast::<u8>(), 4)
+                        .with_entity(without_a_ffi)
+                        .with_watched_components(&tag_a_h, 1),
+                ),
+                FfiResult::OK
+            );
+            // 5. `cmd_trigger_ex` with mismatched `watched_components = [TagB]`: watched skipped.
+            assert_eq!(
+                host_cmd_trigger_ex(
+                    cp,
+                    &BamTriggerDesc::new(dyn_evt_h, (&raw mut p5).cast::<u8>(), 4)
+                        .with_entity(with_a_ffi)
+                        .with_watched_components(&tag_b_h, 1),
+                ),
+                FfiResult::OK
+            );
+        }
+    }
+
+    storage.apply_to_world(&mut world, &snap);
+    assert_eq!(
+        *state.direct_hits.lock().unwrap(),
+        vec![
+            (with_a_ffi, 11),
+            (without_a_ffi, 22),
+            (FfiEntity::NULL, 33),
+            (without_a_ffi, 44),
+            (with_a_ffi, 55),
+        ]
+    );
+    assert_eq!(state.watched_hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn ctx_observer_executes_queries_random_access_resources_commands_chained_triggers_and_runtime_observe()
+ {
+    use crate::ffi::commands::host_cmd_trigger;
+    use crate::ffi::iter::{host_iter_column_readonly, host_iter_next_chunk};
+    use crate::system::{
+        host_sys_commands, host_sys_entity_get, host_sys_entity_get_mut, host_sys_query,
+        host_sys_res_mut_ptr, host_sys_res_ptr,
+    };
+    use bamabi_sys::{AccessMode, BamChangeTicks, BamQueryDesc, BamSystemCtx, BamTermDesc};
+    use core::ptr::null_mut;
+
+    struct CtxChainState {
+        chained_evt_h: BamComponent,
+        score_h: BamComponent,
+        res_h: BamComponent,
+        runtime_hits: core::sync::atomic::AtomicUsize,
+    }
+
+    unsafe extern "C" fn primary_ctx_obs(
+        entity: FfiEntity,
+        data: *const c_void,
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        // SAFETY: `user_data` points to live `CtxChainState` and `data` to `i32`.
+        let st = unsafe { &*user_data.cast::<CtxChainState>() };
+        // SAFETY: `data` points to initialized `i32` event payload.
+        let inc = unsafe { core::ptr::read_unaligned(data.cast::<i32>()) };
+
+        // Read via `host_sys_entity_get`, then mutate via `host_sys_entity_get_mut`.
+        // SAFETY: `sys_ctx` is active for this observer invocation.
+        let prev_ptr = unsafe { host_sys_entity_get(sys_ctx, 0, entity, 0) };
+        assert!(!prev_ptr.is_null());
+        // SAFETY: `prev_ptr` points to readable `ObsScore` component bytes.
+        let prev_score = unsafe { core::ptr::read_unaligned(prev_ptr.cast::<ObsScore>()) }.value;
+
+        // SAFETY: `sys_ctx` is active with declared WRITE access on `ObsScore`.
+        let mut_ptr = unsafe { host_sys_entity_get_mut(sys_ctx, 0, entity, 0) };
+        assert!(!mut_ptr.is_null());
+        // SAFETY: `mut_ptr` points to writable `ObsScore` component storage.
+        unsafe {
+            core::ptr::write_unaligned(
+                mut_ptr.cast::<ObsScore>(),
+                ObsScore {
+                    value: prev_score + inc,
+                },
+            );
+        }
+
+        // Read and mutate resource via `host_sys_res_ptr` and `host_sys_res_mut_ptr`.
+        let mut ticks = BamChangeTicks::default();
+        // SAFETY: `sys_ctx` is active and `ticks` is stack-allocated.
+        let res_ro = unsafe { host_sys_res_ptr(sys_ctx, st.res_h, &mut ticks) };
+        assert!(!res_ro.is_null());
+        // SAFETY: `sys_ctx` is active with declared `RESOURCE_WRITE` access.
+        let res_mut = unsafe { host_sys_res_mut_ptr(sys_ctx, st.res_h, null_mut()) };
+        assert!(!res_mut.is_null());
+        // SAFETY: `res_mut` points to `ObsTelemetryRes` exclusive resource storage.
+        let mut telem = unsafe { core::ptr::read_unaligned(res_mut.cast::<ObsTelemetryRes>()) };
+        telem.hits += 1;
+        telem.random_before = prev_score;
+        // SAFETY: `res_mut` is exclusively writable for `ObsTelemetryRes`.
+        unsafe { core::ptr::write_unaligned(res_mut.cast::<ObsTelemetryRes>(), telem) };
+
+        // Queue chained trigger via `host_sys_commands` (`obs1 -> Ev2 -> obs2`).
+        let mut cmds_ptr: *mut BamCommands = null_mut();
+        // SAFETY: `sys_ctx` is active and `cmds_ptr` is stack-writable.
+        let rc_cmds = unsafe { host_sys_commands(sys_ctx, &mut cmds_ptr) };
+        assert_eq!(rc_cmds, FfiResult::OK);
+        let chained = ChainedEvtPayload { bonus: inc * 2 };
+        // SAFETY: `cmds_ptr` is active and `chained` is valid for `ChainedEvtPayload`.
+        unsafe {
+            host_cmd_trigger(
+                cmds_ptr,
+                st.chained_evt_h,
+                FfiEntity::NULL,
+                core::ptr::from_ref(&chained).cast::<u8>(),
+                core::mem::size_of::<ChainedEvtPayload>(),
+            )
+        }
+    }
+
+    unsafe extern "C" fn chained_ctx_obs(
+        entity: FfiEntity,
+        data: *const c_void,
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        assert_eq!(entity, FfiEntity::NULL);
+        // SAFETY: `user_data` points to `CtxChainState`.
+        let st = unsafe { &*user_data.cast::<CtxChainState>() };
+        // SAFETY: `data` points to initialized `ChainedEvtPayload`.
+        let payload = unsafe { core::ptr::read_unaligned(data.cast::<ChainedEvtPayload>()) };
+
+        let mut iter_ptr: *mut BamIter = null_mut();
+        // SAFETY: `sys_ctx` is active with declared query slot 0.
+        let rc_q = unsafe { host_sys_query(sys_ctx, 0, &mut iter_ptr) };
+        assert_eq!(rc_q, FfiResult::OK);
+        let mut sum = 0i32;
+        let mut chunk_len = 0usize;
+        // SAFETY: Valid `BamIter` returned by `host_sys_query`.
+        while unsafe { host_iter_next_chunk(iter_ptr, &mut chunk_len) }.get() {
+            // SAFETY: `iter_ptr` is active at current chunk with term 0 `ObsScore`.
+            let raw_col = unsafe { host_iter_column_readonly(iter_ptr, 0) };
+            if !raw_col.is_null() {
+                for idx in 0..chunk_len {
+                    // SAFETY: `raw_col` holds `chunk_len` contiguous `ObsScore` values.
+                    let elem = unsafe {
+                        raw_col
+                            .add(idx * core::mem::size_of::<ObsScore>())
+                            .cast::<ObsScore>()
+                            .read_unaligned()
+                    };
+                    sum += elem.value;
+                }
+            }
+        }
+        // SAFETY: `sys_ctx` is active with declared `RESOURCE_WRITE` access.
+        let res_mut = unsafe { host_sys_res_mut_ptr(sys_ctx, st.res_h, null_mut()) };
+        assert!(!res_mut.is_null());
+        // SAFETY: Valid `ObsTelemetryRes` pointer.
+        let mut telem = unsafe { core::ptr::read_unaligned(res_mut.cast::<ObsTelemetryRes>()) };
+        telem.chained_hits += 1;
+        telem.total_score = sum + payload.bonus;
+        // SAFETY: `res_mut` is exclusively writable for `ObsTelemetryRes`.
+        unsafe { core::ptr::write_unaligned(res_mut.cast::<ObsTelemetryRes>(), telem) };
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn runtime_ctx_obs(
+        _entity: FfiEntity,
+        _data: *const c_void,
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        // SAFETY: `user_data` points to `CtxChainState`.
+        let st = unsafe { &*user_data.cast::<CtxChainState>() };
+        let mut iter_ptr: *mut BamIter = null_mut();
+        // SAFETY: `sys_ctx` is active with declared query slot 0.
+        let rc_q = unsafe { host_sys_query(sys_ctx, 0, &mut iter_ptr) };
+        assert_eq!(rc_q, FfiResult::OK);
+        let mut count = 0usize;
+        let mut chunk_len = 0usize;
+        // SAFETY: Valid `BamIter`.
+        while unsafe { host_iter_next_chunk(iter_ptr, &mut chunk_len) }.get() {
+            count += chunk_len;
+        }
+        assert!(st.score_h.is_valid());
+        st.runtime_hits.fetch_add(count, Ordering::SeqCst);
+        FfiResult::OK
+    }
+
+    let mut world = World::new();
+    let score_cid = world.register_component::<ObsScore>();
+    let delta_cid = world.register_component::<ObsDelta>();
+    let res_cid = world.register_component::<ObsTelemetryRes>();
+    world.insert_resource(ObsTelemetryRes::default());
+
+    let mut reg = ModRegistry::new();
+    let score_h = reg
+        .register_component::<ObsScore>(score_cid, Default::default())
+        .unwrap();
+    let delta_h = reg
+        .register_component::<ObsDelta>(delta_cid, Default::default())
+        .unwrap();
+    let res_h = reg.register_resource::<ObsTelemetryRes>(res_cid).unwrap();
+    world.insert_resource(reg.clone());
+
+    let active = Arc::new(AtomicBool::new(true));
+    let mut state = Box::new(CtxChainState {
+        chained_evt_h: BamComponent::INVALID,
+        score_h,
+        res_h,
+        runtime_hits: core::sync::atomic::AtomicUsize::new(0),
+    });
+
+    let mut primary_evt_h = BamComponent::INVALID;
+    let mut runtime_evt_h = BamComponent::INVALID;
+    let (reg, bindings) = {
+        let mut ctx = LoadContext::with_world_and_mod_id(
+            reg,
+            Arc::clone(&active),
+            &mut world as *mut World,
+            Some(ModId(72)),
+        );
+        let d_primary = ComponentDesc::new(
+            c"obs_v03_unit::PrimaryCtxEvt".as_ptr(),
+            ComponentUuid::from_parts("obs_v03_unit::PrimaryCtxEvt", 4, 4, 0),
+            4,
+            4,
+        );
+        let d_chained = ComponentDesc::new(
+            c"obs_v03_unit::ChainedCtxEvt".as_ptr(),
+            ComponentUuid::from_parts("obs_v03_unit::ChainedCtxEvt", 4, 4, 0),
+            4,
+            4,
+        );
+        let d_runtime = ComponentDesc::new(
+            c"obs_v03_unit::RuntimeCtxEvt".as_ptr(),
+            ComponentUuid::from_parts("obs_v03_unit::RuntimeCtxEvt", 4, 4, 0),
+            4,
+            4,
+        );
+        // SAFETY: Valid descriptors and stack pointers.
+        unsafe {
+            assert_eq!(
+                host_register_component(ctx.as_ffi_ptr(), &d_primary, &mut primary_evt_h),
+                FfiResult::OK
+            );
+            assert_eq!(
+                host_register_component(ctx.as_ffi_ptr(), &d_chained, &mut state.chained_evt_h),
+                FfiResult::OK
+            );
+            assert_eq!(
+                host_register_component(ctx.as_ffi_ptr(), &d_runtime, &mut runtime_evt_h),
+                FfiResult::OK
+            );
+
+            let state_ptr = core::ptr::from_ref(&*state).cast_mut().cast::<c_void>();
+            let p_q0 = [BamTermDesc::new(score_h, AccessMode::WRITE)];
+            let p_q1 = [BamTermDesc::new(res_h, AccessMode::RESOURCE_WRITE)];
+            let primary_queries = [
+                BamQueryDesc::new(p_q0.as_ptr(), p_q0.len()),
+                BamQueryDesc::new(p_q1.as_ptr(), p_q1.len()),
+            ];
+            let primary_desc = BamObserverDesc::new_with_ctx(
+                primary_evt_h,
+                primary_ctx_obs,
+                primary_queries.as_ptr(),
+                primary_queries.len(),
+                state_ptr,
+            )
+            .with_name(c"primary_ctx_obs".as_ptr());
+            assert_eq!(
+                host_register_observer(ctx.as_ffi_ptr(), &primary_desc),
+                FfiResult::OK
+            );
+
+            let c_q0 = [BamTermDesc::new(score_h, AccessMode::READ)];
+            let c_q1 = [BamTermDesc::new(res_h, AccessMode::RESOURCE_WRITE)];
+            let chained_queries = [
+                BamQueryDesc::new(c_q0.as_ptr(), c_q0.len()),
+                BamQueryDesc::new(c_q1.as_ptr(), c_q1.len()),
+            ];
+            let chained_desc = BamObserverDesc::new_with_ctx(
+                state.chained_evt_h,
+                chained_ctx_obs,
+                chained_queries.as_ptr(),
+                chained_queries.len(),
+                state_ptr,
+            )
+            .with_name(c"chained_ctx_obs".as_ptr());
+            assert_eq!(
+                host_register_observer(ctx.as_ffi_ptr(), &chained_desc),
+                FfiResult::OK
+            );
+        }
+        let r = ctx.registry.clone();
+        ctx.finish_init();
+        (r, core::mem::take(&mut ctx.registered_observers))
+    };
+    world.insert_resource(reg.clone());
+    let _spawned = spawn_registered_observers_in_world(&mut world, bindings, &reg, ModId(72));
+
+    // Spawn entities AFTER observer init so `group.update_archetypes(cell)` is exercised.
+    let target_ent = world
+        .spawn((ObsScore { value: 10 }, ObsDelta { step: 1 }))
+        .id();
+    let _other_ent = world.spawn(ObsScore { value: 50 }).id();
+    let target_ffi = FfiEntity::from_bits(target_ent.to_bits());
+    let snap = reg.snapshot_arc();
+    let mut storage = HostCommandsStorage::new();
+
+    {
+        let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+            .with_mod_context(Some(ModId(72)), Some(Arc::clone(&active)))
+            .with_registry(&reg);
+        let inc: i32 = 7;
+        // SAFETY: Valid `HostCommands` and payload pointer.
+        let trig_rc = unsafe {
+            host_cmd_trigger(
+                cmds.as_ffi_ptr(),
+                primary_evt_h,
+                target_ffi,
+                core::ptr::from_ref(&inc).cast::<u8>(),
+                4,
+            )
+        };
+        assert_eq!(trig_rc, FfiResult::OK);
+
+        // Also register a runtime ctx observer via `host_cmd_observe`.
+        let state_ptr = core::ptr::from_ref(&*state).cast_mut().cast::<c_void>();
+        let rt_terms = [
+            BamTermDesc::new(score_h, AccessMode::READ),
+            BamTermDesc::new(delta_h, AccessMode::FILTER_ONLY),
+        ];
+        let rt_queries = [BamQueryDesc::new(rt_terms.as_ptr(), rt_terms.len())];
+        let rt_desc = BamObserverDesc::new_with_ctx(
+            runtime_evt_h,
+            runtime_ctx_obs,
+            rt_queries.as_ptr(),
+            rt_queries.len(),
+            state_ptr,
+        )
+        .with_name(c"runtime_ctx_obs".as_ptr());
+        let mut rt_obs_ent = FfiEntity::NULL;
+        // SAFETY: Valid `HostCommands`, `BamObserverDesc`, and `out_entity`.
+        let obs_rc = unsafe { host_cmd_observe(cmds.as_ffi_ptr(), &rt_desc, &mut rt_obs_ent) };
+        assert_eq!(obs_rc, FfiResult::OK);
+        assert_ne!(rt_obs_ent, FfiEntity::NULL);
+    }
+
+    // One synchronous `apply_to_world` must run `primary_ctx_obs -> cmd_trigger(ChainedCtxEvt) -> chained_ctx_obs`.
+    storage.apply_to_world(&mut world, &snap);
+
+    assert_eq!(world.get::<ObsScore>(target_ent).unwrap().value, 17);
+    let telem = *world.resource::<ObsTelemetryRes>();
+    assert_eq!(
+        telem,
+        ObsTelemetryRes {
+            hits: 1,
+            chained_hits: 1,
+            total_score: 17 + 50 + 14,
+            random_before: 10,
+        }
+    );
+
+    // Trigger runtime-spawned `runtime_ctx_obs` (`query: Score with FILTER_ONLY Delta` -> matches 1 entity).
+    {
+        let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+            .with_mod_context(Some(ModId(72)), Some(active))
+            .with_registry(&reg);
+        let dummy: u32 = 1;
+        // SAFETY: Valid `HostCommands` and payload pointer.
+        let rt_rc = unsafe {
+            host_cmd_trigger(
+                cmds.as_ffi_ptr(),
+                runtime_evt_h,
+                FfiEntity::NULL,
+                core::ptr::from_ref(&dummy).cast::<u8>(),
+                4,
+            )
+        };
+        assert_eq!(rt_rc, FfiResult::OK);
+    }
+    storage.apply_to_world(&mut world, &snap);
+    assert_eq!(state.runtime_hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn ctx_observer_validation_quarantine_reentrancy_rollback_and_truncated_compat() {
+    use crate::ffi::commands::host_cmd_spawn_empty;
+    use crate::ffi::v03_ext::host_report_guest_fault;
+    use crate::loader::LoadedMod;
+    use crate::system::{host_sys_commands, host_sys_host_ctx};
+    use bamabi_sys::{
+        AccessMode, BamInstance, BamQueryDesc, BamSystemCtx, BamTermDesc, MAX_QUERIES_PER_SYSTEM,
+        StrView,
+    };
+    use bevy_ecs::error::{BevyError, ErrorContext, FallbackErrorHandler, Severity};
+    use bevy_ecs::event::Event;
+    use core::mem::{offset_of, size_of};
+    use core::ptr::{null, null_mut};
+    use core::sync::atomic::AtomicUsize;
+
+    #[derive(Event, Clone, Copy, Debug, bamabi_macros::ModComponent)]
+    #[mod_component(name = "obs_v03_unit::FaultEvt")]
+    #[repr(C)]
+    struct FaultEvt(u32);
+
+    unsafe extern "C" fn mock_shutdown(_inst: *mut BamInstance) {}
+
+    #[derive(Debug)]
+    struct CapturedFault {
+        is_observer_ctx: bool,
+        severity: Severity,
+    }
+
+    static CAPTURED: Mutex<Vec<CapturedFault>> = Mutex::new(Vec::new());
+    static TEST_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn capture_handler(err: BevyError, ctx: ErrorContext) {
+        let is_observer_ctx = matches!(ctx, ErrorContext::Observer { .. });
+        CAPTURED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(CapturedFault {
+                is_observer_ctx,
+                severity: err.severity(),
+            });
+    }
+
+    unsafe extern "C" fn dummy_ctx_cb(
+        _e: FfiEntity,
+        _d: *const c_void,
+        _sys: *mut BamSystemCtx,
+        _ud: *mut c_void,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn faulting_ctx_obs(
+        _e: FfiEntity,
+        _d: *const c_void,
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        // SAFETY: `user_data` points to `AtomicUsize`.
+        unsafe {
+            (*(user_data.cast::<AtomicUsize>())).fetch_add(1, Ordering::SeqCst);
+        }
+        let mut cmds_ptr: *mut BamCommands = null_mut();
+        // SAFETY: `sys_ctx` is active and `cmds_ptr` is stack-writable.
+        let rc_cmds = unsafe { host_sys_commands(sys_ctx, &mut cmds_ptr) };
+        assert_eq!(rc_cmds, FfiResult::OK);
+        let mut spawned = FfiEntity::NULL;
+        // SAFETY: `cmds_ptr` is active and `spawned` is stack-writable.
+        let rc_spawn = unsafe { host_cmd_spawn_empty(cmds_ptr, &mut spawned) };
+        assert_eq!(rc_spawn, FfiResult::OK);
+        // SAFETY: `sys_ctx` is active for this invocation.
+        let host_ctx = unsafe { host_sys_host_ctx(sys_ctx) };
+        // SAFETY: `host_ctx` is valid and `StrView` points to static UTF-8 bytes.
+        unsafe {
+            host_report_guest_fault(host_ctx, StrView::from_str("ctx observer explicit fault"))
+        };
+        FfiResult::INTERNAL_ERROR
+    }
+
+    let _serial = TEST_CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    CAPTURED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+    let mut world = World::new();
+    world.insert_resource(FallbackErrorHandler(capture_handler));
+    world.init_resource::<Messages<ModSystemFaulted>>();
+    let score_cid = world.register_component::<ObsScore>();
+    let mut reg = ModRegistry::new();
+    let score_h = reg
+        .register_component::<ObsScore>(score_cid, Default::default())
+        .unwrap();
+    let evt_key = world.register_event_key::<FaultEvt>();
+    let evt_h = reg.register_event::<FaultEvt>(evt_key).unwrap();
+    world.insert_resource(reg.clone());
+
+    let active = Arc::new(AtomicBool::new(true));
+    let mock_mod_id = LoadedMod::register_mock_for_test(
+        &mut world,
+        "obs_ctx_guard_mod",
+        Arc::clone(&active),
+        mock_shutdown,
+        None,
+        null_mut(),
+    );
+
+    // 1. Descriptor validation guards + backward-compatible truncated v0.2 & pre-ctx descriptors.
+    {
+        let mut ctx = LoadContext::with_world_and_mod_id(
+            reg.clone(),
+            Arc::clone(&active),
+            &mut world as *mut World,
+            Some(mock_mod_id),
+        );
+        let terms = [BamTermDesc::new(score_h, AccessMode::READ)];
+        let one_q = [BamQueryDesc::new(terms.as_ptr(), terms.len())];
+        let mut too_many = Vec::with_capacity(MAX_QUERIES_PER_SYSTEM + 1);
+        for _ in 0..=MAX_QUERIES_PER_SYSTEM {
+            too_many.push(BamQueryDesc::new(terms.as_ptr(), terms.len()));
+        }
+
+        // `query_count > MAX_QUERIES_PER_SYSTEM` -> CAPACITY_EXCEEDED
+        let over_cap = BamObserverDesc::new_with_ctx(
+            evt_h,
+            dummy_ctx_cb,
+            too_many.as_ptr(),
+            too_many.len(),
+            null_mut(),
+        );
+        // `query_count > 0` with null `queries` -> NULL_POINTER
+        let null_q = BamObserverDesc::new_with_ctx(evt_h, dummy_ctx_cb, null(), 1, null_mut());
+        // `queries` with `callback` (no `ctx_callback`) -> INVALID_ARGUMENT
+        let mut q_no_ctx = BamObserverDesc::new(evt_h, obs_noop_cb, null_mut());
+        q_no_ctx.queries = one_q.as_ptr();
+        q_no_ctx.query_count = 1;
+        // All callbacks null -> NULL_POINTER
+        let mut all_null_cb = BamObserverDesc::new(evt_h, obs_noop_cb, null_mut());
+        all_null_cb.callback = None;
+
+        // SAFETY: Valid `LoadContext` and descriptors.
+        unsafe {
+            assert_eq!(
+                host_register_observer(ctx.as_ffi_ptr(), &over_cap),
+                FfiResult::CAPACITY_EXCEEDED
+            );
+            assert_eq!(
+                host_register_observer(ctx.as_ffi_ptr(), &null_q),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                host_register_observer(ctx.as_ffi_ptr(), &q_no_ctx),
+                FfiResult::INVALID_ARGUMENT
+            );
+            assert_eq!(
+                host_register_observer(ctx.as_ffi_ptr(), &all_null_cb),
+                FfiResult::NULL_POINTER
+            );
+        }
+
+        // Backward-compat truncated v0.2 (`MIN_V0_2_SIZE`) and pre-ctx (`offset_of!(ctx_callback)`).
+        struct AlignedRaw([u128; size_of::<BamObserverDesc>().div_ceil(16)]);
+
+        for prefix_len in [
+            BamObserverDesc::MIN_V0_2_SIZE,
+            offset_of!(BamObserverDesc, ctx_callback),
+        ] {
+            let mut full = BamObserverDesc::new(evt_h, obs_noop_cb, null_mut());
+            full.struct_size = prefix_len as u32;
+            let mut raw = AlignedRaw([0u128; size_of::<BamObserverDesc>().div_ceil(16)]);
+            // SAFETY: `prefix_len <= size_of::<BamObserverDesc>()` and `raw.0` is 16-byte aligned.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    core::ptr::from_ref(&full).cast::<u8>(),
+                    raw.0.as_mut_ptr().cast::<u8>(),
+                    prefix_len,
+                );
+                assert_eq!(
+                    host_register_observer(
+                        ctx.as_ffi_ptr(),
+                        raw.0.as_ptr().cast::<BamObserverDesc>(),
+                    ),
+                    FfiResult::OK
+                );
+            }
+        }
+        ctx.finish_init();
+    }
+
+    // 2. Conflicting queries rejected at registration AND quarantined cleanly if encountered at init.
+    let conflict_binding = {
+        let mut ctx = LoadContext::with_world_and_mod_id(
+            reg.clone(),
+            Arc::clone(&active),
+            &mut world as *mut World,
+            Some(mock_mod_id),
+        );
+        let w_term = [BamTermDesc::new(score_h, AccessMode::WRITE)];
+        let dup_writes = [
+            BamQueryDesc::new(w_term.as_ptr(), 1),
+            BamQueryDesc::new(w_term.as_ptr(), 1),
+        ];
+        let desc = BamObserverDesc::new_with_ctx(
+            evt_h,
+            dummy_ctx_cb,
+            dup_writes.as_ptr(),
+            dup_writes.len(),
+            null_mut(),
+        )
+        .with_name(c"self_conflict_ctx_obs".as_ptr());
+        // SAFETY: Valid `LoadContext` and `BamObserverDesc`.
+        unsafe {
+            assert_eq!(
+                host_register_observer(ctx.as_ffi_ptr(), &desc),
+                FfiResult::ACCESS_CONFLICT
+            );
+        }
+        let one_q = [BamQueryDesc::new(w_term.as_ptr(), 1)];
+        let single_desc =
+            BamObserverDesc::new_with_ctx(evt_h, dummy_ctx_cb, one_q.as_ptr(), 1, null_mut())
+                .with_name(c"self_conflict_init_obs".as_ptr());
+        // SAFETY: Valid stack descriptor.
+        let parsed = unsafe {
+            bamabi_sys::read_descriptor::<BamObserverDesc>(
+                core::ptr::from_ref(&single_desc).cast::<c_void>(),
+            )
+        }
+        .unwrap();
+        // SAFETY: `parsed` passed `read_descriptor`.
+        let mut binding = unsafe {
+            build_observer_binding_from_desc(
+                &parsed,
+                &reg.snapshot_arc(),
+                reg.clone(),
+                Arc::clone(&active),
+                Some(mock_mod_id),
+            )
+        }
+        .unwrap();
+        let dup_spec = binding.query_specs[0].clone();
+        binding.query_specs.push(dup_spec);
+        ctx.finish_init();
+        binding
+    };
+    let conflict_spawned =
+        spawn_registered_observers_in_world(&mut world, vec![conflict_binding], &reg, mock_mod_id);
+    assert_eq!(conflict_spawned.len(), 1);
+    let conflict_state = world.get::<ModObserverState>(conflict_spawned[0]).unwrap();
+    assert!(!conflict_state.enabled.load(Ordering::Acquire));
+    assert!(conflict_state.ctx_state.is_none());
+    let init_faults: Vec<ModSystemFaulted> = world
+        .resource::<Messages<ModSystemFaulted>>()
+        .iter_current_update_messages()
+        .cloned()
+        .collect();
+    assert!(init_faults.iter().any(|f| {
+        f.system_name == "self_conflict_init_obs"
+            && f.init_error.is_some()
+            && f.mod_id == Some(mock_mod_id)
+    }));
+
+    // 3. Re-entrancy `ACCESS_CONFLICT` guard when `ctx_state` mutex is held + runtime fault rollback.
+    let mut hits = AtomicUsize::new(0);
+    let mut_fault_bindings = {
+        let mut ctx = LoadContext::with_world_and_mod_id(
+            reg.clone(),
+            Arc::clone(&active),
+            &mut world as *mut World,
+            Some(mock_mod_id),
+        );
+        let r_term = [BamTermDesc::new(score_h, AccessMode::READ)];
+        let r_q = [BamQueryDesc::new(r_term.as_ptr(), 1)];
+        let d_reent =
+            BamObserverDesc::new_with_ctx(evt_h, dummy_ctx_cb, r_q.as_ptr(), 1, null_mut())
+                .with_name(c"reentrant_ctx_obs".as_ptr());
+        let d_fault = BamObserverDesc::new_with_ctx(
+            evt_h,
+            faulting_ctx_obs,
+            r_q.as_ptr(),
+            1,
+            core::ptr::from_ref(&hits).cast_mut().cast::<c_void>(),
+        )
+        .with_name(c"faulting_ctx_obs".as_ptr());
+        // SAFETY: Valid `LoadContext` and stack descriptors.
+        unsafe {
+            assert_eq!(
+                host_register_observer(ctx.as_ffi_ptr(), &d_reent),
+                FfiResult::OK
+            );
+            assert_eq!(
+                host_register_observer(ctx.as_ffi_ptr(), &d_fault),
+                FfiResult::OK
+            );
+        }
+        ctx.finish_init();
+        core::mem::take(&mut ctx.registered_observers)
+    };
+    let spawned =
+        spawn_registered_observers_in_world(&mut world, mut_fault_bindings, &reg, mock_mod_id);
+    assert_eq!(spawned.len(), 2);
+
+    let reent_mutex = world
+        .get::<ModObserverState>(spawned[0])
+        .unwrap()
+        .ctx_state
+        .clone()
+        .unwrap();
+    let entities_before = world.entities().len();
+    {
+        let _lock = reent_mutex.lock().unwrap();
+        world.trigger(FaultEvt(99));
+    }
+    // Faulting observer's `host_cmd_spawn_empty` was rolled back and both faulted observers quarantined.
+    assert_eq!(world.entities().len(), entities_before);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(
+        !world
+            .get::<ModObserverState>(spawned[0])
+            .unwrap()
+            .enabled
+            .load(Ordering::Acquire)
+    );
+    assert!(
+        !world
+            .get::<ModObserverState>(spawned[1])
+            .unwrap()
+            .enabled
+            .load(Ordering::Acquire)
+    );
+
+    let faults: Vec<ModSystemFaulted> = world
+        .resource::<Messages<ModSystemFaulted>>()
+        .iter_current_update_messages()
+        .cloned()
+        .collect();
+    let reent_fault = faults
+        .iter()
+        .find(|f| f.system_name == "reentrant_ctx_obs")
+        .expect("reentrant fault message");
+    assert_eq!(reent_fault.status, FfiResult::ACCESS_CONFLICT);
+    assert!(
+        reent_fault
+            .last_error
+            .as_deref()
+            .is_some_and(|m| m.contains("re-entrant"))
+    );
+    let runtime_fault = faults
+        .iter()
+        .find(|f| f.system_name == "faulting_ctx_obs")
+        .expect("runtime ctx fault message");
+    assert_eq!(runtime_fault.status, FfiResult::INTERNAL_ERROR);
+    assert_eq!(
+        runtime_fault.last_error.as_deref(),
+        Some("ctx observer explicit fault")
+    );
+    assert_eq!(CAPTURED.lock().unwrap_or_else(|e| e.into_inner()).len(), 2);
+    assert!(
+        CAPTURED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .all(|r| r.severity == Severity::Error && r.is_observer_ctx)
+    );
+    let _ = &mut hits;
 }

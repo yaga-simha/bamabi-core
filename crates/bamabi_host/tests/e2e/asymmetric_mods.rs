@@ -2208,3 +2208,121 @@ fn test_cross_language_interop_binary_layout() {
         }
     );
 }
+
+#[repr(C)]
+#[derive(bevy_ecs::event::EntityEvent, Clone, Copy, Debug, ModComponent)]
+#[mod_component(name = "testbed::CtxObsEvent")]
+struct CtxObsEvent {
+    #[event_target]
+    entity: bamabi_host::TargetEntity,
+    delta: i32,
+    _pad0: u32,
+}
+
+#[repr(C)]
+#[derive(bevy_ecs::event::Event, Clone, Copy, Debug, ModComponent)]
+#[mod_component(name = "testbed::CtxObsChainedEvent")]
+struct CtxObsChainedEvent {
+    bonus: i32,
+}
+
+#[repr(C)]
+#[derive(Component, Clone, Copy, Debug, Default, ModComponent)]
+#[mod_component(name = "testbed::CtxObsTag")]
+struct CtxObsTag;
+
+#[repr(C)]
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "testbed::CtxObsValue")]
+struct CtxObsValue {
+    score: i32,
+}
+
+#[repr(C)]
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "testbed::CtxObsTelemetry")]
+struct CtxObsTelemetry {
+    hits: u32,
+    chained_hits: u32,
+    total_score: i32,
+    _pad0: u32,
+    last_target: u64,
+}
+
+#[test]
+fn test_end_to_end_rust_mod_ctx_observer_watched_queries_and_chained_trigger() {
+    let (shared_rust_dylib, _) = ensure_guest_mods_built();
+    let rust_dylib = create_shadow_copy(&shared_rust_dylib, "ctx_observer_isolated_rust");
+
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.register_mod_component::<Position>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
+    app.register_mod_component::<Velocity>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
+    app.register_mod_entity_event::<CtxObsEvent>().unwrap();
+    app.register_mod_event::<CtxObsChainedEvent>().unwrap();
+    app.register_mod_component::<CtxObsTag>(ComponentOptions::new().with_raw_insert())
+        .unwrap();
+    app.register_mod_component::<CtxObsValue>(ComponentOptions::new().with_raw_insert())
+        .unwrap();
+    app.register_mod_resource::<CtxObsTelemetry>().unwrap();
+    app.insert_resource(CtxObsTelemetry::default());
+
+    let strict_opts = LoadOptions {
+        strict: true,
+        shadow_copy: false,
+        ..Default::default()
+    };
+    let rust_mod_id = app
+        .load_mod_with(&rust_dylib, strict_opts)
+        .expect("Strict load of asymmetric_rust_mod must succeed");
+
+    // Spawn entities AFTER mod load to confirm dynamic query archetype updates on trigger.
+    let tagged = app
+        .world_mut()
+        .spawn((CtxObsTag, CtxObsValue { score: 10 }))
+        .id();
+    let untagged = app.world_mut().spawn(CtxObsValue { score: 100 }).id();
+
+    // Trigger on untagged entity: `with_watched_handle(CtxObsTag)` skips without mutating.
+    app.world_mut().trigger(CtxObsEvent {
+        entity: bamabi_host::TargetEntity::from_entity(untagged),
+        delta: 5,
+        _pad0: 0,
+    });
+    app.update();
+    assert_eq!(app.world().get::<CtxObsValue>(untagged).unwrap().score, 100);
+    assert_eq!(
+        *app.world().resource::<CtxObsTelemetry>(),
+        CtxObsTelemetry::default()
+    );
+
+    // Trigger on tagged entity: fires `rust_ctx_observer` once and chains `CtxObsChainedEvent` synchronously.
+    app.world_mut().trigger(CtxObsEvent {
+        entity: bamabi_host::TargetEntity::from_entity(tagged),
+        delta: 7,
+        _pad0: 0,
+    });
+    app.update();
+
+    assert_eq!(app.world().get::<CtxObsValue>(tagged).unwrap().score, 17);
+    assert_eq!(app.world().get::<CtxObsValue>(untagged).unwrap().score, 100);
+    assert_eq!(
+        *app.world().resource::<CtxObsTelemetry>(),
+        CtxObsTelemetry {
+            hits: 1,
+            chained_hits: 1,
+            total_score: 17 + 100 + 14,
+            _pad0: 0,
+            last_target: tagged.to_bits(),
+        }
+    );
+
+    app.unload_mod(rust_mod_id).expect("Unload Rust mod");
+    remove_shadow_copy_and_parent(&rust_dylib);
+}

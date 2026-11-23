@@ -161,8 +161,7 @@ unsafe fn resolve_vtable_and_handle<'a, V: Copy + 'static>(
         if hdr.validate(core::mem::size_of::<V>(), hdr.uuid).is_err() {
             continue;
         }
-        let Ok(comp) = bamabi_guest::raw::resolve_component(host, None, Some(hdr.uuid))
-        else {
+        let Ok(comp) = bamabi_guest::raw::resolve_component(host, None, Some(hdr.uuid)) else {
             continue;
         };
         // SAFETY: `hdr.validate` confirmed `struct_size >= size_of::<V>()` and ABI compatibility;
@@ -468,7 +467,10 @@ fn setup(app: &mut GuestApp<'_>) -> FfiResult {
     // 6. Conditional Filter System (`Optional` + `Changed` + `Added` + `Resource` + `run_if`)
     // SAFETY: `PositionVTable` matches the `x, y, z: f32` VTable layout of `FilteredTransform`.
     let cond_tf_resolved = unsafe {
-        resolve_vtable_and_handle::<PositionVTable>(&host, &[c"bam.v0.testbed::FilteredTransform.vtable"])
+        resolve_vtable_and_handle::<PositionVTable>(
+            &host,
+            &[c"bam.v0.testbed::FilteredTransform.vtable"],
+        )
     };
     let cond_sensor = resolve_any_named(app, &[c"testbed::ChangeSensor"]);
     let cond_fresh = resolve_any_named(app, &[c"testbed::FreshSpawnTag"]);
@@ -482,8 +484,13 @@ fn setup(app: &mut GuestApp<'_>) -> FfiResult {
         Some(sensor_comp),
         Some(fresh_comp),
         Some(res_comp),
-    ) = (cond_tf_resolved, vel_resolved, cond_sensor, cond_fresh, cond_res)
-    {
+    ) = (
+        cond_tf_resolved,
+        vel_resolved,
+        cond_sensor,
+        cond_fresh,
+        cond_res,
+    ) {
         let status = app
             .system(c"rust_conditional_filter_system")
             .query(|q| {
@@ -594,12 +601,113 @@ fn setup(app: &mut GuestApp<'_>) -> FfiResult {
     }
 
     // 7. Fault Isolation Panicking System (`panic = "unwind"` -> `FfiResult::PANIC_CAUGHT`)
-    app.system(c"rust_panicking").build(|_ctx| {
+    let panic_status = app.system(c"rust_panicking").build(|_ctx| {
         if PANIC_TRIGGER.swap(false, Ordering::SeqCst) {
             panic!("Intentional cross-runtime panic in asymmetric_rust_mod");
         }
         FfiResult::OK
-    })
+    });
+    if panic_status.is_err() {
+        return panic_status;
+    }
+
+    // 8. Context-Aware `TypedObserverBuilder::build_with_ctx` E2E Observers (optional testbed schema)
+    #[repr(C)]
+    #[derive(Clone, Copy, AbiPod)]
+    struct CtxObsEventPayload {
+        _entity: FfiEntity,
+        delta: i32,
+        _pad0: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, AbiPod)]
+    struct CtxObsChainedPayload {
+        bonus: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, AbiPod)]
+    struct CtxObsValue {
+        score: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, AbiPod)]
+    struct CtxObsTelemetry {
+        hits: u32,
+        chained_hits: u32,
+        total_score: i32,
+        _pad0: u32,
+        last_target: u64,
+    }
+
+    if let (Some(obs_evt), Some(chain_evt), Some(obs_tag), Some(obs_val), Some(obs_res)) = (
+        resolve_any_named(app, &[c"testbed::CtxObsEvent"]),
+        resolve_any_named(app, &[c"testbed::CtxObsChainedEvent"]),
+        resolve_any_named(app, &[c"testbed::CtxObsTag"]),
+        resolve_any_named(app, &[c"testbed::CtxObsValue"]),
+        resolve_any_named(app, &[c"testbed::CtxObsTelemetry"]),
+    ) {
+        if let Err(err) = app
+            .observe_event_handle::<CtxObsEventPayload>("rust_ctx_observer", obs_evt)
+            .with_watched_handle(obs_tag)
+            .query(|q| q.write_handle(obs_val))
+            .resource_write_handle(obs_res)
+            .build_with_ctx(move |target, ev, ctx| {
+                let Some(val_mut) = ctx.get_pod_mut::<CtxObsValue>(0, 0, target) else {
+                    return FfiResult::INVALID_ENTITY;
+                };
+                val_mut.score += ev.delta;
+
+                let Some(telem) = ctx.resource_mut::<CtxObsTelemetry>(0) else {
+                    return FfiResult::INVALID_COMPONENT;
+                };
+                telem.hits += 1;
+                telem.last_target = target.0;
+
+                match ctx.commands().trigger_handle(
+                    chain_evt,
+                    FfiEntity::NULL,
+                    &CtxObsChainedPayload {
+                        bonus: ev.delta * 2,
+                    },
+                ) {
+                    Ok(()) => FfiResult::OK,
+                    Err(err) => err,
+                }
+            })
+        {
+            return err;
+        }
+
+        if let Err(err) = app
+            .observe_event_handle::<CtxObsChainedPayload>("rust_ctx_chained_observer", chain_evt)
+            .query(|q| q.read_handle(obs_val))
+            .resource_write_handle(obs_res)
+            .build_with_ctx(move |_target, ev, ctx| {
+                let mut sum = 0i32;
+                let iter = ctx.iter();
+                while let Some(chunk) = iter.next_chunk_view() {
+                    if let Some(scores) = chunk.column::<CtxObsValue>(0) {
+                        for s in scores {
+                            sum += s.score;
+                        }
+                    }
+                }
+                let Some(telem) = ctx.resource_mut::<CtxObsTelemetry>(0) else {
+                    return FfiResult::INVALID_COMPONENT;
+                };
+                telem.chained_hits += 1;
+                telem.total_score = sum + ev.bonus;
+                FfiResult::OK
+            })
+        {
+            return err;
+        }
+    }
+
+    FfiResult::OK
 }
 
 export_mod!(name: c"asymmetric_rust_mod", version: c"0.2.0", setup);
