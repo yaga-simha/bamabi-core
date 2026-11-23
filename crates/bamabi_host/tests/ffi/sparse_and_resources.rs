@@ -148,6 +148,7 @@ mod sparse_soundness_and_clone_semantics {
             "dyn_without_sparse",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![
                     BamTermDesc::write(pos_h),
                     BamTermDesc::without(sparse_tag_h),
@@ -326,6 +327,7 @@ mod sparse_soundness_and_clone_semantics {
             "dyn_sparse_rw",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::read(pos_h), BamTermDesc::write(shield_h)],
             }],
             transfer_pos_x_to_sparse_shield,
@@ -409,6 +411,7 @@ mod sparse_soundness_and_clone_semantics {
             "cond_mutate",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::write(pos_h)],
             }],
             conditional_mutate_pos,

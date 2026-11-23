@@ -12,7 +12,9 @@ use crate::loader::{ModHost, ModId};
 use crate::registry::{ModRegistry, RegistrySnapshot};
 use crate::schedule::ModSystemSet;
 use crate::sync_ptr::{GuestFnPtr, GuestUserData};
-use crate::system::access_builder::initialize_query_groups_in_world;
+use crate::system::access_builder::{
+    initialize_query_groups_in_world, initialize_query_groups_in_world_with_base_idx,
+};
 use crate::system::error_policy::{
     ActiveGuestFaultGuard, GuestSystemRunMetrics, ModBudgetRuntime, ModErrorPolicy,
     ModErrorPolicyConfig, ModQuarantine, ModSystemError, ModSystemFaulted, SystemInitError,
@@ -563,6 +565,12 @@ pub unsafe extern "C" fn host_sys_res_mut_ptr(
     }
 }
 
+struct RunIfCtxState {
+    callback: GuestFnPtr<BamSystemFn>,
+    query_group: CachedQueryGroup,
+    user_data: GuestUserData,
+}
+
 /// Host-side Bevy [`System`] wrapping a unified ABI v0.2 [`BamSystemFn`] callback.
 pub struct GuestSystem {
     name: Arc<str>,
@@ -578,6 +586,7 @@ pub struct GuestSystem {
     callback: GuestFnPtr<BamSystemFn>,
     user_data: GuestUserData,
     run_if: Option<(GuestFnPtr<BamRunIfFn>, GuestUserData)>,
+    run_if_ctx: Option<RunIfCtxState>,
 
     mod_id: Option<ModId>,
     mod_namespace: Option<Arc<str>>,
@@ -638,6 +647,7 @@ impl GuestSystem {
             callback: GuestFnPtr(callback),
             user_data: GuestUserData::new(user_data),
             run_if: None,
+            run_if_ctx: None,
             mod_id: None,
             mod_namespace: None,
             mod_generation: 0,
@@ -724,6 +734,16 @@ impl GuestSystem {
         let mut missing = Vec::new();
         for group in &self.query_groups {
             for term in &group.spec.terms {
+                if snap.get_by_handle(term.component).is_none() {
+                    let label = format!("BamComponent({})", term.component.0);
+                    if !missing.contains(&label) {
+                        missing.push(label);
+                    }
+                }
+            }
+        }
+        if let Some(ref cond) = self.run_if_ctx {
+            for term in &cond.query_group.spec.terms {
                 if snap.get_by_handle(term.component).is_none() {
                     let label = format!("BamComponent({})", term.component.0);
                     if !missing.contains(&label) {
@@ -1015,6 +1035,37 @@ impl GuestSystem {
         self.run_if.map(|(GuestFnPtr(cb), ud)| (cb, ud.as_ptr()))
     }
 
+    /// Configures an optional ECS-aware C-ABI `run_if_ctx` predicate evaluated before each run.
+    #[inline]
+    pub fn set_run_if_ctx(
+        &mut self,
+        run_if_ctx: Option<(BamSystemFn, BamQuerySpecOwned, *mut c_void)>,
+    ) {
+        self.run_if_ctx = run_if_ctx.map(|(cb, spec, ud)| RunIfCtxState {
+            callback: GuestFnPtr(cb),
+            query_group: CachedQueryGroup::new(spec),
+            user_data: GuestUserData::new(ud),
+        });
+    }
+
+    /// Fluent builder method to attach an optional ECS-aware C-ABI `run_if_ctx` predicate.
+    #[inline]
+    pub fn with_run_if_ctx(
+        mut self,
+        run_if_ctx: Option<(BamSystemFn, BamQuerySpecOwned, *mut c_void)>,
+    ) -> Self {
+        self.set_run_if_ctx(run_if_ctx);
+        self
+    }
+
+    /// Returns the configured `run_if_ctx` callback, query spec, and user-data pointer, if any.
+    #[inline]
+    pub fn run_if_ctx(&self) -> Option<(BamSystemFn, &BamQuerySpecOwned, *mut c_void)> {
+        self.run_if_ctx
+            .as_ref()
+            .map(|st| (st.callback.0, &st.query_group.spec, st.user_data.as_ptr()))
+    }
+
     fn record_fault_and_apply_policy(
         &mut self,
         status: FfiResult,
@@ -1184,8 +1235,37 @@ impl System for GuestSystem {
                 group.owner_system_key = None;
             }
         }
+        if let Some(ref mut cond_state) = self.run_if_ctx {
+            if let Some(ns) = self.mod_namespace.as_ref() {
+                cond_state
+                    .query_group
+                    .set_system_identity(Some(Arc::clone(ns)), Arc::clone(&self.name));
+            } else {
+                cond_state.query_group.owner_system_key = None;
+            }
+        }
 
-        match initialize_query_groups_in_world(world, &self.snapshot, &mut self.query_groups) {
+        let init_res =
+            initialize_query_groups_in_world(world, &self.snapshot, &mut self.query_groups)
+                .and_then(|mut access_set| {
+                    if let Some(ref mut cond_state) = self.run_if_ctx {
+                        for (t_idx, term) in cond_state.query_group.spec.terms.iter().enumerate() {
+                            if term.mode.is_mutable() {
+                                return Err(SystemInitError::InvalidMode { index: t_idx });
+                            }
+                        }
+                        let cond_access = initialize_query_groups_in_world_with_base_idx(
+                            world,
+                            &self.snapshot,
+                            core::slice::from_mut(&mut cond_state.query_group),
+                            usize::MAX,
+                        )?;
+                        access_set.extend(cond_access);
+                    }
+                    Ok(access_set)
+                });
+
+        match init_res {
             Ok(mut access_set) => {
                 if let Some(budget_id) = world.components().component_id::<ModBudgetRuntime>() {
                     access_set.add_resource_read(budget_id);
@@ -1208,6 +1288,9 @@ impl System for GuestSystem {
                 let cell = world.as_unsafe_world_cell();
                 for group in &mut self.query_groups {
                     group.update_archetypes(cell);
+                }
+                if let Some(ref mut cond_state) = self.run_if_ctx {
+                    cond_state.query_group.update_archetypes(cell);
                 }
                 self.access.clone()
             }
@@ -1299,6 +1382,112 @@ impl System for GuestSystem {
             // SAFETY: `cond_fn` is a foreign `extern "C"` predicate belonging to an active loaded mod.
             let flag = unsafe { cond_fn(cond_ud.as_ptr()) };
             if !flag.get() {
+                return Ok(());
+            }
+        }
+
+        if let Some(ref mut cond_ctx) = self.run_if_ctx {
+            let current_tick = world.change_tick();
+            let last_run = self.last_run;
+            cond_ctx.query_group.update_archetypes(world);
+            // SAFETY: Scheduler verified access via `FilteredAccessSet`; no intra-system conflict exists.
+            let storages = unsafe { world.storages() };
+            let archetypes = world.archetypes();
+
+            let has_terms = !cond_ctx.query_group.spec.terms.is_empty();
+            let mut cond_iter = if has_terms {
+                Some(
+                    if cond_ctx.query_group.is_dense {
+                        HostIter::new_dense(
+                            &storages.tables,
+                            &cond_ctx.query_group.matched_tables,
+                            &cond_ctx.query_group.plan,
+                            last_run,
+                            current_tick,
+                        )
+                    } else {
+                        HostIter::new_archetypal(
+                            &storages.tables,
+                            archetypes,
+                            &storages.sparse_sets,
+                            &cond_ctx.query_group.matched_archetypes,
+                            &cond_ctx.query_group.plan,
+                            &mut cond_ctx.query_group.sparse_scratch,
+                            last_run,
+                            current_tick,
+                        )
+                    }
+                    .with_world(world)
+                    .with_msg_cursors(&mut cond_ctx.query_group.msg_cursors),
+                )
+            } else {
+                None
+            };
+
+            let mut iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES] =
+                [core::ptr::null_mut(); MAX_SYSTEM_QUERIES];
+            let mut query_views: [Option<RandomQueryView<'_>>; MAX_SYSTEM_QUERIES] =
+                [None; MAX_SYSTEM_QUERIES];
+            let cond_query_count = if let Some(ref mut it) = cond_iter {
+                iter_ptrs[0] = it.as_ffi_ptr();
+                query_views[0] = Some(RandomQueryView {
+                    plan: &cond_ctx.query_group.plan,
+                    is_dense: cond_ctx.query_group.is_dense,
+                    matched_tables: &cond_ctx.query_group.matched_tables,
+                    matched_archetypes: &cond_ctx.query_group.matched_archetypes,
+                    has_query_state: cond_ctx.query_group.query_state.is_some(),
+                });
+                1
+            } else {
+                0
+            };
+
+            let (cond_res, reported_fault) = {
+                let err_buf = core::mem::take(&mut self.last_error_buf);
+                let mut sys_ctx = HostSystemCtx::new(
+                    Arc::clone(&self.snapshot),
+                    self.mod_namespace.clone(),
+                    err_buf,
+                    iter_ptrs,
+                    cond_query_count,
+                    core::ptr::null_mut(),
+                )
+                .with_world_and_queries(world, query_views, last_run, current_tick);
+                let host_ctx_ptr = sys_ctx.host_ctx_ffi_ptr();
+                let sys_ctx_ptr = sys_ctx.as_ffi_ptr();
+                let GuestFnPtr(cond_fn) = cond_ctx.callback;
+                let fault_guard = ActiveGuestFaultGuard::enter(
+                    host_ctx_ptr,
+                    self.mod_id,
+                    self.mod_namespace.clone(),
+                    self.mod_generation,
+                    Arc::clone(&self.name),
+                );
+                // SAFETY: Calling foreign `extern "C"` `run_if_ctx` predicate with stack-scoped
+                // read-only `HostSystemCtx` (`commands_ptr = null`) and optional `HostIter`.
+                let res = unsafe { cond_fn(sys_ctx_ptr, cond_ctx.user_data.as_ptr()) };
+                let reported = fault_guard.finish();
+                self.last_error_buf = sys_ctx.reclaim_error_buffer();
+                (res, reported)
+            };
+            drop(cond_iter);
+
+            if cond_res == FfiResult::PANIC_CAUGHT || reported_fault.is_some() {
+                let effective_status = if cond_res == FfiResult::PANIC_CAUGHT || cond_res.is_err() {
+                    cond_res
+                } else {
+                    FfiResult::INTERNAL_ERROR
+                };
+                let last_error = reported_fault.filter(|s| !s.is_empty()).or_else(|| {
+                    (!self.last_error_buf.is_empty()).then(|| self.last_error_buf.clone())
+                });
+                return self.record_fault_and_apply_policy(
+                    effective_status,
+                    effective_status == FfiResult::PANIC_CAUGHT,
+                    last_error,
+                );
+            }
+            if !cond_res.is_ok() {
                 return Ok(());
             }
         }
@@ -1663,37 +1852,28 @@ fn table_skipped_by_summary_tick(
         let mut saw_summary_skip = false;
         let mut has_active_clause = false;
         for clause in &group.terms {
-            match clause.mode {
-                AccessMode::FILTER_ONLY => {
-                    if table.has_column(clause.component_id) {
-                        trivially_satisfied = true;
-                        break;
-                    }
-                }
-                AccessMode::WITHOUT => {
-                    if !table.has_column(clause.component_id) {
-                        trivially_satisfied = true;
-                        break;
-                    }
-                }
-                AccessMode::CHANGED | AccessMode::ADDED => {
-                    if clause.is_sparse {
-                        has_active_clause = true;
-                        continue;
-                    }
-                    let Some(col) = table.get_column(clause.component_id) else {
-                        continue;
-                    };
-                    if clause.mode == AccessMode::CHANGED
-                        && let Some(summary) = col.get_summary_tick()
-                        && !summary.get().is_newer_than(last_run, this_run)
-                    {
-                        saw_summary_skip = true;
-                        continue;
-                    }
+            if clause.has_tick_filter() {
+                if clause.is_sparse {
                     has_active_clause = true;
+                    continue;
                 }
-                _ => {}
+                let Some(col) = table.get_column(clause.component_id) else {
+                    continue;
+                };
+                if !clause.has_added_filter()
+                    && let Some(summary) = col.get_summary_tick()
+                    && !summary.get().is_newer_than(last_run, this_run)
+                {
+                    saw_summary_skip = true;
+                    continue;
+                }
+                has_active_clause = true;
+            } else if clause.mode == AccessMode::FILTER_ONLY
+                && table.has_column(clause.component_id)
+                || clause.mode == AccessMode::WITHOUT && !table.has_column(clause.component_id)
+            {
+                trivially_satisfied = true;
+                break;
             }
         }
         if !trivially_satisfied && saw_summary_skip && !has_active_clause {

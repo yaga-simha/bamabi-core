@@ -299,6 +299,7 @@ fn rejects_query_with_too_many_terms() {
         "too_many_direct",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: raw_terms,
         }],
         noop_cb,
@@ -346,6 +347,7 @@ fn rejects_query_with_invalid_mode() {
         "bad_mode_direct",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: raw_terms.to_vec(),
         }],
         noop_cb,
@@ -370,6 +372,7 @@ fn rejects_query_with_unknown_component() {
         "unknown_comp_sys",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::read(ghost_handle)],
         }],
         noop_cb,
@@ -409,6 +412,7 @@ fn rejects_query_with_kind_mismatch() {
         "comp_as_res_sys",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::resource_read(pair_h)],
         }],
         noop_cb,
@@ -421,6 +425,7 @@ fn rejects_query_with_kind_mismatch() {
         "res_as_comp_sys",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::read(res_h)],
         }],
         noop_cb,
@@ -493,6 +498,7 @@ fn rejects_query_with_self_conflict() {
         "self_conflict_direct",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: raw_terms.to_vec(),
         }],
         noop_cb,

@@ -32,19 +32,21 @@ pub use ffi::commands::{
     host_cmd_remove, host_cmd_spawn, host_cmd_spawn_empty, host_cmd_trigger,
 };
 pub use ffi::commands_ext::{
-    host_cmd_despawn_all, host_cmd_insert_if_new, host_cmd_spawn_batch, host_cmd_spawn_persistent,
+    host_cmd_clone_entity, host_cmd_despawn_all, host_cmd_insert_if_new, host_cmd_insert_resource,
+    host_cmd_remove_resource, host_cmd_spawn_batch, host_cmd_spawn_persistent,
 };
 pub use ffi::hierarchy_ext::{
     CascadeHierarchyCache, ensure_children_registered_in_world, host_sys_entity_children,
 };
 pub use ffi::host_api::HOST_API;
 pub use ffi::iter::{
-    HostIter, QueryPlan, QueryTermMeta, SparseRowScratch, TickFilterTerm, host_iter_column_info,
-    host_iter_column_mutable, host_iter_column_mutable_untracked, host_iter_column_readonly,
-    host_iter_column_rows_mutable, host_iter_column_rows_readonly, host_iter_entities,
-    host_iter_mark_changed_range, host_iter_next_chunk, host_iter_reset, host_msg_read_batch,
-    host_msg_send, host_msg_write_batch, host_par_for_each_chunk, host_res_mut_ptr, host_res_ptr,
-    host_res_ticks,
+    HostIter, OrFilterClause, OrFilterGroup, QueryPlan, QueryTermMeta, SparseRowScratch,
+    TickFilterTerm, host_iter_column_info, host_iter_column_mutable,
+    host_iter_column_mutable_untracked, host_iter_column_readonly, host_iter_column_rows_mutable,
+    host_iter_column_rows_readonly, host_iter_column_ticks, host_iter_entities,
+    host_iter_mark_changed_range, host_iter_next_chunk, host_iter_next_chunk_batch,
+    host_iter_reset, host_msg_read_batch, host_msg_send, host_msg_write_batch,
+    host_par_for_each_chunk, host_res_mut_ptr, host_res_ptr, host_res_ticks,
 };
 pub use ffi::iter_ext::host_iter_read_removed;
 pub use ffi::observers_ext::{host_cmd_observe, host_cmd_trigger_ex};

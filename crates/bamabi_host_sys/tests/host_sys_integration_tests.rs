@@ -267,6 +267,7 @@ fn handle_headers_reject_mismatched_and_poisoned_handles() {
 
     let query = BamQuerySpecOwned {
         flags: 0,
+        param_set_group: 0,
         terms: vec![BamTermDesc {
             component: BamComponent::from_raw(1),
             mode: AccessMode::READ,
@@ -358,6 +359,8 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
             flags: 0,
             terms: &bad_term,
             term_count: 1,
+            param_set_group: 0,
+            reserved0: 0,
         };
         unsafe extern "C" fn noop_cb(_: *mut BamSystemCtx, _: *mut c_void) -> FfiResult {
             FfiResult::OK
@@ -507,6 +510,7 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
         "changed_vel_reader",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc {
                 component: vel_comp,
                 mode: AccessMode::CHANGED,
@@ -532,6 +536,7 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
         "writer_sys",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![
                 BamTermDesc {
                     component: vel_comp,
@@ -1118,7 +1123,7 @@ fn extended_host_api_slots_asset_scene_backends_and_wire_bridges() {
         StrView,
     };
 
-    // 1. All 68 slots of `HOST_API` pass `validate_for_guest`.
+    // 1. All 73 slots of `HOST_API` pass `validate_for_guest`.
     assert_eq!(HOST_API.validate_for_guest(ABI_VERSION), FfiResult::OK);
     assert!(HOST_API.cmd_spawn_persistent.is_some());
     assert!(HOST_API.cmd_spawn_batch.is_some());

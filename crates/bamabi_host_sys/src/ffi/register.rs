@@ -21,11 +21,12 @@ use crate::sync_ptr::{GuestFnPtr, GuestUserData};
 use crate::system::access_builder::validate_system_queries_against_snapshot;
 use crate::system::{BamQuerySpecOwned, GuestSystem};
 use bamabi_sys::{
-    BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID,
-    BAM_REQUIRED_KNOWN_FLAGS, BamComponent, BamEventKind, BamHostCtx, BamLoadCtx, BamObserverDesc,
-    BamObserverFn, BamObserverMutFn, BamQueryDesc, BamRequiredComponent, BamRequiredInitFn,
-    BamSystem, BamSystemDesc, BamTermDesc, ComponentCloneFn, ComponentDesc, ComponentHookFn,
-    ComponentUuid, FfiEntity, FfiResult, read_descriptor,
+    BAM_QUERY_FLAG_PARAM_SET, BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN,
+    BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BAM_REQUIRED_KNOWN_FLAGS, BamComponent, BamEventKind,
+    BamHostCtx, BamLoadCtx, BamObserverDesc, BamObserverFn, BamObserverMutFn, BamQueryDesc,
+    BamRequiredComponent, BamRequiredInitFn, BamSystem, BamSystemDesc, BamTermDesc,
+    ComponentCloneFn, ComponentDesc, ComponentHookFn, ComponentUuid, FfiEntity, FfiResult,
+    read_descriptor,
 };
 use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, ComponentId, StorageType};
 use bevy_ecs::entity::{ComponentCloneCtx, Entity, SourceComponent};
@@ -1948,6 +1949,19 @@ pub(crate) unsafe fn register_system_inner(
                 return Err(q_val);
             }
 
+            if (q_desc.flags & BAM_QUERY_FLAG_PARAM_SET) != 0 && q_desc.param_set_group == 0 {
+                ctx.host_ctx.set_last_error(format!(
+                    "BamQueryDesc[{q_idx}] sets BAM_QUERY_FLAG_PARAM_SET with param_set_group == 0"
+                ));
+                return Err(FfiResult::INVALID_ARGUMENT);
+            }
+            let param_set_group =
+                if (q_desc.flags & BAM_QUERY_FLAG_PARAM_SET) != 0 || q_desc.param_set_group != 0 {
+                    q_desc.param_set_group
+                } else {
+                    0
+                };
+
             let mut terms = Vec::with_capacity(q_desc.term_count);
             for t_idx in 0..q_desc.term_count {
                 // SAFETY: `q_desc.validate()` verified `!q_desc.terms.is_null()` when `term_count > 0`.
@@ -1957,6 +1971,7 @@ pub(crate) unsafe fn register_system_inner(
             }
             query_specs.push(BamQuerySpecOwned {
                 flags: q_desc.flags,
+                param_set_group,
                 terms,
             });
         }
@@ -1968,6 +1983,73 @@ pub(crate) unsafe fn register_system_inner(
         ctx.host_ctx.set_last_error(msg);
         return Err(status);
     }
+
+    if desc.run_if_ctx.is_none() && !desc.run_if_query.is_null() {
+        ctx.host_ctx
+            .set_last_error("BamSystemDesc `run_if_query` requires non-null `run_if_ctx`");
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+
+    let run_if_ctx = if let Some(run_if_ctx_fn) = desc.run_if_ctx {
+        let cond_spec = if !desc.run_if_query.is_null() {
+            // SAFETY: `desc.run_if_query` is non-null and caller guarantees readable `BamQueryDesc`.
+            let q_desc = match unsafe {
+                read_descriptor::<BamQueryDesc>(desc.run_if_query.cast::<c_void>())
+            } {
+                Ok(q) => q,
+                Err(err) => {
+                    ctx.host_ctx
+                        .set_last_error(format!("invalid BamSystemDesc `run_if_query` ({err})"));
+                    return Err(err);
+                }
+            };
+            let q_val = q_desc.validate();
+            if q_val.is_err() {
+                ctx.host_ctx.set_last_error(format!(
+                    "BamSystemDesc `run_if_query` validation failed ({q_val})"
+                ));
+                return Err(q_val);
+            }
+            if (q_desc.flags & BAM_QUERY_FLAG_PARAM_SET) != 0 || q_desc.param_set_group != 0 {
+                ctx.host_ctx.set_last_error(
+                    "BamSystemDesc `run_if_query` cannot belong to a param_set_group",
+                );
+                return Err(FfiResult::INVALID_ARGUMENT);
+            }
+            let mut terms = Vec::with_capacity(q_desc.term_count);
+            for t_idx in 0..q_desc.term_count {
+                // SAFETY: `q_desc.validate()` verified `!q_desc.terms.is_null()` when `term_count > 0`.
+                let term: BamTermDesc =
+                    unsafe { core::ptr::read_unaligned(q_desc.terms.add(t_idx)) };
+                if term.mode.is_mutable() {
+                    ctx.host_ctx.set_last_error(format!(
+                        "BamSystemDesc `run_if_query` term {t_idx} must be read-only (got {:?})",
+                        term.mode
+                    ));
+                    return Err(FfiResult::PERMISSION_DENIED);
+                }
+                terms.push(term);
+            }
+            let spec = BamQuerySpecOwned {
+                flags: q_desc.flags,
+                param_set_group: 0,
+                terms,
+            };
+            if let Err((status, msg)) = validate_system_queries_against_snapshot(
+                ctx.registry.snapshot(),
+                core::slice::from_ref(&spec),
+            ) {
+                ctx.host_ctx.set_last_error(msg);
+                return Err(status);
+            }
+            spec
+        } else {
+            BamQuerySpecOwned::default()
+        };
+        Some((run_if_ctx_fn, cond_spec, desc.run_if_ctx_user_data))
+    } else {
+        None
+    };
 
     // SAFETY: `desc.validate()` verified `after` and `before` non-null when their counts > 0.
     let after_systems = match unsafe { parse_ordering_targets(desc.after, desc.after_count) } {
@@ -2038,6 +2120,7 @@ pub(crate) unsafe fn register_system_inner(
     .with_ambiguous_with(ambiguous_with)
     .with_ambiguous_with_all(desc.is_ambiguous_with_all())
     .with_run_if(run_if)
+    .with_run_if_ctx(run_if_ctx)
     .with_is_active(Arc::clone(&ctx.is_active));
 
     if let Some(id) = ctx.mod_id {

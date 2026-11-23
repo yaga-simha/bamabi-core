@@ -672,6 +672,7 @@ fn bench_iter_count(cfg: &BenchConfig) {
                 component: BamComponent::from_raw(1),
                 component_id: pos_cid,
                 mode,
+                flags: 0,
                 uuid: Position::UUID,
                 size: core::mem::size_of::<Position>(),
                 align: core::mem::align_of::<Position>(),

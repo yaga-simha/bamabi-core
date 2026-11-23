@@ -1,4 +1,4 @@
-//! Static 68-slot `HOST_API: BamHostApi` function table passed to `bamabi_init`.
+//! Static 73-slot `HOST_API: BamHostApi` function table passed to `bamabi_init`.
 
 use crate::ffi::assets_scene::{
     host_asset_get_load_state, host_asset_load, host_asset_release, host_cmd_spawn_scene,
@@ -8,15 +8,16 @@ use crate::ffi::commands::{
     host_cmd_spawn_empty, host_cmd_trigger,
 };
 use crate::ffi::commands_ext::{
-    host_cmd_despawn_all, host_cmd_insert_if_new, host_cmd_spawn_batch, host_cmd_spawn_persistent,
+    host_cmd_clone_entity, host_cmd_despawn_all, host_cmd_insert_if_new, host_cmd_insert_resource,
+    host_cmd_remove_resource, host_cmd_spawn_batch, host_cmd_spawn_persistent,
 };
 use crate::ffi::hierarchy_ext::host_sys_entity_children;
 use crate::ffi::iter::{
     host_iter_column_info, host_iter_column_mutable, host_iter_column_mutable_untracked,
     host_iter_column_readonly, host_iter_column_rows_mutable, host_iter_column_rows_readonly,
-    host_iter_entities, host_iter_mark_changed_range, host_iter_next_chunk, host_iter_reset,
-    host_msg_read_batch, host_msg_send, host_msg_write_batch, host_par_for_each_chunk,
-    host_res_mut_ptr, host_res_ptr, host_res_ticks,
+    host_iter_column_ticks, host_iter_entities, host_iter_mark_changed_range, host_iter_next_chunk,
+    host_iter_next_chunk_batch, host_iter_reset, host_msg_read_batch, host_msg_send,
+    host_msg_write_batch, host_par_for_each_chunk, host_res_mut_ptr, host_res_ptr, host_res_ticks,
 };
 use crate::ffi::iter_ext::host_iter_read_removed;
 use crate::ffi::observers_ext::{host_cmd_observe, host_cmd_trigger_ex};
@@ -40,7 +41,7 @@ use crate::system::{
 };
 use bamabi_sys::{ABI_VERSION, BamHostApi};
 
-/// Global immutable 68-slot C-ABI v0.3 host function table.
+/// Global immutable 73-slot C-ABI v0.3 host function table.
 pub static HOST_API: BamHostApi = BamHostApi {
     struct_size: core::mem::size_of::<BamHostApi>() as u32,
     abi_version: ABI_VERSION,
@@ -132,6 +133,11 @@ pub static HOST_API: BamHostApi = BamHostApi {
     cmd_insert_relation: Some(host_cmd_insert_relation),
     cmd_remove_relation: Some(host_cmd_remove_relation),
     migrate_component_column: Some(host_migrate_component_column),
+    iter_next_chunk_batch: Some(host_iter_next_chunk_batch),
+    iter_column_ticks: Some(host_iter_column_ticks),
+    cmd_clone_entity: Some(host_cmd_clone_entity),
+    cmd_insert_resource: Some(host_cmd_insert_resource),
+    cmd_remove_resource: Some(host_cmd_remove_resource),
 };
 
 const _: () = assert!(HOST_API.has_all_v0_2_slots());

@@ -11,23 +11,41 @@ use bevy_platform::collections::HashMap;
 use core::any::Any;
 use std::sync::{Arc, Mutex};
 
-/// Maximum number of concurrent/nested queries supported per [`crate::GuestSystem`] (`8`).
+/// Maximum number of concurrent/nested queries supported per [`crate::GuestSystem`] (`16`).
 pub const MAX_SYSTEM_QUERIES: usize = MAX_QUERIES_PER_SYSTEM;
 
 /// Owned representation of a validated [`bamabi_sys::BamQueryDesc`] clause.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct BamQuerySpecOwned {
-    /// Validated `BamQueryDesc::flags` (`0` in ABI `0.2`).
+    /// Validated `BamQueryDesc::flags` (`BAM_QUERY_FLAG_*`).
     pub flags: u32,
+    /// Mutually exclusive `ParamSet` group ID (`0` = independent query).
+    pub param_set_group: u32,
     /// Validated handle-based query/resource terms (`0..=MAX_TERMS_PER_QUERY`).
     pub terms: Vec<BamTermDesc>,
 }
 
 impl BamQuerySpecOwned {
-    /// Creates a query clause specification from `terms` with `flags = 0`.
+    /// Creates a query clause specification from `terms` with `flags = 0` and `param_set_group = 0`.
     #[inline]
     pub fn new(terms: Vec<BamTermDesc>) -> Self {
-        Self { flags: 0, terms }
+        Self {
+            flags: 0,
+            param_set_group: 0,
+            terms,
+        }
+    }
+
+    /// Assigns this query specification to a mutually exclusive `ParamSet` group (`0` = independent).
+    #[inline]
+    pub fn with_param_set_group(mut self, group: u32) -> Self {
+        self.param_set_group = group;
+        if group != 0 {
+            self.flags |= bamabi_sys::BAM_QUERY_FLAG_PARAM_SET;
+        } else {
+            self.flags &= !bamabi_sys::BAM_QUERY_FLAG_PARAM_SET;
+        }
+        self
     }
 }
 

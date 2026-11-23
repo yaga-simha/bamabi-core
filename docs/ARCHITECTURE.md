@@ -29,7 +29,7 @@ flowchart TD
     subgraph L2["Layer 2: bamabi-core (Headless bevy_ecs + bevy_app)"]
         HOST["bamabi_host (headless)"]
         WATCHER["bamabi_watcher"] --> HOST
-        HOST --> HOSTSYS["bamabi_host_sys (68/68 HOST_API)"]
+        HOST --> HOSTSYS["bamabi_host_sys (73/73 HOST_API)"]
     end
     subgraph L1["Layer 1: bamabi-tools (Zero Bevy)"]
         TRUST["bamabi_trust"] & MANIFEST["bamabi_manifest"]
@@ -51,20 +51,20 @@ flowchart TD
     HOSTSYS --> SYS
     MANIFEST --> SYS
     CLI --> SDKGEN & SYS
-    HOSTSYS <-->|"extern 'C' ABI 0.3.0 (68/68)"| GUESTSYS & FOREIGN
+    HOSTSYS <-->|"extern 'C' ABI 0.3.0 (73/73)"| GUESTSYS & FOREIGN
 ```
 
 | Layer / Repo | Crate | Policy | `bevy*` Deps | Responsibilities |
 |---|---|---|---|---|
-| **L0 `bamabi-wire`** | `bamabi_sys` | `#![no_std]`, 0 deps | None | Wire contract (`ABI 0.3.0`), 68-slot `BamHostApi`, `offsets` (`OFF64_*`/`OFF32_*`), `ComponentUuid` (SipHash-2-4-128), `FfiResult` (`CYCLE_DETECTED`), descriptors, `ModComponent`, `AbiPod`, `RawInsertable`. |
+| **L0 `bamabi-wire`** | `bamabi_sys` | `#![no_std]`, 0 deps | None | Wire contract (`ABI 0.3.0`), 73-slot `BamHostApi`, `offsets` (`OFF64_*`/`OFF32_*`), `ComponentUuid` (SipHash-2-4-128), `FfiResult` (`CYCLE_DETECTED`), descriptors, `ModComponent`, `AbiPod`, `RawInsertable`. |
 | **L0 `bamabi-wire`** | `bamabi_macros` | `#![forbid(unsafe_code)]` | None | `#[derive(ModComponent, AbiPod, GuestComponent)]`, zero-padding checks, hygienic VTables, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, `REQUIRED_COMPONENTS`, `#[guest_component(...)]`, `#[mod_component(..., guest)]`, `C_DECL`/`ZIG_DECL`. |
 | **L0 `bamabi-wire`** | `bamabi_sdk_gen` | `#![forbid(unsafe_code)]` | None | Generates `include/bamabi.h` (C99), `bamabi.hpp`, `bamabi.zig`, and component headers (`BAM_EXPORT`, `BAM_RESTRICT`, `BAM_HOST_API_OFFSET_*`). |
-| **L0 `bamabi-wire`** | `bamabi_guest_sys` | Guest `unsafe` | None | `GuestInstance`, `extern "C"` panic guards (`ReentrantCell`), all 68 `BamHostApi` `covers_slot` wrappers, validated slice/row/command/resource/migration wrappers. |
+| **L0 `bamabi-wire`** | `bamabi_guest_sys` | Guest `unsafe` | None | `GuestInstance`, `extern "C"` panic guards (`ReentrantCell`), all 73 `BamHostApi` `covers_slot` wrappers, validated slice/row/command/resource/migration wrappers. |
 | **L0 `bamabi-wire`** | `bamabi_guest` | `#![forbid(unsafe_code)]` | None | Safe Rust guest SDK (`GuestPlugin`, `GuestApp`, `#[derive(AbiPod, GuestComponent)]`, typed `query_typed`/`single_query`, 16-term `QueryTuple`, `Or<(T0..T7)>`, `ObserverBuilder::run_if`, `GuestTransaction`, `ScheduleSetBuilder`, `RelationDescBuilder`, `export_mod!`). |
 | **L1 `bamabi-tools`** | `bamabi_trust` | `#![forbid(unsafe_code)]` | None | Pure-Rust Ed25519 `SSHSIG`, CA certs, authority-scoped `SSHKRL` (`DEFAULT_KRL_SIGNER_PRINCIPAL`, `add_krl_signer_*`), `.bam_sig`, and hardened `.bampack` (`VerifiedBamPack::extract_to_dir`). |
 | **L1 `bamabi-tools`** | `bamabi_manifest` | `#![forbid(unsafe_code)]` | None | `mod.toml` parser, hardened ID/entry path & symlink validation (`validate_mod_id`, `validate_manifest_entry_path`), and Kahn SemVer DAG sorter. |
 | **L1 `bamabi-tools`** | `cargo-bam` | `#![forbid(unsafe_code)]` | None | Standalone CLI (`new`, `export-sdk`/`header`, `build`, `pack`, `watch`, `check-mods`, `doctor`, `keygen`, `sign`, `verify`). |
-| **L2 `bamabi-core`** | `bamabi_host_sys` | Host `unsafe` | `bevy_ecs`, `bevy_app`, `bevy_tasks`, opt. `bevy_reflect` | 68/68 `HOST_API`, sealed `ffi/` + `ffi/validation.rs` (panic-free `BamFieldReflectSlot` pool), `HostIter`, `CascadeHierarchyCache`, `CommandArena`, `ModRelationGraph`, `ModScheduleSetRegistry`, `BamSymbolTable`, `ModNamedObjects`, `GuestSystem`, observer `FallbackErrorHandler`/`ErrorContext::Observer`, `ModRegistry`, `ModHost`, `LoadedMod::registered_schedule_labels`, checked-arithmetic binary parsers, `DROP_PAGES`, `signature-verification` (non-`keygen`, zero `getrandom`) & opt-in `keygen` `bamabi_trust` parity. |
+| **L2 `bamabi-core`** | `bamabi_host_sys` | Host `unsafe` | `bevy_ecs`, `bevy_app`, `bevy_tasks`, opt. `bevy_reflect` | 73/73 `HOST_API`, sealed `ffi/` + `ffi/validation.rs` (panic-free `BamFieldReflectSlot` pool), `HostIter`, `CascadeHierarchyCache`, `CommandArena`, `ModRelationGraph`, `ModScheduleSetRegistry`, `BamSymbolTable`, `ModNamedObjects`, `GuestSystem`, observer `FallbackErrorHandler`/`ErrorContext::Observer`, `ModRegistry`, `ModHost`, `LoadedMod::registered_schedule_labels`, checked-arithmetic binary parsers, `DROP_PAGES`, `signature-verification` (non-`keygen`, zero `getrandom`) & opt-in `keygen` `bamabi_trust` parity. |
 | **L2 `bamabi-core`** | `bamabi_host` | `#![forbid(unsafe_code)]` | `bevy_ecs`, `bevy_app`, opt. `bevy_diagnostic` (**headless**) | Slim headless `AbiModPlugin`, `ModLifecycleFlush`, `ModBudgetPolicy`/`ModBudgetTelemetry`, `ModAppExt`, `ModWorldExt` (`ScheduleLeased` guards, skip-leased `unload_all_mods`, `despawn_all_where` incl. `Allow<Disabled>`, `ComponentOptions::with_summary_tick()`), `ModCommandsExt` (safe-point deferral), `ModDagErrorKind` + 13 accessors, `ModVisibleSets`, `ModUnloadHooks`. |
 | **L2 `bamabi-core`** | `bamabi_watcher` | `#![forbid(unsafe_code)]` | `bevy_app`, `bevy_ecs`, `notify-debouncer-full` | Debounced recursive filesystem watcher (`ModHotReloadPlugin`, `ModHotReloadWatcher`, `ModHotReloadHistory`) polling in `ModLifecycleFlush`, synchronous `with_sync_on_start`, transient `ScheduleLeased` retries, disconnect handling, and cascading SemVer DAG reloads. |
 | **L3 `bamabi`** | `bamabi_bridges` | `#![forbid(unsafe_code)]` | Opt-in (`default = []`) | 12 granular Bevy `0.20.1` bridges (`std_types`+`Disabled`, `state`, `asset`+overlay, `bsn`, `picking`+`Gamepad`, `camera-2d`, `light`/`PanOrbitCamera`/`SolariLighting`, `audio`, `ui`+real `feathers` BSN) + 4 presets (`preset-2d`/`3d`/`ui`/`full`). |
@@ -77,15 +77,15 @@ flowchart TD
 
 ## 3. Extensible Wire Contract, Polyglot SDK & `bevy_bql` Lowering
 
-### 3.1 `struct_size` Prefix Extensibility & 68/68 Live `BamHostApi`
+### 3.1 `struct_size` Prefix Extensibility & 73/73 Live `BamHostApi`
 Every extensible wire struct (`BamManifest`, `BamHostApi`, `BamSystemDesc`, `BamObserverDesc`, `BamTriggerDesc`, `BamQueryDesc`, `BamTermDesc`, `ComponentDesc`, `BamFieldDesc`, `BamRequiredComponent`, `BamRelationDesc`, `BamLayoutInfo`, `BamScheduleSetDesc`, `BamColumnInfo`, `VTableHeader`) obeys four rules:
-- **`struct_size: u32` at offset `0`:** Frozen `MIN_V0_2_SIZE` / `MIN_V0_3_SIZE` are verified via `core::mem::offset_of!`. `BamHostApi` has `MIN_V0_2_SIZE = 224` B (64-bit) / `116` B (32-bit) and `MIN_V0_3_SIZE = size_of = 552` B (64-bit) / `280` B (32-bit). All **68/68** slots (`27` core v0.2, `23` extended v0.2, and all `18` ABI `0.3.0` slots covering diagnostics/faults, UUID/layout lookup, relations, symbols/named objects, `iter_count`/`iter_up_cascade`/`par_for_each_chunk_readonly`, decoupled schedule sets, checkpoints/rollback, and `migrate_component_column`) are 100% live.
+- **`struct_size: u32` at offset `0`:** Frozen `MIN_V0_2_SIZE` / `MIN_V0_3_SIZE` are verified via `core::mem::offset_of!`. `BamHostApi` has `MIN_V0_2_SIZE = 224` B (64-bit) / `116` B (32-bit), `MIN_V0_3_SIZE = 552` B (64-bit) / `280` B (32-bit), and `size_of = 592` B (64-bit) / `300` B (32-bit). All **73/73** slots (`27` core v0.2, `23` extended v0.2, and all `23` ABI `0.3.0` slots covering diagnostics/faults, UUID/layout lookup, relations, symbols/named objects, `iter_count`/`iter_up_cascade`/`par_for_each_chunk_readonly`, decoupled schedule sets, checkpoints/rollback, `migrate_component_column`, plus Slots `68..=72`: `iter_next_chunk_batch`, `iter_column_ticks`, `cmd_clone_entity`, `cmd_insert_resource`, `cmd_remove_resource`) are 100% live.
 - **Prefix Compatibility:** `read_extensible_struct` / `read_descriptor` (and C99 `bam_host_api_copy_bounded`) check `struct_size >= MIN_V0_2_SIZE`, zero-extend omitted trailing fields, and ignore unknown trailing bytes.
-- **Zero Implicit Padding & Niche Callbacks:** `reserved0: u32 = 0`; unknown `flags` return `FfiResult::UNSUPPORTED`. All 68 slots use `Option<unsafe extern "C" fn(...)>`; strings use `StrView`.
+- **Zero Implicit Padding & Niche Callbacks:** `reserved0: u32 = 0`; unknown `flags` return `FfiResult::UNSUPPORTED`. All 73 slots use `Option<unsafe extern "C" fn(...)>`; strings use `StrView`.
 - **Handle Poisoning & Tree Borrows:** Opaque handles (`BamHostCtx`, `BamLoadCtx`, `BamSystemCtx`, `BamIter`, `BamCommands`) begin with `HandleHeader { magic, generation }`, poisoned with `POISONED_MAGIC` on drop for deterministic post-scope errors in debug/`strict-ffi-checks`. `HostContext::snapshot` uses `UnsafeCell` for strict Miri Tree Borrows soundness across FFI pointers.
 
 ### 3.2 Polyglot Headers & `bevy_bql` Lowering
-`bamabi_sys::offsets` exports target-native (`<FIELD>`), 64-bit (`OFF64_*`, `SIZE_64 = 552`), and 32-bit (`OFF32_*`, `SIZE_32 = 280`) offsets (`SLOT_COUNT = 68`). `bamabi_sdk_gen` emits `bamabi.h` ([`bamabi-wire/include/bamabi.h`](https://github.com/yaga-simha/bamabi-wire/blob/main/include/bamabi.h)), `bamabi.hpp`, and `bamabi.zig` with `BAM_EXPORT`, `BAM_RESTRICT` (`__restrict`/MSVC, `restrict`/C99, `"noalias"`/Zig), `BAM_HOST_API_OFFSET_*`, `BAM_STATIC_ASSERT` layout checks, and `bam_uuid_from_parts` (`SipHash-2-4-128`).
+`bamabi_sys::offsets` exports target-native (`<FIELD>`), 64-bit (`OFF64_*`, `SIZE_64 = 592`), and 32-bit (`OFF32_*`, `SIZE_32 = 300`) offsets (`SLOT_COUNT = 73`). `bamabi_sdk_gen` emits `bamabi.h` ([`bamabi-wire/include/bamabi.h`](https://github.com/yaga-simha/bamabi-wire/blob/main/include/bamabi.h)), `bamabi.hpp`, and `bamabi.zig` with `BAM_EXPORT`, `BAM_RESTRICT` (`__restrict`/MSVC, `restrict`/C99, `"noalias"`/Zig), `BAM_HOST_API_OFFSET_*`, `BAM_STATIC_ASSERT` layout checks, and `bam_uuid_from_parts` (`SipHash-2-4-128`).
 
 External DSL/query compilers (`bevy_bql` / `bql_jit`) lower directly onto ABI `0.3.0`:
 - **Offsets & Disjoint Vectorization:** `offsets` + `BAM_RESTRICT` yield non-aliasing SoA column pointers without hardcoded slot indices.
@@ -107,7 +107,7 @@ External DSL/query compilers (`bevy_bql` / `bql_jit`) lower directly onto ABI `0
 ## 5. Execution, Bevy `0.20.1` Scheduler & `CommandArena`
 
 `GuestSystem` implements Bevy's `System<In = (), Out = ()>` (`Send + Sync`):
-- **`FilteredAccessSet` & Parallelism:** `build_query_groups_in_world` compiles up to `8` queries (`<= 32` terms each: `Allow<T>`, `Has<T>`, `RemovedComponents<T>`, `Or<(T0..T7)>`), resources, and `Messages<M>` into Bevy's `FilteredAccessSet`. Writes to `IMMUTABLE` components return `PERMISSION_DENIED`; intra-system conflicts fail with `SystemInitError`; disjoint systems run in parallel on `ComputeTaskPool`.
+- **`FilteredAccessSet` & Parallelism:** `build_query_groups_in_world` compiles up to `16` queries (`MAX_QUERIES_PER_SYSTEM`, `<= 32` terms each: `Allow<T>`, `Has<T>`, `RemovedComponents<T>`, `Or<(T0..T7)>`, `BAM_TERM_FLAG_{CHANGED,ADDED}`, and `param_set_group` mutual exclusion), resources, and `Messages<M>` into Bevy's `FilteredAccessSet` (alongside read-only `run_if_ctx` queries). Writes to `IMMUTABLE` components return `PERMISSION_DENIED`; intra-system conflicts fail with `SystemInitError`; disjoint systems run in parallel on `ComputeTaskPool`.
 - **Schedules & Ordering:** Built-in schedules (`STARTUP`..`LAST`) and `ScheduleId::custom(id >= 1024)` map via `ModScheduleMap`. Systems join `ModSystemSet::Mod(id)` and `ModNamedSystemSet`, resolving intra-mod, cross-mod (`"other::step"`), and host sets (`app.register_mod_visible_set` -> `"host::<name>"`). `BAM_SYSTEM_FLAG_MAIN_THREAD` adds `SystemStateFlags::NON_SEND`; late `STARTUP` systems run once on commit when `StartupCompleted` exists.
 
 ```mermaid

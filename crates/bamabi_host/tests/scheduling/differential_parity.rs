@@ -409,7 +409,11 @@ fn differential_query_access_compatibility_matrix_parity() {
                     ));
                 }
             }
-            groups.push(BamQuerySpecOwned { flags: 0, terms });
+            groups.push(BamQuerySpecOwned {
+                flags: 0,
+                param_set_group: 0,
+                terms,
+            });
         }
 
         let mut dyn_sys = GuestSystem::new(
@@ -467,6 +471,7 @@ fn differential_query_access_compatibility_matrix_parity() {
         "disjoint_a",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![
                 BamTermDesc::write(schema.dense_vec),
                 BamTermDesc::filter_only(schema.sparse_badge),
@@ -480,6 +485,7 @@ fn differential_query_access_compatibility_matrix_parity() {
         "disjoint_b",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![
                 BamTermDesc::write(schema.dense_vec),
                 BamTermDesc::without(schema.sparse_badge),
@@ -874,6 +880,7 @@ fn differential_side_by_side_multiframe_execution_and_tick_wraparound_parity() {
         "dyn_s1",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![
                 BamTermDesc::write(schema_dyn.dense_vec),
                 BamTermDesc::read(schema_dyn.over_aligned),
@@ -889,6 +896,7 @@ fn differential_side_by_side_multiframe_execution_and_tick_wraparound_parity() {
         "dyn_s2",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![
                 BamTermDesc::write(schema_dyn.sparse_energy),
                 BamTermDesc::read(schema_dyn.dense_vec),
@@ -905,6 +913,7 @@ fn differential_side_by_side_multiframe_execution_and_tick_wraparound_parity() {
         vec![
             BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![
                     BamTermDesc::read(schema_dyn.over_aligned),
                     BamTermDesc::filter_only(schema_dyn.dense_zst),
@@ -912,6 +921,7 @@ fn differential_side_by_side_multiframe_execution_and_tick_wraparound_parity() {
             },
             BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![
                     BamTermDesc::write(schema_dyn.over_aligned),
                     BamTermDesc::without(schema_dyn.dense_zst),
@@ -927,6 +937,7 @@ fn differential_side_by_side_multiframe_execution_and_tick_wraparound_parity() {
         "dyn_s4",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![
                 BamTermDesc::read(schema_dyn.sparse_energy),
                 BamTermDesc::without(schema_dyn.dense_zst),
@@ -1078,6 +1089,7 @@ fn differential_side_by_side_multiframe_execution_and_tick_wraparound_parity() {
             "wrap_boundary_dyn",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::write(dv_h), BamTermDesc::read(oa_h)],
             }],
             dyn_stage1_dense_without_sparse_zst,
@@ -1659,6 +1671,7 @@ fn differential_multi_world_parallel_thread_scope_executor_and_drop_isolation() 
                     format!("w{w_idx}_dense_with_badge"),
                     vec![BamQuerySpecOwned {
                         flags: 0,
+                        param_set_group: 0,
                         terms: vec![
                             BamTermDesc::write(schema.dense_vec),
                             BamTermDesc::filter_only(schema.sparse_badge),
@@ -1672,6 +1685,7 @@ fn differential_multi_world_parallel_thread_scope_executor_and_drop_isolation() 
                     format!("w{w_idx}_dense_without_badge"),
                     vec![BamQuerySpecOwned {
                         flags: 0,
+                        param_set_group: 0,
                         terms: vec![
                             BamTermDesc::write(schema.dense_vec),
                             BamTermDesc::without(schema.sparse_badge),
@@ -1685,6 +1699,7 @@ fn differential_multi_world_parallel_thread_scope_executor_and_drop_isolation() 
                     format!("w{w_idx}_sparse_energy"),
                     vec![BamQuerySpecOwned {
                         flags: 0,
+                        param_set_group: 0,
                         terms: vec![BamTermDesc::write(schema.sparse_energy)],
                     }],
                     verify_worker_isolation_and_mutate,
@@ -1999,7 +2014,11 @@ mod proptest_differential_parity {
             terms.push(BamTermDesc::new(h, mode));
         }
 
-        BamQuerySpecOwned { flags: 0, terms }
+        BamQuerySpecOwned {
+            flags: 0,
+            param_set_group: 0,
+            terms,
+        }
     }
 
     fn spawn_entity_from_mask(world: &mut World, mask: u8, seed_val: i64) -> Entity {
@@ -2566,7 +2585,7 @@ mod proptest_differential_parity {
                                 }
                             })
                             .collect();
-                        BamQuerySpecOwned { flags: 0, terms }
+                        BamQuerySpecOwned { flags: 0, param_set_group: 0, terms }
                     })
                     .collect()
             };

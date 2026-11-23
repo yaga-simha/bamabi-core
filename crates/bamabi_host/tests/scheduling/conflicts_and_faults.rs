@@ -112,6 +112,7 @@ fn test_disjoint_systems_concurrency_execution() {
         "sys_concurrent_a",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(comp_a)],
         }],
         noop_callback,
@@ -122,6 +123,7 @@ fn test_disjoint_systems_concurrency_execution() {
         "sys_concurrent_b",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(comp_b)],
         }],
         noop_callback,
@@ -166,6 +168,7 @@ fn test_compatible_read_read_and_disjoint_systems() {
 
     let query_pos_read = vec![BamQuerySpecOwned {
         flags: 0,
+        param_set_group: 0,
         terms: vec![BamTermDesc::read(pos_h)],
     }];
     let mut sys_r1 = GuestSystem::new(
@@ -201,6 +204,7 @@ fn test_compatible_read_read_and_disjoint_systems() {
         "sys_pos",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(pos_h)],
         }],
         noop_callback,
@@ -211,6 +215,7 @@ fn test_compatible_read_read_and_disjoint_systems() {
         "sys_vel",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(vel_h)],
         }],
         noop_callback,
@@ -300,6 +305,7 @@ fn test_disjoint_systems_multi_threaded_parallel_execution() {
         "sys_a_kinematics",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(pos_h), BamTermDesc::read(vel_h)],
         }],
         sys_pos_kinematics,
@@ -310,6 +316,7 @@ fn test_disjoint_systems_multi_threaded_parallel_execution() {
         "sys_b_tagger",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(tag_h)],
         }],
         sys_tag_mutator,
@@ -382,6 +389,7 @@ fn test_write_write_and_write_read_conflict_detection() {
         "sys_w1",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(health_h)],
         }],
         noop_callback,
@@ -392,6 +400,7 @@ fn test_write_write_and_write_read_conflict_detection() {
         "sys_w2",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(health_h)],
         }],
         noop_callback,
@@ -425,6 +434,7 @@ fn test_write_write_and_write_read_conflict_detection() {
         "sys_w1_b",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(health_h)],
         }],
         noop_callback,
@@ -435,6 +445,7 @@ fn test_write_write_and_write_read_conflict_detection() {
         "sys_w2_b",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(health_h)],
         }],
         noop_callback,
@@ -449,6 +460,7 @@ fn test_write_write_and_write_read_conflict_detection() {
         "sys_writer",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(health_h)],
         }],
         noop_callback,
@@ -459,6 +471,7 @@ fn test_write_write_and_write_read_conflict_detection() {
         "sys_reader",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::read(health_h)],
         }],
         noop_callback,
@@ -504,6 +517,7 @@ fn test_native_and_dynamic_system_borrow_interaction() {
         "dyn_writer",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(pos_h)],
         }],
         noop_callback,
@@ -523,6 +537,7 @@ fn test_native_and_dynamic_system_borrow_interaction() {
         "dyn_reader",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::read(pos_h)],
         }],
         noop_callback,
@@ -606,6 +621,7 @@ fn test_intra_query_conflict_detection() {
             label,
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![
                     BamTermDesc::new(stat_h, modes[0]),
                     BamTermDesc::new(stat_h, modes[1]),
@@ -630,10 +646,12 @@ fn test_intra_query_conflict_detection() {
             vec![
                 BamQuerySpecOwned {
                     flags: 0,
+                    param_set_group: 0,
                     terms: vec![BamTermDesc::new(stat_h, modes[0])],
                 },
                 BamQuerySpecOwned {
                     flags: 0,
+                    param_set_group: 0,
                     terms: vec![BamTermDesc::new(stat_h, modes[1])],
                 },
             ],
@@ -679,6 +697,7 @@ fn test_unknown_component_disables_single_and_multi_query_systems() {
         "sys_unknown",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::read(ghost_h)],
         }],
         noop_callback,
@@ -692,6 +711,7 @@ fn test_unknown_component_disables_single_and_multi_query_systems() {
         "sys_partial_unknown",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::read(known_h), BamTermDesc::read(ghost_h)],
         }],
         noop_callback,
@@ -709,10 +729,12 @@ fn test_unknown_component_disables_single_and_multi_query_systems() {
         vec![
             BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::read(known_h)],
             },
             BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::read(ghost_h)],
             },
         ],
@@ -777,6 +799,7 @@ fn test_fault_isolation_panic_caught_and_system_disabled() {
         "faulting_system",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(pos_h)],
         }],
         stateful_test_callback,
@@ -837,6 +860,7 @@ fn test_fault_isolation_error_statuses() {
             format!("err_system_{}", status.0),
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::read(pos_h)],
             }],
             stateful_test_callback,
@@ -888,6 +912,7 @@ fn test_multi_system_fault_isolation_healthy_survives() {
         "sys_faulty",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(pos_h)],
         }],
         stateful_test_callback,
@@ -904,6 +929,7 @@ fn test_multi_system_fault_isolation_healthy_survives() {
         "sys_healthy",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(vel_h)],
         }],
         stateful_test_callback,

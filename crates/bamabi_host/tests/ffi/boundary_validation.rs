@@ -244,7 +244,7 @@ mod fuzz_boundaries {
 
             match mutation {
                 0 => {
-                    // `query_count > MAX_QUERIES_PER_SYSTEM` (`9..=usize::MAX`) with null `queries` -> `CAPACITY_EXCEEDED`
+                    // `query_count > MAX_QUERIES_PER_SYSTEM` (`17..=usize::MAX`) with null `queries` -> `CAPACITY_EXCEEDED`
                     let bad_q_count = match rng.range(4) {
                         0 => MAX_QUERIES_PER_SYSTEM + 1,
                         1 => MAX_QUERIES_PER_SYSTEM + 1 + rng.range(10_000),
@@ -310,17 +310,21 @@ mod fuzz_boundaries {
                     assert_eq!(res, FfiResult::INVALID_ARGUMENT, "step {step}");
                 }
                 5 => {
-                    // Unknown `BamTermDesc::flags != 0` or `BamQueryDesc::flags != 0` -> `UNSUPPORTED`
+                    // Unknown `BamTermDesc::flags` (`>= 1 << 2`) or `BamQueryDesc::flags` (`>= 1 << 1`) -> `UNSUPPORTED`
                     let term = BamTermDesc {
                         component: valid_handles[0],
                         mode: AccessMode::READ,
-                        flags: if rng.gen_bool() { 1 } else { 0 },
+                        flags: if rng.gen_bool() {
+                            1u16 << (2 + rng.range(14))
+                        } else {
+                            0
+                        },
                         or_group: 0,
                         reserved0: 0,
                     };
                     let mut q = BamQueryDesc::new(&term, 1);
                     if term.flags == 0 {
-                        q.flags = 1 << rng.range(32);
+                        q.flags = 1u32 << (1 + rng.range(31));
                     }
                     let desc = BamSystemDesc::new(
                         c"bad_q_flags".as_ptr(),
@@ -565,6 +569,8 @@ mod fuzz_boundaries {
                         } else {
                             MAX_TERMS_PER_QUERY + 1 + rng.range(500)
                         },
+                        param_set_group: 0,
+                        reserved0: 0,
                     };
                     let qs = [valid_q, bad_q];
                     let desc = BamSystemDesc::new(
@@ -587,6 +593,8 @@ mod fuzz_boundaries {
                         flags: 0,
                         terms: core::ptr::null(),
                         term_count: 1 + rng.range(MAX_TERMS_PER_QUERY),
+                        param_set_group: 0,
+                        reserved0: 0,
                     };
                     let qs = [valid_q, bad_q];
                     let desc = BamSystemDesc::new(
@@ -701,6 +709,8 @@ mod fuzz_boundaries {
                                 flags: 0,
                                 terms: &t0,
                                 term_count: 1,
+                                param_set_group: 0,
+                                reserved0: 0,
                             },
                             future_word_0: 0x1111,
                             future_word_1: 0x2222,
@@ -711,6 +721,8 @@ mod fuzz_boundaries {
                                 flags: 0,
                                 terms: &t1,
                                 term_count: 1,
+                                param_set_group: 0,
+                                reserved0: 0,
                             },
                             future_word_0: 0x3333,
                             future_word_1: 0x4444,
@@ -730,7 +742,7 @@ mod fuzz_boundaries {
                     );
                 }
                 _ => {
-                    // Valid `MAX_SYSTEM_QUERIES = 8` disjoint mutable queries + `RESOURCE_WRITE`!
+                    // Valid `MAX_SYSTEM_QUERIES = 16` disjoint mutable queries + `RESOURCE_WRITE`!
                     let terms: [BamTermDesc; MAX_SYSTEM_QUERIES] = core::array::from_fn(|i| {
                         if i == MAX_SYSTEM_QUERIES - 1 {
                             BamTermDesc::resource_write(res_h)
@@ -741,7 +753,7 @@ mod fuzz_boundaries {
                     let qs: [BamQueryDesc; MAX_SYSTEM_QUERIES] =
                         core::array::from_fn(|i| BamQueryDesc::new(&terms[i], 1));
                     let desc = BamSystemDesc::new(
-                        c"valid_8_queries".as_ptr(),
+                        c"valid_16_queries".as_ptr(),
                         qs.as_ptr(),
                         MAX_SYSTEM_QUERIES,
                         dummy_sys_cb,
@@ -1091,6 +1103,7 @@ mod fuzz_boundaries {
                 component: BamComponent::from_raw(1),
                 component_id: pos_id,
                 mode: AccessMode::READ,
+                flags: 0,
                 uuid: Position::UUID,
                 size: core::mem::size_of::<Position>(),
                 align: core::mem::align_of::<Position>(),
@@ -1103,6 +1116,7 @@ mod fuzz_boundaries {
                 component: BamComponent::from_raw(2),
                 component_id: vel_id,
                 mode: AccessMode::WRITE,
+                flags: 0,
                 uuid: Velocity::UUID,
                 size: core::mem::size_of::<Velocity>(),
                 align: core::mem::align_of::<Velocity>(),
@@ -1115,6 +1129,7 @@ mod fuzz_boundaries {
                 component: BamComponent::from_raw(3),
                 component_id: zst_id,
                 mode: AccessMode::WITHOUT,
+                flags: 0,
                 uuid: FuzzZst::UUID,
                 size: 0,
                 align: 1,
@@ -1137,6 +1152,7 @@ mod fuzz_boundaries {
                 component: BamComponent::from_raw(1),
                 component_id: pos_id,
                 mode: AccessMode::READ,
+                flags: 0,
                 uuid: Position::UUID,
                 size: core::mem::size_of::<Position>(),
                 align: core::mem::align_of::<Position>(),
@@ -1149,6 +1165,7 @@ mod fuzz_boundaries {
                 component: BamComponent::from_raw(4),
                 component_id: sparse_id,
                 mode: AccessMode::WRITE,
+                flags: 0,
                 uuid: FuzzSparseVal::UUID,
                 size: core::mem::size_of::<FuzzSparseVal>(),
                 align: core::mem::align_of::<FuzzSparseVal>(),
@@ -1161,6 +1178,7 @@ mod fuzz_boundaries {
                 component: BamComponent::from_raw(2),
                 component_id: vel_id,
                 mode: AccessMode::FILTER_ONLY,
+                flags: 0,
                 uuid: Velocity::UUID,
                 size: core::mem::size_of::<Velocity>(),
                 align: core::mem::align_of::<Velocity>(),
@@ -1759,7 +1777,10 @@ mod host_api_boundary_and_proc_address {
         {
             assert_eq!(core::mem::size_of::<TruncatedHostApi40>(), 40);
             assert_eq!(core::mem::align_of::<TruncatedHostApi40>(), 8);
-            assert_eq!(core::mem::size_of::<BamHostApi>(), 552);
+            assert_eq!(
+                core::mem::size_of::<BamHostApi>(),
+                bamabi_sys::offsets::SIZE_64
+            );
             assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
             assert_eq!(core::mem::align_of::<BamHostApi>(), 8);
         }
@@ -2181,7 +2202,11 @@ mod dynamic_descriptor_layouts {
         #[cfg(target_pointer_width = "64")]
         {
             assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
-            assert_eq!(core::mem::size_of::<BamHostApi>(), 552);
+            assert_eq!(BamHostApi::MIN_V0_3_SIZE, 552);
+            assert_eq!(
+                core::mem::size_of::<BamHostApi>(),
+                bamabi_sys::offsets::SIZE_64
+            );
             assert_eq!(core::mem::align_of::<BamHostApi>(), 8);
             assert_eq!(core::mem::offset_of!(BamHostApi, struct_size), 0);
             assert_eq!(core::mem::offset_of!(BamHostApi, abi_version), 4);
@@ -2267,6 +2292,26 @@ mod dynamic_descriptor_layouts {
             assert_eq!(
                 core::mem::offset_of!(BamHostApi, migrate_component_column),
                 544
+            );
+            assert_eq!(
+                core::mem::offset_of!(BamHostApi, iter_next_chunk_batch),
+                bamabi_sys::offsets::OFF64_ITER_NEXT_CHUNK_BATCH
+            );
+            assert_eq!(
+                core::mem::offset_of!(BamHostApi, iter_column_ticks),
+                bamabi_sys::offsets::OFF64_ITER_COLUMN_TICKS
+            );
+            assert_eq!(
+                core::mem::offset_of!(BamHostApi, cmd_clone_entity),
+                bamabi_sys::offsets::OFF64_CMD_CLONE_ENTITY
+            );
+            assert_eq!(
+                core::mem::offset_of!(BamHostApi, cmd_insert_resource),
+                bamabi_sys::offsets::OFF64_CMD_INSERT_RESOURCE
+            );
+            assert_eq!(
+                core::mem::offset_of!(BamHostApi, cmd_remove_resource),
+                bamabi_sys::offsets::OFF64_CMD_REMOVE_RESOURCE
             );
         }
     }
@@ -2451,7 +2496,7 @@ mod query_limits_and_placeholder_entities {
         );
         assert!(load_ctx.registered_systems.is_empty());
 
-        // 2. `query_count == MAX_QUERIES_PER_SYSTEM + 1` (`9`) -> `CAPACITY_EXCEEDED`
+        // 2. `query_count == MAX_QUERIES_PER_SYSTEM + 1` (`17`) -> `CAPACITY_EXCEEDED`
         let dummy_q = BamQueryDesc::empty();
         let over_queries = [dummy_q; MAX_QUERIES_PER_SYSTEM + 1];
         let multi_desc = BamSystemDesc::new(

@@ -27,8 +27,9 @@ use crate::registry::{MsgReadBatchFn, MsgSendFn, MsgWriteBatchFn};
 use crate::sync_ptr::{GuestFnPtr, GuestUserData};
 use bamabi_sys::{
     AccessMode, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
-    BAM_STORAGE_FLAG_SPARSE_SET, BamChangeTicks, BamChunkTaskFn, BamColumnInfo, BamComponent,
-    BamIter, ComponentUuid, FfiBool, FfiEntity, FfiResult, MAX_TERMS_PER_QUERY,
+    BAM_STORAGE_FLAG_SPARSE_SET, BAM_TERM_FLAG_ADDED, BAM_TERM_FLAG_CHANGED, BamChangeTicks,
+    BamChunkTaskFn, BamColumnInfo, BamComponent, BamIter, ComponentUuid, FfiBool, FfiEntity,
+    FfiResult, MAX_TERMS_PER_QUERY,
 };
 use bevy_ecs::archetype::{ArchetypeId, Archetypes};
 use bevy_ecs::change_detection::{AtomicTick, Tick};
@@ -47,6 +48,8 @@ use nonmax::NonMaxU32;
 const _: () = assert!(core::mem::size_of::<Entity>() == core::mem::size_of::<FfiEntity>());
 const _: () = assert!(core::mem::align_of::<Entity>() == core::mem::align_of::<FfiEntity>());
 const _: () = assert!(core::mem::size_of::<*mut u8>() == core::mem::size_of::<*const u8>());
+const _: () = assert!(core::mem::size_of::<UnsafeCell<Tick>>() == core::mem::size_of::<u32>());
+const _: () = assert!(core::mem::align_of::<UnsafeCell<Tick>>() == core::mem::align_of::<u32>());
 
 /// Pre-resolved metadata for one term inside a `BamQueryDesc` (`0..MAX_TERMS_PER_QUERY`).
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +60,8 @@ pub struct QueryTermMeta {
     pub component_id: ComponentId,
     /// Declared [`AccessMode`].
     pub mode: AccessMode,
+    /// Term bitflags (`BAM_TERM_FLAG_*`).
+    pub flags: u16,
     /// Registered 128-bit [`ComponentUuid`].
     pub uuid: ComponentUuid,
     /// Byte size (`size_of::<T>()`).
@@ -74,6 +79,24 @@ pub struct QueryTermMeta {
 }
 
 impl QueryTermMeta {
+    /// Returns `true` if [`BAM_TERM_FLAG_CHANGED`] is set or `mode == AccessMode::CHANGED`.
+    #[inline]
+    pub const fn has_changed_filter(&self) -> bool {
+        (self.flags & BAM_TERM_FLAG_CHANGED) != 0 || self.mode.0 == AccessMode::CHANGED.0
+    }
+
+    /// Returns `true` if [`BAM_TERM_FLAG_ADDED`] is set or `mode == AccessMode::ADDED`.
+    #[inline]
+    pub const fn has_added_filter(&self) -> bool {
+        (self.flags & BAM_TERM_FLAG_ADDED) != 0 || self.mode.0 == AccessMode::ADDED.0
+    }
+
+    /// Returns `true` if this term carries a `Changed<T>` or `Added<T>` tick filter.
+    #[inline]
+    pub const fn has_tick_filter(&self) -> bool {
+        self.has_changed_filter() || self.has_added_filter()
+    }
+
     /// Returns `true` if this term uses `StorageType::SparseSet`.
     #[inline]
     pub const fn is_sparse_set(&self) -> bool {
@@ -117,8 +140,30 @@ pub struct OrFilterClause {
     pub component_id: ComponentId,
     /// Filter access mode (`FILTER_ONLY`, `WITHOUT`, `CHANGED`, or `ADDED`).
     pub mode: AccessMode,
+    /// Term bitflags (`BAM_TERM_FLAG_*`).
+    pub flags: u16,
     /// `true` if stored in `SparseSets` rather than `Table`.
     pub is_sparse: bool,
+}
+
+impl OrFilterClause {
+    /// Returns `true` if [`BAM_TERM_FLAG_CHANGED`] is set or `mode == AccessMode::CHANGED`.
+    #[inline]
+    pub const fn has_changed_filter(&self) -> bool {
+        (self.flags & BAM_TERM_FLAG_CHANGED) != 0 || self.mode.0 == AccessMode::CHANGED.0
+    }
+
+    /// Returns `true` if [`BAM_TERM_FLAG_ADDED`] is set or `mode == AccessMode::ADDED`.
+    #[inline]
+    pub const fn has_added_filter(&self) -> bool {
+        (self.flags & BAM_TERM_FLAG_ADDED) != 0 || self.mode.0 == AccessMode::ADDED.0
+    }
+
+    /// Returns `true` if this clause carries a `Changed<T>` or `Added<T>` tick filter.
+    #[inline]
+    pub const fn has_tick_filter(&self) -> bool {
+        self.has_changed_filter() || self.has_added_filter()
+    }
 }
 
 /// Disjunctive `Or<(...)>` filter group (`group_id != 0`) composed of [`OrFilterClause`]s.
@@ -185,6 +230,7 @@ impl QueryPlan {
                 let clause = OrFilterClause {
                     component_id: t.component_id,
                     mode: t.mode,
+                    flags: t.flags,
                     is_sparse: t.is_sparse_set(),
                 };
                 if let Some(group) = or_groups.iter_mut().find(|g| g.group_id == or_group) {
@@ -206,12 +252,24 @@ impl QueryPlan {
                 continue;
             }
 
-            if t.mode.is_tick_filter() {
-                tick_filters.push(TickFilterTerm {
-                    component_id: t.component_id,
-                    is_added: t.mode == AccessMode::ADDED,
-                    is_sparse: t.is_sparse_set(),
-                });
+            if !t.is_resource() && !t.is_message() {
+                let mut push_tick = |is_added: bool| {
+                    if !tick_filters.iter().any(|tf: &TickFilterTerm| {
+                        tf.component_id == t.component_id && tf.is_added == is_added
+                    }) {
+                        tick_filters.push(TickFilterTerm {
+                            component_id: t.component_id,
+                            is_added,
+                            is_sparse: t.is_sparse_set(),
+                        });
+                    }
+                };
+                if t.has_changed_filter() {
+                    push_tick(false);
+                }
+                if t.has_added_filter() {
+                    push_tick(true);
+                }
             }
 
             if !t.mode.has_entity_column_data() || t.is_resource() || t.is_message() {
@@ -289,6 +347,7 @@ struct RunTicks {
 #[derive(Clone, Copy)]
 struct ActiveDenseColumn<'w> {
     data_ptr: *mut u8,
+    added_ticks: &'w [UnsafeCell<Tick>],
     changed_ticks: &'w [UnsafeCell<Tick>],
     summary_tick: Option<&'w AtomicTick>,
 }
@@ -311,11 +370,13 @@ enum IterBacking<'w> {
     },
 }
 
+const MAX_TICK_FILTER_SLICES: usize = MAX_TERMS_PER_QUERY * 2;
+
 struct DenseTableFilters<'t> {
     skip: bool,
-    filter_slices: [&'t [UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY],
+    filter_slices: [&'t [UnsafeCell<Tick>]; MAX_TICK_FILTER_SLICES],
     filter_len: usize,
-    or_slices: [&'t [UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY],
+    or_slices: [&'t [UnsafeCell<Tick>]; MAX_TICK_FILTER_SLICES],
     or_slice_len: usize,
     or_ranges: [(usize, usize); MAX_TERMS_PER_QUERY],
     or_group_len: usize,
@@ -323,11 +384,11 @@ struct DenseTableFilters<'t> {
 
 struct ArchetypeFilters<'t> {
     skip: bool,
-    dense_filter_slices: [(usize, &'t [UnsafeCell<Tick>]); MAX_TERMS_PER_QUERY],
+    dense_filter_slices: [(usize, &'t [UnsafeCell<Tick>]); MAX_TICK_FILTER_SLICES],
     dense_filter_len: usize,
-    or_dense_slices: [&'t [UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY],
+    or_dense_slices: [&'t [UnsafeCell<Tick>]; MAX_TICK_FILTER_SLICES],
     or_dense_len: usize,
-    or_sparse_clauses: [(ComponentId, bool); MAX_TERMS_PER_QUERY],
+    or_sparse_clauses: [(ComponentId, bool); MAX_TICK_FILTER_SLICES],
     or_sparse_len: usize,
     or_ranges: [(usize, usize, usize, usize); MAX_TERMS_PER_QUERY],
     or_group_len: usize,
@@ -653,8 +714,8 @@ impl<'w> HostIter<'w> {
     ) -> DenseTableFilters<'t> {
         let tick_filters = plan.tick_filters.as_slice();
         let or_groups = plan.or_groups.as_slice();
-        let mut filter_slices: [&'t [UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY] =
-            [&[]; MAX_TERMS_PER_QUERY];
+        let mut filter_slices: [&'t [UnsafeCell<Tick>]; MAX_TICK_FILTER_SLICES] =
+            [&[]; MAX_TICK_FILTER_SLICES];
         let mut skip = false;
 
         for (f_idx, tf) in tick_filters.iter().enumerate() {
@@ -678,8 +739,8 @@ impl<'w> HostIter<'w> {
             };
         }
 
-        let mut or_slices: [&'t [UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY] =
-            [&[]; MAX_TERMS_PER_QUERY];
+        let mut or_slices: [&'t [UnsafeCell<Tick>]; MAX_TICK_FILTER_SLICES] =
+            [&[]; MAX_TICK_FILTER_SLICES];
         let mut or_slice_len = 0usize;
         let mut or_ranges: [(usize, usize); MAX_TERMS_PER_QUERY] = [(0, 0); MAX_TERMS_PER_QUERY];
         let mut or_group_len = 0usize;
@@ -689,41 +750,33 @@ impl<'w> HostIter<'w> {
                 let mut trivially_satisfied = false;
                 let start_slice = or_slice_len;
                 for clause in &group.terms {
-                    match clause.mode {
-                        AccessMode::FILTER_ONLY => {
-                            if table.has_column(clause.component_id) {
-                                trivially_satisfied = true;
-                                break;
-                            }
+                    if clause.has_tick_filter() {
+                        let Some(col) = table.get_column(clause.component_id) else {
+                            continue;
+                        };
+                        let is_added = clause.has_added_filter();
+                        if !is_added
+                            && let Some(summary) = col.get_summary_tick()
+                            && !summary.get().is_newer_than(last_run, this_run)
+                        {
+                            continue;
                         }
-                        AccessMode::WITHOUT => {
-                            if !table.has_column(clause.component_id) {
-                                trivially_satisfied = true;
-                                break;
-                            }
-                        }
-                        AccessMode::CHANGED | AccessMode::ADDED => {
-                            let Some(col) = table.get_column(clause.component_id) else {
-                                continue;
-                            };
-                            let is_added = clause.mode == AccessMode::ADDED;
-                            if !is_added
-                                && let Some(summary) = col.get_summary_tick()
-                                && !summary.get().is_newer_than(last_run, this_run)
-                            {
-                                continue;
-                            }
-                            let slice = if is_added {
-                                // SAFETY: `full_table_len == table.entity_count() as usize`.
-                                unsafe { col.get_added_ticks_slice(full_table_len) }
-                            } else {
-                                // SAFETY: `full_table_len == table.entity_count() as usize`.
-                                unsafe { col.get_changed_ticks_slice(full_table_len) }
-                            };
-                            or_slices[or_slice_len] = slice;
-                            or_slice_len += 1;
-                        }
-                        _ => {}
+                        let slice = if is_added {
+                            // SAFETY: `full_table_len == table.entity_count() as usize`.
+                            unsafe { col.get_added_ticks_slice(full_table_len) }
+                        } else {
+                            // SAFETY: `full_table_len == table.entity_count() as usize`.
+                            unsafe { col.get_changed_ticks_slice(full_table_len) }
+                        };
+                        or_slices[or_slice_len] = slice;
+                        or_slice_len += 1;
+                    } else if clause.mode == AccessMode::FILTER_ONLY
+                        && table.has_column(clause.component_id)
+                        || clause.mode == AccessMode::WITHOUT
+                            && !table.has_column(clause.component_id)
+                    {
+                        trivially_satisfied = true;
+                        break;
                     }
                 }
                 if trivially_satisfied {
@@ -762,8 +815,8 @@ impl<'w> HostIter<'w> {
     ) -> ArchetypeFilters<'t> {
         let tick_filters = plan.tick_filters.as_slice();
         let or_groups = plan.or_groups.as_slice();
-        let mut dense_filter_slices: [(usize, &'t [UnsafeCell<Tick>]); MAX_TERMS_PER_QUERY] =
-            [(0, &[]); MAX_TERMS_PER_QUERY];
+        let mut dense_filter_slices: [(usize, &'t [UnsafeCell<Tick>]); MAX_TICK_FILTER_SLICES] =
+            [(0, &[]); MAX_TICK_FILTER_SLICES];
         let mut dense_filter_len = 0usize;
         let mut skip = false;
 
@@ -793,11 +846,11 @@ impl<'w> HostIter<'w> {
             dense_filter_len += 1;
         }
 
-        let mut or_dense_slices: [&'t [UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY] =
-            [&[]; MAX_TERMS_PER_QUERY];
+        let mut or_dense_slices: [&'t [UnsafeCell<Tick>]; MAX_TICK_FILTER_SLICES] =
+            [&[]; MAX_TICK_FILTER_SLICES];
         let mut or_dense_len = 0usize;
-        let mut or_sparse_clauses: [(ComponentId, bool); MAX_TERMS_PER_QUERY] =
-            [(ComponentId::new(0), false); MAX_TERMS_PER_QUERY];
+        let mut or_sparse_clauses: [(ComponentId, bool); MAX_TICK_FILTER_SLICES] =
+            [(ComponentId::new(0), false); MAX_TICK_FILTER_SLICES];
         let mut or_sparse_len = 0usize;
         let mut or_ranges: [(usize, usize, usize, usize); MAX_TERMS_PER_QUERY] =
             [(0, 0, 0, 0); MAX_TERMS_PER_QUERY];
@@ -809,49 +862,40 @@ impl<'w> HostIter<'w> {
                 let d_start = or_dense_len;
                 let s_start = or_sparse_len;
                 for clause in &group.terms {
-                    match clause.mode {
-                        AccessMode::FILTER_ONLY => {
-                            if archetype.contains(clause.component_id) {
-                                trivially_satisfied = true;
-                                break;
-                            }
+                    if clause.has_tick_filter() {
+                        if !archetype.contains(clause.component_id) {
+                            continue;
                         }
-                        AccessMode::WITHOUT => {
-                            if !archetype.contains(clause.component_id) {
-                                trivially_satisfied = true;
-                                break;
+                        let is_added = clause.has_added_filter();
+                        if clause.is_sparse {
+                            if sparse_sets.get(clause.component_id).is_some() {
+                                or_sparse_clauses[or_sparse_len] = (clause.component_id, is_added);
+                                or_sparse_len += 1;
                             }
-                        }
-                        AccessMode::CHANGED | AccessMode::ADDED => {
-                            if !archetype.contains(clause.component_id) {
+                        } else if let Some(col) = table.get_column(clause.component_id) {
+                            if !is_added
+                                && let Some(summary) = col.get_summary_tick()
+                                && !summary.get().is_newer_than(last_run, this_run)
+                            {
                                 continue;
                             }
-                            let is_added = clause.mode == AccessMode::ADDED;
-                            if clause.is_sparse {
-                                if sparse_sets.get(clause.component_id).is_some() {
-                                    or_sparse_clauses[or_sparse_len] =
-                                        (clause.component_id, is_added);
-                                    or_sparse_len += 1;
-                                }
-                            } else if let Some(col) = table.get_column(clause.component_id) {
-                                if !is_added
-                                    && let Some(summary) = col.get_summary_tick()
-                                    && !summary.get().is_newer_than(last_run, this_run)
-                                {
-                                    continue;
-                                }
-                                let slice = if is_added {
-                                    // SAFETY: `table_len == table.entity_count() as usize`.
-                                    unsafe { col.get_added_ticks_slice(table_len) }
-                                } else {
-                                    // SAFETY: `table_len == table.entity_count() as usize`.
-                                    unsafe { col.get_changed_ticks_slice(table_len) }
-                                };
-                                or_dense_slices[or_dense_len] = slice;
-                                or_dense_len += 1;
-                            }
+                            let slice = if is_added {
+                                // SAFETY: `table_len == table.entity_count() as usize`.
+                                unsafe { col.get_added_ticks_slice(table_len) }
+                            } else {
+                                // SAFETY: `table_len == table.entity_count() as usize`.
+                                unsafe { col.get_changed_ticks_slice(table_len) }
+                            };
+                            or_dense_slices[or_dense_len] = slice;
+                            or_dense_len += 1;
                         }
-                        _ => {}
+                    } else if clause.mode == AccessMode::FILTER_ONLY
+                        && archetype.contains(clause.component_id)
+                        || clause.mode == AccessMode::WITHOUT
+                            && !archetype.contains(clause.component_id)
+                    {
+                        trivially_satisfied = true;
+                        break;
                     }
                 }
                 if trivially_satisfied {
@@ -1465,12 +1509,16 @@ impl<'w> HostIter<'w> {
                 // SAFETY: `start_row_idx + run_len <= table_len == table.entity_count() as usize`.
                 let data_ptr = unsafe { col.get_data_unchecked(start_row).as_ptr().cast_mut() };
                 // SAFETY: `table_len` is `table.entity_count() as usize`.
+                let all_added = unsafe { col.get_added_ticks_slice(table_len) };
+                let added_ticks = &all_added[start_row_idx..start_row_idx + run_len];
+                // SAFETY: `table_len` is `table.entity_count() as usize`.
                 let all_ticks = unsafe { col.get_changed_ticks_slice(table_len) };
                 let changed_ticks = &all_ticks[start_row_idx..start_row_idx + run_len];
                 let summary_tick = col.get_summary_tick();
 
                 self.active_columns[idx] = Some(ActiveDenseColumn {
                     data_ptr,
+                    added_ticks,
                     changed_ticks,
                     summary_tick,
                 });
@@ -1537,6 +1585,7 @@ impl<'w> HostIter<'w> {
             };
             self.active_columns[idx] = Some(ActiveDenseColumn {
                 data_ptr,
+                added_ticks: &[],
                 changed_ticks: &[],
                 summary_tick: None,
             });
@@ -1572,6 +1621,195 @@ pub unsafe extern "C" fn host_iter_next_chunk(iter: *mut BamIter, out_len: *mut 
         *out_len = len;
     }
     FfiBool::from(len > 0)
+}
+
+/// Advances `iter` to the next non-empty chunk and writes `*out_len`, `*out_entities` (when
+/// `out_entities` is non-null), and `out_col_ptrs[0..col_count]` in a single FFI call.
+///
+/// # Safety
+/// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+/// - `out_len` must point to writable `usize` storage, or null.
+/// - If `out_entities` is non-null, it must point to writable `*const FfiEntity` storage.
+/// - If `col_count > 0`, `out_col_ptrs` must point to `col_count` writable `*mut u8` slots.
+pub unsafe extern "C" fn host_iter_next_chunk_batch(
+    iter: *mut BamIter,
+    out_len: *mut usize,
+    out_entities: *mut *const FfiEntity,
+    out_col_ptrs: *mut *mut u8,
+    col_count: usize,
+    mark_changed_mask: u32,
+) -> FfiBool {
+    if out_len.is_null() || (col_count > 0 && out_col_ptrs.is_null()) {
+        return FfiBool::FALSE;
+    }
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(host_iter) = (unsafe { validate_iter_mut(iter) }) else {
+        return FfiBool::FALSE;
+    };
+
+    let len = host_iter.next_chunk();
+    // SAFETY: `out_len` was checked non-null above and caller guarantees writable `usize`.
+    unsafe {
+        *out_len = len;
+    }
+    if len == 0 {
+        return FfiBool::FALSE;
+    }
+
+    if !out_entities.is_null() {
+        // SAFETY: `out_entities` was checked non-null above and caller guarantees writable `*const FfiEntity`.
+        unsafe {
+            *out_entities = host_iter.current_entities_ptr;
+        }
+    }
+
+    let fill_count = col_count
+        .min(host_iter.plan.terms.len())
+        .min(MAX_TERMS_PER_QUERY);
+    let this_run = host_iter.this_run;
+
+    for term_index in 0..fill_count {
+        let term = &host_iter.plan.terms[term_index];
+        let bit = 1u32 << term_index;
+        let ptr = if !term.is_resource()
+            && !term.is_message()
+            && (host_iter.plan.or_term_mask & bit) == 0
+        {
+            if (term.mode == AccessMode::WRITE || term.mode == AccessMode::OPTIONAL_WRITE)
+                && !term.is_sparse_set()
+                && !term.is_immutable()
+            {
+                if let Some(col) = host_iter.active_columns[term_index] {
+                    if (mark_changed_mask & bit) != 0 && (host_iter.marked_changed_mask & bit) == 0
+                    {
+                        for tick_cell in col.changed_ticks {
+                            // SAFETY: Exclusive mutable access to this component's rows is held by this system.
+                            unsafe {
+                                *tick_cell.get() = this_run;
+                            }
+                        }
+                        if let Some(summary) = col.summary_tick {
+                            summary.set(this_run);
+                        }
+                        host_iter.marked_changed_mask |= bit;
+                    }
+                    col.data_ptr
+                } else {
+                    core::ptr::null_mut()
+                }
+            } else if (term.mode.is_has() || term.mode.has_entity_column_data())
+                && !term.is_sparse_set()
+            {
+                host_iter.active_columns[term_index]
+                    .map_or(core::ptr::null_mut(), |col| col.data_ptr)
+            } else {
+                core::ptr::null_mut()
+            }
+        } else {
+            core::ptr::null_mut()
+        };
+
+        // SAFETY: `term_index < fill_count <= col_count`, and caller guarantees `col_count` writable slots.
+        unsafe {
+            *out_col_ptrs.add(term_index) = ptr;
+        }
+    }
+
+    for term_index in fill_count..col_count {
+        // SAFETY: `term_index < col_count`, and caller guarantees `col_count` writable slots.
+        unsafe {
+            *out_col_ptrs.add(term_index) = core::ptr::null_mut();
+        }
+    }
+
+    FfiBool::TRUE
+}
+
+/// Retrieves per-row `added` and `changed` tick array pointers (`[u32; chunk_len]`) alongside the
+/// enclosing system's `(last_run, this_run)` tick window for dense column `term_index` in the
+/// current chunk.
+///
+/// # Safety
+/// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+/// - Any non-null out-pointer (`out_added`, `out_changed`, `out_last_run`, `out_this_run`) must
+///   point to aligned writable storage of its respective type.
+pub unsafe extern "C" fn host_iter_column_ticks(
+    iter: *const BamIter,
+    term_index: usize,
+    out_added: *mut *const u32,
+    out_changed: *mut *const u32,
+    out_last_run: *mut u32,
+    out_this_run: *mut u32,
+) -> FfiResult {
+    if (!out_added.is_null() && !out_added.is_aligned())
+        || (!out_changed.is_null() && !out_changed.is_aligned())
+        || (!out_last_run.is_null() && !out_last_run.is_aligned())
+        || (!out_this_run.is_null() && !out_this_run.is_aligned())
+    {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let host_iter = ffi_try!(unsafe { validate_iter_ref(iter) });
+    if term_index >= host_iter.plan.terms.len() {
+        return FfiResult::OUT_OF_RANGE;
+    }
+    if host_iter.current_entity_count == 0 {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+
+    let term = &host_iter.plan.terms[term_index];
+    if term.is_resource()
+        || term.is_message()
+        || (host_iter.plan.or_term_mask & (1u32 << term_index)) != 0
+        || !term.mode.has_entity_column_data()
+    {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    if term.is_sparse_set() {
+        return FfiResult::UNSUPPORTED;
+    }
+
+    let Some(col) = host_iter.active_columns[term_index] else {
+        return FfiResult::NOT_FOUND;
+    };
+
+    if !out_added.is_null() {
+        let added_ptr = if col.added_ticks.is_empty() {
+            core::ptr::null()
+        } else {
+            col.added_ticks.as_ptr().cast::<u32>()
+        };
+        // SAFETY: `out_added` is non-null, aligned, and caller guarantees writable storage.
+        unsafe {
+            *out_added = added_ptr;
+        }
+    }
+    if !out_changed.is_null() {
+        let changed_ptr = if col.changed_ticks.is_empty() {
+            core::ptr::null()
+        } else {
+            col.changed_ticks.as_ptr().cast::<u32>()
+        };
+        // SAFETY: `out_changed` is non-null, aligned, and caller guarantees writable storage.
+        unsafe {
+            *out_changed = changed_ptr;
+        }
+    }
+    if !out_last_run.is_null() {
+        // SAFETY: `out_last_run` is non-null, aligned, and caller guarantees writable storage.
+        unsafe {
+            *out_last_run = host_iter.last_run.get();
+        }
+    }
+    if !out_this_run.is_null() {
+        // SAFETY: `out_this_run` is non-null, aligned, and caller guarantees writable storage.
+        unsafe {
+            *out_this_run = host_iter.this_run.get();
+        }
+    }
+
+    FfiResult::OK
 }
 
 /// Resets `iter` back to its initial chunk (`FfiResult::OK`).

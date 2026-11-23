@@ -721,6 +721,7 @@ fn bench_dense_iterate(cfg: &BenchConfig, dylibs: Option<&(PathBuf, PathBuf)>) {
             let reg = app.world().resource::<ModRegistry>().clone();
             let spec = BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![
                     BamTermDesc::new(pos_h, AccessMode::WRITE),
                     BamTermDesc::new(vel_h, AccessMode::READ),
@@ -885,6 +886,7 @@ fn bench_changed_filter(cfg: &BenchConfig) {
             let reg = app.world().resource::<ModRegistry>().clone();
             let spec = BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::new(pos_h, AccessMode::CHANGED)],
             };
             let visited_ptr = (&mut *last_visited as *mut usize).cast::<c_void>();
@@ -979,6 +981,7 @@ fn bench_command_burst(cfg: &BenchConfig) {
         let reg = app.world().resource::<ModRegistry>().clone();
         let spec = BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::new(pos_h, AccessMode::FILTER_ONLY)],
         };
         let sys = GuestSystem::new(
@@ -1058,6 +1061,7 @@ fn bench_sparse_query(cfg: &BenchConfig) {
         let reg = app.world().resource::<ModRegistry>().clone();
         let spec = BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![
                 BamTermDesc::new(pos_h, AccessMode::WRITE),
                 BamTermDesc::new(buff_h, AccessMode::WRITE),

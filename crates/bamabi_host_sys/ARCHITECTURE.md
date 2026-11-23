@@ -31,13 +31,13 @@
 | Module | Path | Contents |
 |---|---|---|
 | **Crate root** | [`src/lib.rs`](src/lib.rs) | `#![warn(missing_docs)]`, `#![deny(...)]` safety lints, flat public re-exports of audited host primitives and entrypoints. |
-| **FFI sub-layer** | [`src/ffi/mod.rs`](src/ffi/mod.rs) | Sealed (`pub(crate)`) host FFI modules implementing all 68 `BamHostApi` slots and bridge helpers. |
-| ↳ *Host table* | [`src/ffi/host_api.rs`](src/ffi/host_api.rs) | Static 68-slot `HOST_API: BamHostApi` verified at compile time via `has_all_slots()`. |
+| **FFI sub-layer** | [`src/ffi/mod.rs`](src/ffi/mod.rs) | Sealed (`pub(crate)`) host FFI modules implementing all 73 `BamHostApi` slots and bridge helpers. |
+| ↳ *Host table* | [`src/ffi/host_api.rs`](src/ffi/host_api.rs) | Static 73-slot `HOST_API: BamHostApi` verified at compile time via `has_all_slots()`. |
 | ↳ *Registration* | [`src/ffi/register.rs`](src/ffi/register.rs) | `LoadContext` (`BamLoadCtx`), `host_register_component`, `host_resolve_component`, `host_register_system`, `host_register_observer`, `DynamicComponentHookMap`. |
-| ↳ *Iteration* | [`src/ffi/iter.rs`](src/ffi/iter.rs) | `HostIter` (`BamIter`), `QueryPlan`, `QueryTermMeta`, `TickFilterTerm`, dense table slices, `SparseRowScratch`, `Messages<M>`, `host_res_ptr`/`host_res_ticks`, `host_par_for_each_chunk`. |
+| ↳ *Iteration* | [`src/ffi/iter.rs`](src/ffi/iter.rs) | `HostIter` (`BamIter`), `QueryPlan`, `QueryTermMeta`, `TickFilterTerm`, dense table slices, `SparseRowScratch`, `Messages<M>`, `host_res_ptr`/`host_res_ticks`, `host_par_for_each_chunk`, `host_iter_next_chunk_batch` (Slot 68), `host_iter_column_ticks` (Slot 69). |
 | ↳ *Extended iter* | [`src/ffi/iter_ext.rs`](src/ffi/iter_ext.rs) | `host_iter_read_removed` (`RemovedComponents<T>`) and `par_for_each_chunk_readonly_impl`. |
 | ↳ *Commands* | [`src/ffi/commands.rs`](src/ffi/commands.rs) | `HostCommands`, `HostCommandsStorage`, bump-allocated `CommandArena`, `CommandQuotaLimits`, `host_cmd_{spawn_empty,spawn,despawn,insert,insert_default,remove,trigger}`. |
-| ↳ *Extended cmds* | [`src/ffi/commands_ext.rs`](src/ffi/commands_ext.rs) | `host_cmd_spawn_persistent`, `host_cmd_spawn_batch`, `host_cmd_despawn_all`, `host_cmd_insert_if_new`. |
+| ↳ *Extended cmds* | [`src/ffi/commands_ext.rs`](src/ffi/commands_ext.rs) | `host_cmd_spawn_persistent`, `host_cmd_spawn_batch`, `host_cmd_despawn_all`, `host_cmd_insert_if_new`, `host_cmd_clone_entity` (Slot 70), `host_cmd_insert_resource` (Slot 71), `host_cmd_remove_resource` (Slot 72). |
 | ↳ *Hierarchy* | [`src/ffi/hierarchy_ext.rs`](src/ffi/hierarchy_ext.rs) | `host_sys_entity_children`, `CascadeHierarchyCache`, `host_iter_up_cascade` (Brent cycle guard). |
 | ↳ *Observers* | [`src/ffi/observers_ext.rs`](src/ffi/observers_ext.rs) | `ModObserverState`, `guest_observer_runner`, `host_cmd_trigger_ex`, `host_cmd_observe`. |
 | ↳ *Relations* | [`src/ffi/relations.rs`](src/ffi/relations.rs) | `ModRelationGraph`, `RelationFlushPolicy`, `RelationFlushError`, `check_relation_acyclic`, lifecycle `on_despawn`/`on_remove` cascade hooks. |
@@ -57,9 +57,10 @@
 
 ## 3. Core Subsystems & Hardening Details
 
-### 3.1 `HOST_API` (68/68 Slots) & `HandleHeader` Safety
+### 3.1 `HOST_API` (73/73 Slots) & `HandleHeader` Safety
 
-- `HOST_API` in [`src/ffi/host_api.rs`](src/ffi/host_api.rs) populates all `68` `Option<unsafe extern "C" fn(...)>` slots (`27` core `0.2`, `23` extended `0.2.x`, and `18` `0.3.0` slots), asserted at compile time by `HOST_API.has_all_slots()`.
+- `HOST_API` in [`src/ffi/host_api.rs`](src/ffi/host_api.rs) populates all `73` `Option<unsafe extern "C" fn(...)>` slots (`27` core `0.2`, `23` extended `0.2.x`, and `23` `0.3.0` slots, including Slots `68..=72`: `iter_next_chunk_batch`, `iter_column_ticks`, `cmd_clone_entity`, `cmd_insert_resource`, `cmd_remove_resource`; `592` B on 64-bit / `300` B on 32-bit), asserted at compile time by `HOST_API.has_all_slots()`.
+- System descriptors support up to `16` queries (`MAX_QUERIES_PER_SYSTEM = 16`), `BamQueryDesc::param_set_group` mutual exclusion (`BAM_QUERY_FLAG_PARAM_SET`), `BAM_TERM_FLAG_CHANGED`/`BAM_TERM_FLAG_ADDED`, and `BamSystemDesc::{run_if_ctx, run_if_query, run_if_ctx_user_data}` read-only run-condition evaluation before advancing `last_run`.
 - Every opaque host handle (`HostContext`, `LoadContext`, `HostSystemCtx`, `HostIter`, `HostCommands`) begins with `HandleHeader { magic, generation }`. Drop guards overwrite `magic` with `POISONED_MAGIC` (`0xDEAD_BEEF`) and `generation` with `0`.
 - `HostContext::snapshot` wraps its `Arc<RegistrySnapshot>` in `UnsafeCell` so updating the snapshot pointer during `bamabi_init` component registration preserves valid Tree Borrows provenance across raw `BamHostCtx*` pointers under Miri (`-Zmiri-tree-borrows`).
 

@@ -1,5 +1,6 @@
 //! Extended deferred entity command entrypoints (`cmd_spawn_persistent`, `cmd_spawn_batch`,
-//! `cmd_despawn_all`, and `cmd_insert_if_new`).
+//! `cmd_despawn_all`, `cmd_insert_if_new`, `cmd_clone_entity`, `cmd_insert_resource`, and
+//! `cmd_remove_resource`).
 
 use bamabi_sys::{BamCommands, BamComponent, BamTermDesc, FfiEntity, FfiResult};
 
@@ -91,6 +92,52 @@ pub unsafe extern "C" fn host_cmd_insert_if_new(
     let host_cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
     // SAFETY: `host_cmds` is validated and caller guarantees `data_ptr` is readable for `data_len`.
     unsafe { host_cmds.insert_raw_inner(entity, component, data_ptr, data_len, true) }
+}
+
+/// Queues deferred cloning of all cloneable components from `src_entity` onto `dst_entity`
+/// (`EntityCloner::build_opt_out`, respecting `clone_fn` and POD dynamic components).
+///
+/// # Safety
+/// `commands` must point to an active [`crate::ffi::commands::HostCommands`] cast to [`BamCommands`], or null.
+pub unsafe extern "C" fn host_cmd_clone_entity(
+    commands: *mut BamCommands,
+    src_entity: FfiEntity,
+    dst_entity: FfiEntity,
+) -> FfiResult {
+    // SAFETY: Validates `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let host_cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
+    host_cmds.clone_entity_raw(src_entity, dst_entity)
+}
+
+/// Queues deferred insertion or replacement of singleton `resource` (`data_len` bytes at `data_ptr`).
+///
+/// # Safety
+/// - `commands` must point to an active [`crate::ffi::commands::HostCommands`] cast to [`BamCommands`], or null.
+/// - If `data_len > 0`, `data_ptr` must point to at least `data_len` readable bytes matching the
+///   registered layout of `resource`.
+pub unsafe extern "C" fn host_cmd_insert_resource(
+    commands: *mut BamCommands,
+    resource: BamComponent,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult {
+    // SAFETY: Validates `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let host_cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
+    // SAFETY: `host_cmds` is validated and caller guarantees `data_ptr` is readable for `data_len`.
+    unsafe { host_cmds.insert_resource_raw(resource, data_ptr, data_len) }
+}
+
+/// Queues deferred removal of singleton `resource` from the `World`.
+///
+/// # Safety
+/// `commands` must point to an active [`crate::ffi::commands::HostCommands`] cast to [`BamCommands`], or null.
+pub unsafe extern "C" fn host_cmd_remove_resource(
+    commands: *mut BamCommands,
+    resource: BamComponent,
+) -> FfiResult {
+    // SAFETY: Validates `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let host_cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
+    host_cmds.remove_resource_raw(resource)
 }
 
 #[cfg(test)]

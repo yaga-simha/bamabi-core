@@ -477,4 +477,91 @@ fn access_builder_validation_conflicts_or_groups_and_find_conflicting_name() {
         let got = initialize_query_groups_in_world(&mut world, snap, &mut groups).unwrap_err();
         assert_eq!(got, expected);
     }
+
+    // 4. `param_set_group` mutual exclusion semantics:
+    //    - Conflicting accesses within the SAME non-zero `param_set_group` are allowed.
+    //    - Conflicting accesses against group `0` or a DIFFERENT non-zero group are rejected.
+    let ps_ok = [
+        BamQuerySpecOwned::new(vec![
+            BamTermDesc::new(a_h, AccessMode::WRITE),
+            BamTermDesc::new(res_h, AccessMode::RESOURCE_WRITE),
+        ])
+        .with_param_set_group(1),
+        BamQuerySpecOwned::new(vec![
+            BamTermDesc::new(a_h, AccessMode::READ),
+            BamTermDesc::new(res_h, AccessMode::RESOURCE_READ),
+        ])
+        .with_param_set_group(1),
+        // Disjoint component in group 0 does not conflict with group 1.
+        BamQuerySpecOwned::new(vec![BamTermDesc::new(imm_h, AccessMode::READ)]),
+    ];
+    assert!(validate_system_queries_against_snapshot(snap, &ps_ok).is_ok());
+    let mut ps_cached: Vec<CachedQueryGroup> =
+        ps_ok.iter().cloned().map(CachedQueryGroup::new).collect();
+    let ps_fas = initialize_query_groups_in_world(&mut world, snap, &mut ps_cached).unwrap();
+    assert!(ps_fas.combined_access().has_write(res_cid));
+
+    // Group 1 (`WRITE`) vs Group 0 (`READ`) -> conflict!
+    assert_eq!(
+        validate_system_queries_against_snapshot(
+            snap,
+            &[
+                BamQuerySpecOwned::new(vec![BamTermDesc::new(a_h, AccessMode::WRITE)])
+                    .with_param_set_group(1),
+                BamQuerySpecOwned::new(vec![BamTermDesc::new(a_h, AccessMode::READ)]),
+            ]
+        )
+        .unwrap_err()
+        .0,
+        FfiResult::ACCESS_CONFLICT
+    );
+    // Group 1 (`WRITE`) vs Group 2 (`READ`) -> conflict!
+    assert_eq!(
+        validate_system_queries_against_snapshot(
+            snap,
+            &[
+                BamQuerySpecOwned::new(vec![BamTermDesc::new(a_h, AccessMode::WRITE)])
+                    .with_param_set_group(1),
+                BamQuerySpecOwned::new(vec![BamTermDesc::new(a_h, AccessMode::READ)])
+                    .with_param_set_group(2),
+            ]
+        )
+        .unwrap_err()
+        .0,
+        FfiResult::ACCESS_CONFLICT
+    );
+
+    // 5. `BAM_TERM_FLAG_CHANGED` / `BAM_TERM_FLAG_ADDED` validation:
+    for allowed_mode in [
+        AccessMode::READ,
+        AccessMode::WRITE,
+        AccessMode::OPTIONAL_READ,
+        AccessMode::OPTIONAL_WRITE,
+        AccessMode::FILTER_ONLY,
+    ] {
+        let mut t = BamTermDesc::new(a_h, allowed_mode);
+        t.flags = bamabi_sys::BAM_TERM_FLAG_CHANGED | bamabi_sys::BAM_TERM_FLAG_ADDED;
+        assert!(
+            validate_system_queries_against_snapshot(snap, &[BamQuerySpecOwned::new(vec![t])])
+                .is_ok(),
+            "mode {allowed_mode:?} should accept CHANGED|ADDED flags"
+        );
+    }
+    for (handle, disallowed_mode) in [
+        (a_h, AccessMode::WITHOUT),
+        (a_h, AccessMode::HAS),
+        (a_h, AccessMode::ALLOW),
+        (res_h, AccessMode::RESOURCE_READ),
+        (a_h, AccessMode::REMOVED_READ),
+    ] {
+        let mut t = BamTermDesc::new(handle, disallowed_mode);
+        t.flags = bamabi_sys::BAM_TERM_FLAG_CHANGED;
+        assert_eq!(
+            validate_system_queries_against_snapshot(snap, &[BamQuerySpecOwned::new(vec![t])])
+                .unwrap_err()
+                .0,
+            FfiResult::INVALID_ARGUMENT,
+            "mode {disallowed_mode:?} must reject BAM_TERM_FLAG_CHANGED"
+        );
+    }
 }

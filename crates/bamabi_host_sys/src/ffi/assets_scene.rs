@@ -6,7 +6,7 @@
 //! `bevy_scene` so dedicated servers and simulations stay lightweight. Keeping asset and scene
 //! integration behind [`HostAssetBackend`] and [`HostSceneBackend`] trait objects allows Layer 3
 //! companion crates (such as `bamabi_bridges`) to plug in live `AssetServer` / `DynamicScene`
-//! implementations without altering the 68-slot `BamHostApi` table.
+//! implementations without altering the 73-slot `BamHostApi` table.
 //!
 //! # How It Works
 //! - Each slot (`asset_load`, `asset_get_load_state`, `asset_release`, and `cmd_spawn_scene`)

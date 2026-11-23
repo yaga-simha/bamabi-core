@@ -27,8 +27,9 @@ use bamabi_sys::{
     AccessMode, BamCommands, BamComponent, BamTermDesc, FfiAssetHandle, FfiEntity, FfiResult,
     MAX_TERMS_PER_QUERY,
 };
-use bevy_ecs::component::{ComponentId, IS_RESOURCE};
-use bevy_ecs::entity::{Entity, EntityAllocator};
+use bevy_ecs::change_detection::MaybeLocation;
+use bevy_ecs::component::{ComponentCloneBehavior, ComponentId, IS_RESOURCE};
+use bevy_ecs::entity::{ComponentCloneCtx, Entity, EntityAllocator, EntityCloner, SourceComponent};
 use bevy_ecs::event::{EntityTrigger, GlobalTrigger};
 use bevy_ecs::hierarchy::ChildOf;
 use bevy_ecs::observer::Observer;
@@ -389,9 +390,29 @@ enum RecordedCommand {
         relation: BamComponent,
         target: Entity,
     },
+    CloneEntity {
+        src: Entity,
+        dst: Entity,
+    },
+    InsertResource {
+        resource: BamComponent,
+        slice: ArenaSlice,
+        drop_slot: Option<(usize, u64)>,
+    },
+    RemoveResource {
+        component_id: ComponentId,
+    },
     Custom {
         idx: usize,
     },
+}
+
+fn pod_dynamic_clone_runner(source: &SourceComponent, ctx: &mut ComponentCloneCtx) {
+    // SAFETY: `pod_dynamic_clone_runner` is only bound to `is_abi_pod && drop_fn.is_none()`
+    // dynamic components whose layout matches `source.ptr()` and can be bitwise-copied.
+    unsafe {
+        ctx.write_target_component_ptr(source.ptr());
+    }
 }
 
 type CustomCommandFn = Box<dyn FnOnce(&mut World, &RegistrySnapshot) + Send + Sync>;
@@ -516,6 +537,7 @@ unsafe fn drop_uncommitted_soa_column(
 pub struct HostCommandsStorage {
     arena: CommandArena,
     commands: Vec<RecordedCommand>,
+    cmd_watermarks: Vec<ArenaWatermark>,
     batch_items: Vec<BatchItem>,
     soa_entities: Vec<Entity>,
     soa_columns: Vec<SpawnSoaColumn>,
@@ -534,6 +556,7 @@ impl HostCommandsStorage {
         Self {
             arena: CommandArena::new(),
             commands: Vec::new(),
+            cmd_watermarks: Vec::new(),
             batch_items: Vec::new(),
             soa_entities: Vec::new(),
             soa_columns: Vec::new(),
@@ -544,6 +567,12 @@ impl HostCommandsStorage {
             arena_breaches: 0,
             spawn_breaches: 0,
         }
+    }
+
+    #[inline]
+    fn push_command(&mut self, pre_arena_wm: ArenaWatermark, cmd: RecordedCommand) {
+        self.cmd_watermarks.push(pre_arena_wm);
+        self.commands.push(cmd);
     }
 
     /// Returns the most recent relationship flush status from the last [`Self::apply_to_world`]
@@ -660,6 +689,11 @@ impl HostCommandsStorage {
                     slice,
                     ref mut drop_slot,
                     ..
+                }
+                | RecordedCommand::InsertResource {
+                    slice,
+                    ref mut drop_slot,
+                    ..
                 } => {
                     if let Some((slot, expected_gen)) = drop_slot.take() {
                         let nn = self.arena.ptr_mut(slice);
@@ -708,6 +742,7 @@ impl HostCommandsStorage {
     pub fn clear(&mut self) {
         self.drop_uncommitted_payloads();
         self.commands.clear();
+        self.cmd_watermarks.clear();
         self.batch_items.clear();
         self.soa_entities.clear();
         self.soa_columns.clear();
@@ -723,16 +758,21 @@ impl HostCommandsStorage {
         self.commands.len()
     }
 
-    /// Rolls back all commands queued after `checkpoint`, invoking foreign destructors in reverse
-    /// order for uncommitted dynamic payloads and truncating auxiliary command storage.
-    pub fn rollback_to_checkpoint(&mut self, checkpoint: usize) -> FfiResult {
+    /// Rolls back all commands queued after `checkpoint`, rewinding `CommandArena`, returning
+    /// `(status, rolled_back_spawns)`.
+    pub(crate) fn rollback_to_checkpoint_counted(
+        &mut self,
+        checkpoint: usize,
+    ) -> (FfiResult, usize) {
         if checkpoint > self.commands.len() {
-            return FfiResult::OUT_OF_RANGE;
+            return (FfiResult::OUT_OF_RANGE, 0);
         }
         if checkpoint == self.commands.len() {
-            return FfiResult::OK;
+            return (FfiResult::OK, 0);
         }
 
+        let rewind_wm = self.cmd_watermarks[checkpoint];
+        let mut rolled_back_spawns = 0usize;
         let mut min_batch_len = self.batch_items.len();
         let mut min_soa_ent_len = self.soa_entities.len();
         let mut min_soa_col_len = self.soa_columns.len();
@@ -745,6 +785,9 @@ impl HostCommandsStorage {
                     slice, drop_slot, ..
                 }
                 | RecordedCommand::InsertIfNew {
+                    slice, drop_slot, ..
+                }
+                | RecordedCommand::InsertResource {
                     slice, drop_slot, ..
                 } => {
                     let slice = *slice;
@@ -762,6 +805,7 @@ impl HostCommandsStorage {
                     batch_len,
                     ..
                 } => {
+                    rolled_back_spawns = rolled_back_spawns.saturating_add(1);
                     let bs = *batch_start;
                     let bl = *batch_len;
                     min_batch_len = min_batch_len.min(bs);
@@ -779,10 +823,12 @@ impl HostCommandsStorage {
                 }
                 RecordedCommand::SpawnSoaBatch {
                     entity_start,
+                    entity_count,
                     col_start,
                     col_count,
                     ..
                 } => {
+                    rolled_back_spawns = rolled_back_spawns.saturating_add(*entity_count);
                     let es = *entity_start;
                     let cs = *col_start;
                     let cc = *col_count;
@@ -792,15 +838,15 @@ impl HostCommandsStorage {
                         let col = &mut self.soa_columns[c];
                         let slice = col.slice;
                         let elem_size = col.elem_size;
-                        let entity_count = col.entity_count;
+                        let ec = col.entity_count;
                         if let Some((slot, expected_gen)) = col.drop_slot.take() {
                             let base = self.arena.ptr_mut(slice);
-                            // SAFETY: `base` holds `entity_count` contiguous `elem_size` uncommitted payloads.
+                            // SAFETY: `base` holds `ec` contiguous `elem_size` uncommitted payloads.
                             unsafe {
                                 drop_uncommitted_soa_column(
                                     base.as_ptr(),
                                     elem_size,
-                                    entity_count,
+                                    ec,
                                     slot,
                                     expected_gen,
                                     true,
@@ -809,6 +855,9 @@ impl HostCommandsStorage {
                         }
                     }
                 }
+                RecordedCommand::SpawnEmpty { .. } | RecordedCommand::SpawnScene { .. } => {
+                    rolled_back_spawns = rolled_back_spawns.saturating_add(1);
+                }
                 RecordedCommand::Custom { idx } => {
                     let c_idx = *idx;
                     min_custom_len = min_custom_len.min(c_idx);
@@ -816,23 +865,32 @@ impl HostCommandsStorage {
                         let _ = slot.take();
                     }
                 }
-                RecordedCommand::SpawnEmpty { .. }
-                | RecordedCommand::Despawn { .. }
+                RecordedCommand::Despawn { .. }
                 | RecordedCommand::InsertDefault { .. }
                 | RecordedCommand::Remove { .. }
                 | RecordedCommand::Trigger { .. }
-                | RecordedCommand::SpawnScene { .. }
                 | RecordedCommand::InsertRelation { .. }
-                | RecordedCommand::RemoveRelation { .. } => {}
+                | RecordedCommand::RemoveRelation { .. }
+                | RecordedCommand::CloneEntity { .. }
+                | RecordedCommand::RemoveResource { .. } => {}
             }
         }
 
         self.commands.truncate(checkpoint);
+        self.cmd_watermarks.truncate(checkpoint);
         self.batch_items.truncate(min_batch_len);
         self.soa_entities.truncate(min_soa_ent_len);
         self.soa_columns.truncate(min_soa_col_len);
         self.custom_fns.truncate(min_custom_len);
-        FfiResult::OK
+        self.arena.rewind(rewind_wm);
+        self.spawns_queued = self.spawns_queued.saturating_sub(rolled_back_spawns);
+        (FfiResult::OK, rolled_back_spawns)
+    }
+
+    /// Rolls back all commands queued after `checkpoint`, invoking foreign destructors in reverse
+    /// order for uncommitted dynamic payloads and truncating auxiliary command storage.
+    pub fn rollback_to_checkpoint(&mut self, checkpoint: usize) -> FfiResult {
+        self.rollback_to_checkpoint_counted(checkpoint).0
     }
 
     /// Takes ownership of all queued commands into a fresh `HostCommandsStorage` (used only by
@@ -1319,6 +1377,91 @@ impl HostCommandsStorage {
                         }
                     }
                 }
+                RecordedCommand::CloneEntity { src, dst } => {
+                    if src != dst
+                        && world.entities().contains(src)
+                        && world.entities().contains(dst)
+                    {
+                        let mut pod_cids = Vec::new();
+                        for &cid in world.entity(src).archetype().components() {
+                            if let Some(meta) = active_snapshot.get_by_id(cid)
+                                && meta.is_dynamic
+                                && meta.is_abi_pod
+                                && meta.drop_fn.is_none()
+                                && meta.drop_slot.is_none()
+                                && !meta.is_resource()
+                                && !meta.is_message()
+                                && world.components().get_info(cid).is_some_and(|info| {
+                                    matches!(info.clone_behavior(), ComponentCloneBehavior::Default)
+                                })
+                            {
+                                pod_cids.push(cid);
+                            }
+                        }
+                        let mut builder = EntityCloner::build_opt_out(world);
+                        builder.deny::<ModScoped>();
+                        for cid in pod_cids {
+                            builder.override_clone_behavior_with_id(
+                                cid,
+                                ComponentCloneBehavior::Custom(pod_dynamic_clone_runner),
+                            );
+                        }
+                        builder.finish().clone_entity(world, src, dst);
+                    }
+                }
+                RecordedCommand::InsertResource {
+                    resource,
+                    slice,
+                    drop_slot,
+                } => {
+                    if let RecordedCommand::InsertResource {
+                        drop_slot: ref mut stored_slot,
+                        ..
+                    } = self.commands[i]
+                    {
+                        *stored_slot = None;
+                    }
+                    let Some(meta) = active_snapshot.get_by_handle(resource) else {
+                        if let Some((slot, expected_gen)) = drop_slot {
+                            let nn = self.arena.ptr_mut(slice);
+                            // SAFETY: Resource handle vanished before apply; drop uncommitted payload.
+                            unsafe {
+                                run_uncommitted_slot_drop(slot, expected_gen, nn.as_ptr());
+                            }
+                        }
+                        continue;
+                    };
+                    if !meta.is_resource()
+                        || meta.is_message()
+                        || meta.is_immutable()
+                        || (meta.is_dynamic && meta.drop_slot.is_some() && meta.drop_fn.is_none())
+                        || (!meta.is_dynamic && !meta.is_abi_pod)
+                    {
+                        if let Some((slot, expected_gen)) = drop_slot {
+                            let nn = self.arena.ptr_mut(slice);
+                            // SAFETY: Owning mod unloaded or resource became ineligible before apply.
+                            unsafe {
+                                run_uncommitted_slot_drop(slot, expected_gen, nn.as_ptr());
+                            }
+                        }
+                        continue;
+                    }
+                    let nn = self.arena.ptr_mut(slice);
+                    // SAFETY: `nn` holds `meta.size` aligned bytes for `meta.component_id`;
+                    // ownership transfers into Bevy ECS singleton resource storage.
+                    let owning = unsafe { OwningPtr::new(nn) };
+                    // SAFETY: `meta.component_id` was registered in `world` with `(meta.size, meta.align)`.
+                    unsafe {
+                        world.insert_resource_by_id(
+                            meta.component_id,
+                            owning,
+                            MaybeLocation::caller(),
+                        );
+                    }
+                }
+                RecordedCommand::RemoveResource { component_id } => {
+                    world.remove_resource_by_id(component_id);
+                }
                 RecordedCommand::Custom { idx } => {
                     if let Some(custom_fn) = self.custom_fns.get_mut(idx).and_then(Option::take) {
                         custom_fn(world, snapshot);
@@ -1554,9 +1697,11 @@ impl<'a> HostCommands<'a> {
         &mut self,
         f: impl FnOnce(&mut World, &RegistrySnapshot) + Send + Sync + 'static,
     ) {
+        let arena_wm = self.storage.arena.watermark();
         let idx = self.storage.custom_fns.len();
         self.storage.custom_fns.push(Some(Box::new(f)));
-        self.storage.commands.push(RecordedCommand::Custom { idx });
+        self.storage
+            .push_command(arena_wm, RecordedCommand::Custom { idx });
     }
 
     /// Casts `&mut self` to an opaque `*mut BamCommands` FFI pointer.
@@ -1571,10 +1716,20 @@ impl<'a> HostCommands<'a> {
         self.storage.checkpoint()
     }
 
-    /// Rolls back commands queued after `checkpoint` in the backing [`HostCommandsStorage`].
+    /// Rolls back commands queued after `checkpoint` in the backing [`HostCommandsStorage`],
+    /// releasing any rolled-back spawns on `self.shared_frame_spawns`.
     #[inline]
     pub fn rollback_to_checkpoint(&mut self, checkpoint: usize) -> FfiResult {
-        self.storage.rollback_to_checkpoint(checkpoint)
+        let (res, rolled_back_spawns) = self.storage.rollback_to_checkpoint_counted(checkpoint);
+        if res.is_ok()
+            && rolled_back_spawns > 0
+            && let Some(shared) = self.shared_frame_spawns
+        {
+            let _ = shared.try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                Some(cur.saturating_sub(rolled_back_spawns))
+            });
+        }
+        res
     }
 
     pub(crate) fn queue_spawn_scene(
@@ -1589,12 +1744,16 @@ impl<'a> HostCommands<'a> {
             return Err(code);
         }
         self.try_reserve_spawns(1)?;
+        let arena_wm = self.storage.arena.watermark();
         let entity = self.allocator.alloc();
-        self.storage.commands.push(RecordedCommand::SpawnScene {
-            entity,
-            parent,
-            handle,
-        });
+        self.storage.push_command(
+            arena_wm,
+            RecordedCommand::SpawnScene {
+                entity,
+                parent,
+                handle,
+            },
+        );
         Ok(entity)
     }
 
@@ -1659,17 +1818,21 @@ impl<'a> HostCommands<'a> {
             }
         }
 
+        let arena_wm = self.storage.arena.watermark();
         // SAFETY: `data_ptr` is non-null when `rel_meta.data_size > 0` and caller guarantees
         // `data_len == rel_meta.data_size` initialized readable bytes.
         let slice = ffi_try!(unsafe {
             self.alloc_arena_copy(data_ptr, rel_meta.data_size, rel_meta.data_align)
         });
-        self.storage.commands.push(RecordedCommand::InsertRelation {
-            entity: bevy_entity,
-            relation,
-            target: bevy_target,
-            slice,
-        });
+        self.storage.push_command(
+            arena_wm,
+            RecordedCommand::InsertRelation {
+                entity: bevy_entity,
+                relation,
+                target: bevy_target,
+                slice,
+            },
+        );
         FfiResult::OK
     }
 
@@ -1688,11 +1851,100 @@ impl<'a> HostCommands<'a> {
         if self.snapshot.get_relation(relation).is_none() {
             return FfiResult::INVALID_COMPONENT;
         }
-        self.storage.commands.push(RecordedCommand::RemoveRelation {
-            entity: bevy_entity,
-            relation,
-            target: bevy_target,
-        });
+        let arena_wm = self.storage.arena.watermark();
+        self.storage.push_command(
+            arena_wm,
+            RecordedCommand::RemoveRelation {
+                entity: bevy_entity,
+                relation,
+                target: bevy_target,
+            },
+        );
+        FfiResult::OK
+    }
+
+    /// Validates and queues a deferred entity component clone from `src_entity` onto `dst_entity`.
+    pub(crate) fn clone_entity_raw(
+        &mut self,
+        src_entity: FfiEntity,
+        dst_entity: FfiEntity,
+    ) -> FfiResult {
+        let src = ffi_try!(decode_live_entity(src_entity));
+        let dst = ffi_try!(decode_live_entity(dst_entity));
+        if src == dst {
+            return FfiResult::OK;
+        }
+        let arena_wm = self.storage.arena.watermark();
+        self.storage
+            .push_command(arena_wm, RecordedCommand::CloneEntity { src, dst });
+        FfiResult::OK
+    }
+
+    /// Validates and queues a deferred singleton resource insertion or replacement.
+    ///
+    /// # Safety
+    /// If `data_len > 0`, `data_ptr` must be non-null and readable for `data_len` bytes.
+    pub(crate) unsafe fn insert_resource_raw(
+        &mut self,
+        resource: BamComponent,
+        data_ptr: *const u8,
+        data_len: usize,
+    ) -> FfiResult {
+        if data_len > 0 && data_ptr.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        let Some(meta) = self.snapshot.get_by_handle(resource) else {
+            return FfiResult::INVALID_COMPONENT;
+        };
+        if !meta.is_resource() || meta.is_message() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if meta.is_immutable() {
+            return FfiResult::PERMISSION_DENIED;
+        }
+        if meta.is_dynamic && meta.drop_slot.is_some() && meta.drop_fn.is_none() {
+            return FfiResult::INVALID_STATE;
+        }
+        if !meta.is_dynamic && !meta.is_abi_pod {
+            return FfiResult::PERMISSION_DENIED;
+        }
+        if meta.size != data_len {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+
+        let arena_wm = self.storage.arena.watermark();
+        // SAFETY: `data_ptr` is non-null when `data_len > 0` and readable for `meta.size` bytes.
+        let slice = ffi_try!(unsafe { self.alloc_arena_copy(data_ptr, meta.size, meta.align) });
+        let drop_slot = active_drop_slot(meta);
+        self.storage.push_command(
+            arena_wm,
+            RecordedCommand::InsertResource {
+                resource,
+                slice,
+                drop_slot,
+            },
+        );
+        FfiResult::OK
+    }
+
+    /// Validates and queues a deferred singleton resource removal.
+    pub(crate) fn remove_resource_raw(&mut self, resource: BamComponent) -> FfiResult {
+        let Some(meta) = self.snapshot.get_by_handle(resource) else {
+            return FfiResult::INVALID_COMPONENT;
+        };
+        if !meta.is_resource() || meta.is_message() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if meta.is_immutable() {
+            return FfiResult::PERMISSION_DENIED;
+        }
+        let arena_wm = self.storage.arena.watermark();
+        self.storage.push_command(
+            arena_wm,
+            RecordedCommand::RemoveResource {
+                component_id: meta.component_id,
+            },
+        );
         FfiResult::OK
     }
 
@@ -1729,6 +1981,7 @@ impl<'a> HostCommands<'a> {
             }
         }
 
+        let arena_wm = self.storage.arena.watermark();
         // SAFETY: `data_ptr` is non-null when `data_len > 0` and readable for `meta.size` bytes.
         let slice = ffi_try!(unsafe { self.alloc_arena_copy(data_ptr, meta.size, meta.align) });
         let drop_slot = active_drop_slot(meta);
@@ -1747,7 +2000,7 @@ impl<'a> HostCommands<'a> {
                 drop_slot,
             }
         };
-        self.storage.commands.push(cmd);
+        self.storage.push_command(arena_wm, cmd);
         FfiResult::OK
     }
 
@@ -1916,13 +2169,16 @@ impl<'a> HostCommands<'a> {
                 }
             }
         }
-        self.storage.commands.push(RecordedCommand::SpawnSoaBatch {
-            entity_start,
-            entity_count,
-            col_start,
-            col_count: component_count,
-            owner_mod_id: self.mod_id,
-        });
+        self.storage.push_command(
+            arena_wm,
+            RecordedCommand::SpawnSoaBatch {
+                entity_start,
+                entity_count,
+                col_start,
+                col_count: component_count,
+                owner_mod_id: self.mod_id,
+            },
+        );
         FfiResult::OK
     }
 
@@ -2061,11 +2317,15 @@ pub unsafe extern "C" fn host_cmd_spawn_empty(
     let cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
     ffi_try!(cmds.try_reserve_spawns(1));
 
+    let arena_wm = cmds.storage.arena.watermark();
     let entity = cmds.allocator.alloc();
-    cmds.storage.commands.push(RecordedCommand::SpawnEmpty {
-        entity,
-        owner_mod_id: cmds.mod_id,
-    });
+    cmds.storage.push_command(
+        arena_wm,
+        RecordedCommand::SpawnEmpty {
+            entity,
+            owner_mod_id: cmds.mod_id,
+        },
+    );
     // SAFETY: `out_entity` was checked non-null above and caller guarantees writable `FfiEntity`.
     unsafe {
         *out_entity = FfiEntity::from_bits(entity.to_bits());
@@ -2097,11 +2357,15 @@ pub(crate) unsafe fn spawn_batch_with_scope(
         if let Err(err) = cmds.try_reserve_spawns(1) {
             return err;
         }
+        let arena_wm = cmds.storage.arena.watermark();
         let entity = cmds.allocator.alloc();
-        cmds.storage.commands.push(RecordedCommand::SpawnEmpty {
-            entity,
-            owner_mod_id,
-        });
+        cmds.storage.push_command(
+            arena_wm,
+            RecordedCommand::SpawnEmpty {
+                entity,
+                owner_mod_id,
+            },
+        );
         // SAFETY: `out_entity` is non-null and writable.
         unsafe {
             *out_entity = FfiEntity::from_bits(entity.to_bits());
@@ -2221,12 +2485,15 @@ pub(crate) unsafe fn spawn_batch_with_scope(
     }
 
     let entity = cmds.allocator.alloc();
-    cmds.storage.commands.push(RecordedCommand::SpawnBatch {
-        entity,
-        batch_start,
-        batch_len: count,
-        owner_mod_id,
-    });
+    cmds.storage.push_command(
+        arena_wm,
+        RecordedCommand::SpawnBatch {
+            entity,
+            batch_start,
+            batch_len: count,
+            owner_mod_id,
+        },
+    );
     // SAFETY: `out_entity` is non-null and writable.
     unsafe {
         *out_entity = FfiEntity::from_bits(entity.to_bits());
@@ -2268,9 +2535,13 @@ pub unsafe extern "C" fn host_cmd_despawn(
     // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
     let cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
     let bevy_entity = ffi_try!(decode_live_entity(entity));
-    cmds.storage.commands.push(RecordedCommand::Despawn {
-        entity: bevy_entity,
-    });
+    let arena_wm = cmds.storage.arena.watermark();
+    cmds.storage.push_command(
+        arena_wm,
+        RecordedCommand::Despawn {
+            entity: bevy_entity,
+        },
+    );
     FfiResult::OK
 }
 
@@ -2314,10 +2585,14 @@ pub unsafe extern "C" fn host_cmd_insert_default(
     };
     let bevy_entity = ffi_try!(decode_live_entity(entity));
 
-    cmds.storage.commands.push(RecordedCommand::InsertDefault {
-        entity: bevy_entity,
-        insert_fn,
-    });
+    let arena_wm = cmds.storage.arena.watermark();
+    cmds.storage.push_command(
+        arena_wm,
+        RecordedCommand::InsertDefault {
+            entity: bevy_entity,
+            insert_fn,
+        },
+    );
     FfiResult::OK
 }
 
@@ -2340,10 +2615,14 @@ pub unsafe extern "C" fn host_cmd_remove(
     }
     let bevy_entity = ffi_try!(decode_live_entity(entity));
 
-    cmds.storage.commands.push(RecordedCommand::Remove {
-        entity: bevy_entity,
-        component_id: meta.component_id,
-    });
+    let arena_wm = cmds.storage.arena.watermark();
+    cmds.storage.push_command(
+        arena_wm,
+        RecordedCommand::Remove {
+            entity: bevy_entity,
+            component_id: meta.component_id,
+        },
+    );
     FfiResult::OK
 }
 
@@ -2407,14 +2686,18 @@ pub unsafe extern "C" fn host_cmd_trigger(
         }
     }
 
+    let arena_wm = cmds.storage.arena.watermark();
     // SAFETY: `data_ptr` is non-null when `meta.size > 0` and readable for `meta.size` bytes.
     let slice = ffi_try!(unsafe { cmds.alloc_arena_copy(data_ptr, meta.size, meta.align) });
 
-    cmds.storage.commands.push(RecordedCommand::Trigger {
-        component: event,
-        target: target_entity,
-        slice,
-    });
+    cmds.storage.push_command(
+        arena_wm,
+        RecordedCommand::Trigger {
+            component: event,
+            target: target_entity,
+            slice,
+        },
+    );
     FfiResult::OK
 }
 

@@ -160,6 +160,7 @@ fn iter_count_and_register_system_handle_work() {
         component: stats_handle,
         component_id: comp_id,
         mode: AccessMode::READ,
+        flags: 0,
         uuid: TestStats::UUID,
         size: core::mem::size_of::<TestStats>(),
         align: core::mem::align_of::<TestStats>(),

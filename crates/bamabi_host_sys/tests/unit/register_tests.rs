@@ -1398,6 +1398,7 @@ fn summary_tick_dynamic_and_typed_options_flow_into_iter_column_info() {
         component: dyn_h,
         component_id: meta.component_id,
         mode: AccessMode::READ,
+        flags: 0,
         uuid: meta.uuid,
         size: meta.size,
         align: meta.align,
@@ -1421,4 +1422,183 @@ fn summary_tick_dynamic_and_typed_options_flow_into_iter_column_info() {
     let res = unsafe { host_iter_column_info(iter.as_ffi_ptr().cast_const(), 0, &mut col_info) };
     assert_eq!(res, FfiResult::OK);
     assert_ne!(col_info.storage_flags & BAM_STORAGE_FLAG_SUMMARY_TICK, 0);
+}
+
+#[test]
+fn register_system_16_queries_param_set_and_run_if_ctx_validation() {
+    use crate::registry::ComponentOptions;
+    use bamabi_macros::ModComponent;
+    use bamabi_sys::{
+        AccessMode, BAM_QUERY_FLAG_PARAM_SET, BamQueryDesc, BamSystemCtx, BamSystemDesc,
+        BamTermDesc, MAX_QUERIES_PER_SYSTEM,
+    };
+
+    #[repr(C)]
+    #[derive(Component, Clone, Copy, Debug, ModComponent)]
+    #[mod_component(name = "reg73::Comp")]
+    struct Reg73Comp(u32);
+
+    unsafe extern "C" fn dummy_sys(_ctx: *mut BamSystemCtx, _ud: *mut c_void) -> FfiResult {
+        FfiResult::OK
+    }
+
+    let mut world = World::new();
+    let cid = world.register_component::<Reg73Comp>();
+    let mut reg = ModRegistry::new();
+    let h = reg
+        .register_component::<Reg73Comp>(cid, ComponentOptions::new())
+        .unwrap();
+    let active = Arc::new(AtomicBool::new(true));
+
+    let mut ctx =
+        LoadContext::with_world_and_mod_id(reg, active, &mut world as *mut World, Some(ModId(99)));
+
+    // 1. `MAX_QUERIES_PER_SYSTEM == 16`: 16 queries succeed, 17 fail with `CAPACITY_EXCEEDED`.
+    assert_eq!(MAX_QUERIES_PER_SYSTEM, 16);
+    let ro_term = BamTermDesc::read(h);
+    let queries_17 = [BamQueryDesc::new(&ro_term, 1); 17];
+    let sys_16 = BamSystemDesc::new(
+        c"reg73::sixteen".as_ptr(),
+        queries_17.as_ptr(),
+        16,
+        dummy_sys,
+        core::ptr::null_mut(),
+    );
+    let sys_17 = BamSystemDesc::new(
+        c"reg73::seventeen".as_ptr(),
+        queries_17.as_ptr(),
+        17,
+        dummy_sys,
+        core::ptr::null_mut(),
+    );
+    // SAFETY: Valid `LoadContext` and descriptor pointers.
+    unsafe {
+        assert_eq!(
+            host_register_system(ctx.as_ffi_ptr(), &sys_16),
+            FfiResult::OK
+        );
+        assert_eq!(
+            host_register_system(ctx.as_ffi_ptr(), &sys_17),
+            FfiResult::CAPACITY_EXCEEDED
+        );
+    }
+
+    // 2. `BAM_QUERY_FLAG_PARAM_SET` requires non-zero `param_set_group`; conflicting writes/reads
+    //    within same non-zero group register cleanly.
+    let w_term = BamTermDesc::write(h);
+    let mut q_bad_ps = BamQueryDesc::new(&w_term, 1);
+    q_bad_ps.flags = BAM_QUERY_FLAG_PARAM_SET;
+    let sys_bad_ps = BamSystemDesc::new(
+        c"reg73::bad_ps".as_ptr(),
+        &q_bad_ps,
+        1,
+        dummy_sys,
+        core::ptr::null_mut(),
+    );
+    // SAFETY: Valid `LoadContext` and descriptor pointers.
+    unsafe {
+        assert_eq!(
+            host_register_system(ctx.as_ffi_ptr(), &sys_bad_ps),
+            FfiResult::INVALID_ARGUMENT
+        );
+    }
+
+    let mut q_ps0 = BamQueryDesc::new(&w_term, 1);
+    q_ps0.flags = BAM_QUERY_FLAG_PARAM_SET;
+    q_ps0.param_set_group = 1;
+    let mut q_ps1 = BamQueryDesc::new(&ro_term, 1);
+    q_ps1.flags = BAM_QUERY_FLAG_PARAM_SET;
+    q_ps1.param_set_group = 1;
+    let ps_queries = [q_ps0, q_ps1];
+    let sys_ps_ok = BamSystemDesc::new(
+        c"reg73::ps_ok".as_ptr(),
+        ps_queries.as_ptr(),
+        ps_queries.len(),
+        dummy_sys,
+        core::ptr::null_mut(),
+    );
+    // SAFETY: Valid `LoadContext` and descriptor pointers.
+    unsafe {
+        assert_eq!(
+            host_register_system(ctx.as_ffi_ptr(), &sys_ps_ok),
+            FfiResult::OK
+        );
+    }
+
+    // 3. `run_if_ctx` validation:
+    let mut sys_orphan_q = BamSystemDesc::new(
+        c"reg73::orphan_run_if_q".as_ptr(),
+        &q_ps0,
+        1,
+        dummy_sys,
+        core::ptr::null_mut(),
+    );
+    let ro_q = BamQueryDesc::new(&ro_term, 1);
+    sys_orphan_q.run_if_query = &ro_q;
+    // SAFETY: Valid `LoadContext` and descriptor pointers.
+    unsafe {
+        assert_eq!(
+            host_register_system(ctx.as_ffi_ptr(), &sys_orphan_q),
+            FfiResult::INVALID_ARGUMENT
+        );
+    }
+
+    let mut_q = BamQueryDesc::new(&w_term, 1);
+    let sys_mut_cond = BamSystemDesc::new(
+        c"reg73::mut_cond".as_ptr(),
+        core::ptr::null(),
+        0,
+        dummy_sys,
+        core::ptr::null_mut(),
+    )
+    .with_run_if_ctx(dummy_sys, &mut_q, core::ptr::null_mut());
+    // SAFETY: Valid `LoadContext` and descriptor pointers.
+    unsafe {
+        assert_eq!(
+            host_register_system(ctx.as_ffi_ptr(), &sys_mut_cond),
+            FfiResult::PERMISSION_DENIED
+        );
+    }
+
+    let mut ps_cond_q = BamQueryDesc::new(&ro_term, 1);
+    ps_cond_q.param_set_group = 2;
+    let sys_ps_cond = BamSystemDesc::new(
+        c"reg73::ps_cond".as_ptr(),
+        core::ptr::null(),
+        0,
+        dummy_sys,
+        core::ptr::null_mut(),
+    )
+    .with_run_if_ctx(dummy_sys, &ps_cond_q, core::ptr::null_mut());
+    // SAFETY: Valid `LoadContext` and descriptor pointers.
+    unsafe {
+        assert_eq!(
+            host_register_system(ctx.as_ffi_ptr(), &sys_ps_cond),
+            FfiResult::INVALID_ARGUMENT
+        );
+    }
+
+    // Main system writes `Reg73Comp`, `run_if_ctx` reads `Reg73Comp` -> must succeed without conflict!
+    let main_w_q = BamQueryDesc::new(&w_term, 1);
+    let ud_sentinel = core::ptr::without_provenance_mut::<c_void>(0x1234);
+    let sys_cond_ok = BamSystemDesc::new(
+        c"reg73::cond_ok".as_ptr(),
+        &main_w_q,
+        1,
+        dummy_sys,
+        core::ptr::null_mut(),
+    )
+    .with_run_if_ctx(dummy_sys, &ro_q, ud_sentinel);
+    // SAFETY: Valid `LoadContext` and descriptor pointers.
+    unsafe {
+        assert_eq!(
+            host_register_system(ctx.as_ffi_ptr(), &sys_cond_ok),
+            FfiResult::OK
+        );
+    }
+    let last_sys = ctx.registered_systems.last().unwrap();
+    let (_, _, cond_ud) = last_sys.run_if_ctx().expect("run_if_ctx parsed");
+    assert_eq!(cond_ud, ud_sentinel);
+    let _ = AccessMode::READ;
+    ctx.finish_init();
 }

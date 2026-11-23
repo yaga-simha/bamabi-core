@@ -126,6 +126,7 @@ fn weak_ordering_and_ambiguity_suppression_work_with_strict_error_detection() {
         "sys_a",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::resource_write(trace_h)],
         }],
         push_step_cb,
@@ -146,6 +147,7 @@ fn weak_ordering_and_ambiguity_suppression_work_with_strict_error_detection() {
         "sys_b",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::resource_write(trace_h)],
         }],
         push_step_cb,
@@ -163,6 +165,7 @@ fn weak_ordering_and_ambiguity_suppression_work_with_strict_error_detection() {
         "sys_c",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::resource_write(trace_h)],
         }],
         push_step_cb,
@@ -177,6 +180,7 @@ fn weak_ordering_and_ambiguity_suppression_work_with_strict_error_detection() {
         "ambig_1",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::resource_write(counter_h)],
         }],
         bump_counter_cb,
@@ -189,6 +193,7 @@ fn weak_ordering_and_ambiguity_suppression_work_with_strict_error_detection() {
         "ambig_2",
         vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::resource_write(counter_h)],
         }],
         bump_counter_cb,
@@ -368,6 +373,7 @@ fn multi_seed_shuffle_seed_determinism_with_weak_chain_and_ambiguity() {
                 sys_name,
                 vec![BamQuerySpecOwned {
                     flags: 0,
+                    param_set_group: 0,
                     terms: vec![BamTermDesc::resource_write(trace_h)],
                 }],
                 push_step_cb,
@@ -384,6 +390,7 @@ fn multi_seed_shuffle_seed_determinism_with_weak_chain_and_ambiguity() {
             "counter_a",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::resource_write(counter_h)],
             }],
             bump_counter_cb,
@@ -396,6 +403,7 @@ fn multi_seed_shuffle_seed_determinism_with_weak_chain_and_ambiguity() {
             "counter_b",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::resource_write(counter_h)],
             }],
             bump_counter_cb,

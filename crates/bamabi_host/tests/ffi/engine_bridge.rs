@@ -402,6 +402,7 @@ mod registry_and_command_bridge {
                 component: BamComponent::from_raw(1),
                 component_id: pos_id,
                 mode: AccessMode::WRITE,
+                flags: 0,
                 uuid: Position::UUID,
                 size: core::mem::size_of::<Position>(),
                 align: core::mem::align_of::<Position>(),
@@ -414,6 +415,7 @@ mod registry_and_command_bridge {
                 component: BamComponent::from_raw(2),
                 component_id: vel_id,
                 mode: AccessMode::READ,
+                flags: 0,
                 uuid: Velocity::UUID,
                 size: core::mem::size_of::<Velocity>(),
                 align: core::mem::align_of::<Velocity>(),
@@ -559,6 +561,7 @@ mod registry_and_command_bridge {
         let registry = app.world().resource::<ModRegistry>().clone();
         let query_specs = vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(pos_h), BamTermDesc::read(vel_h)],
         }];
 
@@ -628,6 +631,7 @@ mod registry_and_command_bridge {
         let registry = app.world().resource::<ModRegistry>().clone();
         let query_specs = vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(pos_h), BamTermDesc::read(vel_h)],
         }];
 
@@ -684,6 +688,7 @@ mod registry_and_command_bridge {
         let registry = app.world().resource::<ModRegistry>().clone();
         let query_specs = vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![BamTermDesc::write(pos_h)],
         }];
 
@@ -891,9 +896,12 @@ mod registry_and_command_bridge {
         #[cfg(target_pointer_width = "64")]
         {
             assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
-            assert_eq!(core::mem::size_of::<BamHostApi>(), 552);
+            assert_eq!(
+                core::mem::size_of::<BamHostApi>(),
+                bamabi_sys::offsets::SIZE_64
+            );
             assert_eq!(core::mem::align_of::<BamHostApi>(), 8);
-            assert_eq!(HOST_API.struct_size, 552);
+            assert_eq!(HOST_API.struct_size as usize, bamabi_sys::offsets::SIZE_64);
             assert_eq!(core::mem::offset_of!(BamHostApi, register_component), 32);
         }
         assert_eq!(HOST_API.abi_version, ABI_VERSION);
@@ -1267,6 +1275,7 @@ mod runtime_10k_soa_pipeline {
         let registry = app.world().resource::<ModRegistry>().clone();
         let query_specs = vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![
                 BamTermDesc::write(pos_h),
                 BamTermDesc::read(vel_h),

@@ -684,3 +684,309 @@ fn command_quotas_enforce_arena_and_spawn_caps_and_rewind_cleanly() {
         .resource_mut::<WorldDropGuard>()
         .recycle_slots_for_guard(&active);
 }
+
+#[test]
+fn rollback_rewinds_arena_spawns_and_shared_quota_with_zero_drift() {
+    use crate::CommandQuotaLimits;
+    use crate::ffi::commands::{host_cmd_insert, host_cmd_spawn, host_cmd_spawn_empty};
+    use crate::ffi::commands_ext::host_cmd_spawn_batch;
+    use crate::ffi::v03_ext::{host_cmd_checkpoint, host_cmd_rollback};
+    use crate::registry::{ComponentOptions, ModRegistry};
+    use bamabi_macros::ModComponent;
+    use bamabi_sys::{FfiEntity, FfiResult};
+    use bevy_ecs::component::Component;
+    use core::ptr::null;
+
+    #[repr(C)]
+    #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, ModComponent)]
+    #[mod_component(name = "cmd_rb::Payload")]
+    struct RbPayload([u64; 4]);
+
+    let mut world = World::new();
+    let cid = world.register_component::<RbPayload>();
+    let mut reg = ModRegistry::new();
+    let val_h = reg
+        .register_component::<RbPayload>(cid, ComponentOptions::new().with_raw_insert())
+        .unwrap();
+    let snap = reg.snapshot_arc();
+    let shared_spawns = Arc::new(AtomicUsize::new(0));
+
+    let mut storage = HostCommandsStorage::new();
+    let limits = CommandQuotaLimits {
+        max_arena_bytes: Some(256),
+        max_spawns_per_frame: Some(5),
+    };
+
+    // Case 1: Rollback directly to `checkpoint == 0` without a prior `checkpoint()` call,
+    // releasing arena bytes, `spawns_queued`, and `shared_frame_spawns` so full quota is reusable.
+    {
+        let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+            .with_quotas(limits, Some(&shared_spawns));
+
+        let payload = RbPayload([1, 2, 3, 4]);
+        let batch_comps = [val_h];
+        let batch_ptrs = [(&raw const payload).cast::<u8>()];
+        let mut e_batch = FfiEntity::NULL;
+        let mut soa_ents = [FfiEntity::NULL; 3];
+        let soa_data = [
+            RbPayload([10, 11, 12, 13]),
+            RbPayload([20, 21, 22, 23]),
+            RbPayload([30, 31, 32, 33]),
+        ];
+        let soa_ptrs = [soa_data.as_ptr().cast::<u8>()];
+        let soa_comps = [val_h];
+        // SAFETY: Valid `HostCommands` and stack pointers/arrays.
+        unsafe {
+            assert_eq!(
+                host_cmd_spawn(
+                    cmds.as_ffi_ptr(),
+                    batch_comps.as_ptr(),
+                    batch_ptrs.as_ptr(),
+                    1,
+                    &raw mut e_batch,
+                ),
+                FfiResult::OK
+            );
+            let mut e_empty = FfiEntity::NULL;
+            assert_eq!(
+                host_cmd_spawn_empty(cmds.as_ffi_ptr(), &raw mut e_empty),
+                FfiResult::OK
+            );
+            assert_eq!(
+                host_cmd_spawn_batch(
+                    cmds.as_ffi_ptr(),
+                    soa_comps.as_ptr(),
+                    soa_ptrs.as_ptr(),
+                    1,
+                    3,
+                    soa_ents.as_mut_ptr(),
+                ),
+                FfiResult::OK
+            );
+            // Quota (5 spawns) is now exhausted: 1 + 1 + 3 = 5.
+            assert_eq!(
+                host_cmd_spawn_empty(cmds.as_ffi_ptr(), &raw mut e_empty),
+                FfiResult::CAPACITY_EXCEEDED
+            );
+        }
+        assert_eq!(shared_spawns.load(Ordering::Acquire), 5);
+        assert!(cmds.storage.arena_bytes_used() > 0);
+    }
+    assert_eq!(storage.spawns_queued(), 5);
+
+    {
+        let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+            .with_quotas(limits, Some(&shared_spawns));
+        // SAFETY: Valid `HostCommands`.
+        unsafe {
+            assert_eq!(host_cmd_rollback(cmds.as_ffi_ptr(), 0), FfiResult::OK);
+        }
+    }
+    assert_eq!(storage.arena_bytes_used(), 0);
+    assert_eq!(storage.spawns_queued(), 0);
+    assert_eq!(shared_spawns.load(Ordering::Acquire), 0);
+
+    // Case 2: Nested checkpoints + full quota reuse + arena reuse.
+    let pre_count = world.query::<Entity>().iter(&world).count();
+    let base_entity = world.spawn_empty().id();
+    let base_ffi = FfiEntity::from_bits(base_entity.to_bits());
+    let mut e1 = FfiEntity::NULL;
+    let mut e2 = FfiEntity::NULL;
+    {
+        let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+            .with_quotas(limits, Some(&shared_spawns));
+        let mut cp1 = 0usize;
+        let mut cp2 = 0usize;
+        let p = RbPayload([99; 4]);
+        // SAFETY: Valid `HostCommands` and stack pointers.
+        unsafe {
+            assert_eq!(
+                host_cmd_spawn_empty(cmds.as_ffi_ptr(), &raw mut e1),
+                FfiResult::OK
+            );
+            assert_eq!(
+                host_cmd_checkpoint(cmds.as_ffi_ptr(), &raw mut cp1),
+                FfiResult::OK
+            );
+        }
+        let wm1_arena = cmds.storage.arena_bytes_used();
+        assert_eq!(wm1_arena, 0);
+        // SAFETY: Valid `HostCommands` and stack pointers.
+        unsafe {
+            assert_eq!(
+                host_cmd_insert(
+                    cmds.as_ffi_ptr(),
+                    base_ffi,
+                    val_h,
+                    (&raw const p).cast::<u8>(),
+                    core::mem::size_of::<RbPayload>(),
+                ),
+                FfiResult::OK
+            );
+            assert_eq!(
+                host_cmd_checkpoint(cmds.as_ffi_ptr(), &raw mut cp2),
+                FfiResult::OK
+            );
+        }
+        let wm2_arena = cmds.storage.arena_bytes_used();
+        assert!(wm2_arena >= core::mem::size_of::<RbPayload>());
+        // SAFETY: Valid `HostCommands` and stack pointers.
+        unsafe {
+            assert_eq!(
+                host_cmd_spawn_empty(cmds.as_ffi_ptr(), &raw mut e2),
+                FfiResult::OK
+            );
+            assert_eq!(
+                host_cmd_insert(
+                    cmds.as_ffi_ptr(),
+                    base_ffi,
+                    val_h,
+                    (&raw const p).cast::<u8>(),
+                    core::mem::size_of::<RbPayload>(),
+                ),
+                FfiResult::OK
+            );
+            assert_eq!(host_cmd_rollback(cmds.as_ffi_ptr(), cp2), FfiResult::OK);
+        }
+        assert_eq!(shared_spawns.load(Ordering::Acquire), 1);
+        assert_eq!(cmds.checkpoint(), cp2);
+        assert_eq!(cmds.storage.arena_bytes_used(), wm2_arena);
+
+        // SAFETY: Valid `HostCommands`.
+        unsafe {
+            assert_eq!(host_cmd_rollback(cmds.as_ffi_ptr(), cp1), FfiResult::OK);
+        }
+        assert_eq!(shared_spawns.load(Ordering::Acquire), 1);
+        assert_eq!(cmds.checkpoint(), cp1);
+        assert_eq!(cmds.storage.arena_bytes_used(), 0);
+        // SAFETY: Valid `HostCommands`; intentionally tests out-of-range checkpoint guard.
+        let bad_res = unsafe { host_cmd_rollback(cmds.as_ffi_ptr(), cp1 + 10) };
+        assert_eq!(bad_res, FfiResult::OUT_OF_RANGE);
+        let _ = null::<u8>();
+    }
+    storage.apply_to_world(&mut world, &snap);
+    assert!(world.entity(base_entity).get::<RbPayload>().is_none());
+    let e1_ent = bevy_ecs::entity::Entity::try_from_bits(e1.to_bits()).unwrap();
+    let e2_ent = bevy_ecs::entity::Entity::try_from_bits(e2.to_bits()).unwrap();
+    assert!(world.get_entity(e1_ent).is_ok());
+    assert!(world.get_entity(e2_ent).is_err());
+    assert_eq!(world.query::<Entity>().iter(&world).count(), pre_count + 2);
+}
+
+#[test]
+fn rollback_ax4_ten_thousand_cycle_stress_constant_arena_and_zero_drift() {
+    use crate::ffi::commands::{host_cmd_insert, host_cmd_spawn_empty};
+    use crate::ffi::register::LoadContext;
+    use crate::ffi::v03_ext::{host_cmd_checkpoint, host_cmd_rollback, host_register_relation};
+    use crate::registry::{ComponentOptions, ModRegistry};
+    use bamabi_macros::ModComponent;
+    use bamabi_sys::{BamRelationDesc, ComponentUuid, FfiEntity, FfiResult};
+    use bevy_ecs::component::Component;
+
+    #[repr(C)]
+    #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, ModComponent)]
+    #[mod_component(name = "ax4::Payload")]
+    struct Ax4Payload([u64; 8]);
+
+    let mut world = World::new();
+    let payload_cid = world.register_component::<Ax4Payload>();
+    let target = world.spawn_empty().id();
+    let target_ffi = FfiEntity::from_bits(target.to_bits());
+
+    let mut reg = ModRegistry::new();
+    let payload_h = reg
+        .register_component::<Ax4Payload>(payload_cid, ComponentOptions::new().with_raw_insert())
+        .unwrap();
+
+    let mut link_h = bamabi_sys::BamComponent::INVALID;
+    let reg = {
+        let mut lctx = LoadContext::with_world_and_mod_id(
+            reg,
+            Arc::new(AtomicBool::new(true)),
+            (&raw mut world).cast::<World>(),
+            Some(ModId(7)),
+        );
+        let rel_desc = BamRelationDesc::new(
+            c"ax4::Link".as_ptr(),
+            ComponentUuid::from_canonical_name("ax4::Link"),
+        );
+        // SAFETY: Valid `LoadContext`, `BamRelationDesc`, and output handle.
+        unsafe {
+            assert_eq!(
+                host_register_relation(lctx.as_ffi_ptr(), &rel_desc, &raw mut link_h),
+                FfiResult::OK
+            );
+        }
+        let r = lctx.registry.clone();
+        lctx.finish_init();
+        r
+    };
+    let snap = reg.snapshot_arc();
+    let shared_spawns = Arc::new(AtomicUsize::new(3));
+
+    let mut storage = HostCommandsStorage::new();
+    let pre_arena_bytes;
+    let pre_spawns;
+    {
+        let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+            .with_quotas(Default::default(), Some(&shared_spawns));
+        let mut seed = FfiEntity::NULL;
+        // SAFETY: Valid `HostCommands` and stack pointers.
+        unsafe {
+            assert_eq!(
+                host_cmd_spawn_empty(cmds.as_ffi_ptr(), &raw mut seed),
+                FfiResult::OK
+            );
+        }
+        pre_arena_bytes = cmds.storage.arena_bytes_used();
+        pre_spawns = cmds.storage.spawns_queued();
+
+        let mut high_water_arena = pre_arena_bytes;
+        let payload = Ax4Payload([42; 8]);
+
+        for _ in 0..10_000 {
+            let mut cp = 0usize;
+            let mut e = FfiEntity::NULL;
+            // SAFETY: Valid `HostCommands`, live reserved entities, and stack payload.
+            unsafe {
+                assert_eq!(
+                    host_cmd_checkpoint(cmds.as_ffi_ptr(), &raw mut cp),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_cmd_spawn_empty(cmds.as_ffi_ptr(), &raw mut e),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_cmd_insert(
+                        cmds.as_ffi_ptr(),
+                        e,
+                        payload_h,
+                        (&raw const payload).cast::<u8>(),
+                        core::mem::size_of::<Ax4Payload>(),
+                    ),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    cmds.insert_relation_raw(e, link_h, target_ffi, core::ptr::null(), 0),
+                    FfiResult::OK
+                );
+            }
+            high_water_arena = high_water_arena.max(cmds.storage.arena_bytes_used());
+            // SAFETY: Valid `HostCommands` and checkpoint from this command buffer.
+            unsafe {
+                assert_eq!(host_cmd_rollback(cmds.as_ffi_ptr(), cp), FfiResult::OK);
+            }
+            assert_eq!(cmds.storage.arena_bytes_used(), pre_arena_bytes);
+            assert_eq!(cmds.storage.spawns_queued(), pre_spawns);
+            assert_eq!(shared_spawns.load(Ordering::Acquire), 4);
+        }
+        assert!(
+            high_water_arena <= 256,
+            "CommandArena high-water mark grew unboundedly: {high_water_arena}"
+        );
+    }
+    storage.clear();
+    assert_eq!(storage.arena_bytes_used(), 0);
+    assert_eq!(storage.spawns_queued(), 0);
+}

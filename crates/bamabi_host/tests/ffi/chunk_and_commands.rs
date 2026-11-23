@@ -290,6 +290,7 @@ mod archetype_and_permission_boundaries {
                 component: BamComponent::from_raw(1),
                 component_id: pos_id,
                 mode: AccessMode::WRITE,
+                flags: 0,
                 uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Position"),
                 size: core::mem::size_of::<Position>(),
                 align: core::mem::align_of::<Position>(),
@@ -302,6 +303,7 @@ mod archetype_and_permission_boundaries {
                 component: BamComponent::from_raw(2),
                 component_id: vel_id,
                 mode: AccessMode::READ,
+                flags: 0,
                 uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Velocity"),
                 size: core::mem::size_of::<Velocity>(),
                 align: core::mem::align_of::<Velocity>(),
@@ -404,6 +406,7 @@ mod archetype_and_permission_boundaries {
                 component: BamComponent::from_raw(1),
                 component_id: pos_id,
                 mode: AccessMode::WRITE,
+                flags: 0,
                 uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Position"),
                 size: core::mem::size_of::<Position>(),
                 align: core::mem::align_of::<Position>(),
@@ -416,6 +419,7 @@ mod archetype_and_permission_boundaries {
                 component: BamComponent::from_raw(2),
                 component_id: vel_id,
                 mode: AccessMode::READ,
+                flags: 0,
                 uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Velocity"),
                 size: core::mem::size_of::<Velocity>(),
                 align: core::mem::align_of::<Velocity>(),
@@ -428,6 +432,7 @@ mod archetype_and_permission_boundaries {
                 component: BamComponent::from_raw(3),
                 component_id: arm_id,
                 mode: AccessMode::FILTER_ONLY,
+                flags: 0,
                 uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Armor"),
                 size: core::mem::size_of::<Armor>(),
                 align: core::mem::align_of::<Armor>(),
@@ -498,6 +503,7 @@ mod archetype_and_permission_boundaries {
             component: BamComponent::from_raw(1),
             component_id: pos_id,
             mode: AccessMode::WRITE,
+            flags: 0,
             uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Position"),
             size: core::mem::size_of::<Position>(),
             align: core::mem::align_of::<Position>(),
@@ -813,6 +819,9 @@ mod archetype_and_permission_boundaries {
             before_weak_count: 0,
             ambiguous_with: core::ptr::null(),
             ambiguous_with_count: 0,
+            run_if_ctx: None,
+            run_if_query: core::ptr::null(),
+            run_if_ctx_user_data: core::ptr::null_mut(),
         };
         assert_eq!(
             unsafe { host_register_system(core::ptr::null_mut(), &valid_sys_desc) },
@@ -889,6 +898,9 @@ mod archetype_and_permission_boundaries {
             before_weak_count: 0,
             ambiguous_with: core::ptr::null(),
             ambiguous_with_count: 0,
+            run_if_ctx: None,
+            run_if_query: core::ptr::null(),
+            run_if_ctx_user_data: core::ptr::null_mut(),
         };
         let mut load_ctx = LoadContext::new(registry);
         assert_eq!(
@@ -909,6 +921,7 @@ mod archetype_and_permission_boundaries {
                 } else {
                     AccessMode::READ
                 },
+                flags: 0,
                 uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Position"),
                 size: core::mem::size_of::<Position>(),
                 align: core::mem::align_of::<Position>(),

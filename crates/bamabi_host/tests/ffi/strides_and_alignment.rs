@@ -144,6 +144,7 @@ mod heterogeneous_alignment_and_isolation {
         let registry = app.world().resource::<ModRegistry>().clone();
         let query_specs = vec![BamQuerySpecOwned {
             flags: 0,
+            param_set_group: 0,
             terms: vec![
                 BamTermDesc::read(h_byte),
                 BamTermDesc::read(h_word),
@@ -217,6 +218,7 @@ mod heterogeneous_alignment_and_isolation {
             "bounds_checker",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::write(pos_h)],
             }],
             bounds_checker_callback,
@@ -618,6 +620,7 @@ mod dynamic_component_lifecycle {
             "score_mutator",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::write(score_h)],
             }],
             dynamic_score_mutator_system,
@@ -729,6 +732,7 @@ mod dynamic_component_lifecycle {
             "selective_change_sys",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::write(mana_h)],
             }],
             selective_change_system,
@@ -872,6 +876,7 @@ mod column_bounds_and_zst_alignment {
             "bounds_stress_sys",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::write(comp_h)],
             }],
             bounds_stress_callback,
@@ -1426,6 +1431,7 @@ mod empirical_pointer_arithmetic_and_decoupling {
             "pointer_arith_verifier",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![
                     BamTermDesc::write(h1),
                     BamTermDesc::write(h16),
@@ -1596,6 +1602,7 @@ mod empirical_pointer_arithmetic_and_decoupling {
             "zst_system",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![
                     BamTermDesc::read(h_zst1),
                     BamTermDesc::write(h_zst16),
@@ -1717,6 +1724,7 @@ mod empirical_pointer_arithmetic_and_decoupling {
             "multi_chunk_collector",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::read(h_shared)],
             }],
             multi_chunk_collector_system,
@@ -1813,6 +1821,7 @@ mod empirical_pointer_arithmetic_and_decoupling {
             "tick_marker",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::write(comp_h)],
             }],
             fine_grained_change_marker_system,

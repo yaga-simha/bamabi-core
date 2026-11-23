@@ -287,6 +287,7 @@ fn guest_system_ffi_guards_random_access_policies_and_summary_or_groups() {
             component: sparse_h,
             component_id: sparse_id,
             mode: AccessMode::ADDED,
+            flags: 0,
             uuid: SparseFlag::UUID,
             size: 4,
             align: 4,
@@ -299,6 +300,7 @@ fn guest_system_ffi_guards_random_access_policies_and_summary_or_groups() {
             component: imm_h,
             component_id: imm_id,
             mode: AccessMode::READ,
+            flags: 0,
             uuid: ImmComp::UUID,
             size: 4,
             align: 4,
@@ -311,6 +313,7 @@ fn guest_system_ffi_guards_random_access_policies_and_summary_or_groups() {
             component: val_h,
             component_id: val_id,
             mode: AccessMode::FILTER_ONLY,
+            flags: 0,
             uuid: SummaryVal::UUID,
             size: 4,
             align: 4,
@@ -325,6 +328,7 @@ fn guest_system_ffi_guards_random_access_policies_and_summary_or_groups() {
             component: res_h,
             component_id: res_id,
             mode: AccessMode::RESOURCE_WRITE,
+            flags: 0,
             uuid: TestRes::UUID,
             size: 8,
             align: 8,
@@ -337,6 +341,7 @@ fn guest_system_ffi_guards_random_access_policies_and_summary_or_groups() {
             component: BamComponent::from_raw(998),
             component_id: res_id,
             mode: AccessMode::RESOURCE_WRITE,
+            flags: 0,
             uuid: TestRes::UUID,
             size: 8,
             align: 8,
@@ -530,6 +535,7 @@ fn guest_system_ffi_guards_random_access_policies_and_summary_or_groups() {
         component: sparse_h,
         component_id: sparse_id,
         mode: AccessMode::WRITE,
+        flags: 0,
         uuid: SparseFlag::UUID,
         size: 4,
         align: 4,
@@ -744,4 +750,180 @@ fn guest_system_ffi_guards_random_access_policies_and_summary_or_groups() {
         });
         assert_eq!(col.drain().len(), 1);
     }
+}
+
+#[test]
+#[allow(clippy::cast_ptr_alignment)]
+fn run_if_ctx_preserves_changed_ticks_when_skipped_supports_read_under_write_and_fault_quarantine()
+{
+    use crate::ffi::iter::{host_iter_column_mutable, host_iter_column_readonly};
+    use bamabi_sys::MAX_QUERIES_PER_SYSTEM;
+
+    struct CondState {
+        allow: AtomicBool,
+        panic_now: AtomicBool,
+        cond_calls: AtomicUsize,
+        main_calls: AtomicUsize,
+        observed_changed_rows: AtomicUsize,
+        observed_sum_in_cond: AtomicUsize,
+    }
+
+    unsafe extern "C" fn cond_cb(ctx: *mut BamSystemCtx, ud: *mut c_void) -> FfiResult {
+        // SAFETY: `ud` points to live `CondState`.
+        let st = unsafe { &*ud.cast::<CondState>() };
+        st.cond_calls.fetch_add(1, Ordering::Relaxed);
+        if st.panic_now.load(Ordering::Relaxed) {
+            return FfiResult::PANIC_CAUGHT;
+        }
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        // SAFETY: `ctx` is an active `run_if_ctx` execution context with query index `0`.
+        assert_eq!(unsafe { host_sys_query(ctx, 0, &mut iter) }, FfiResult::OK);
+        let mut count = 0usize;
+        let mut sum = 0usize;
+        // SAFETY: Valid `BamIter`.
+        while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
+            // `run_if_ctx` query is strictly read-only (`host_iter_column_mutable` must be null).
+            // SAFETY: Valid `BamIter`.
+            assert!(unsafe { host_iter_column_mutable(iter, 0) }.is_null());
+            // SAFETY: Valid `BamIter`.
+            let ptr = unsafe { host_iter_column_readonly(iter, 0) }.cast::<SummaryVal>();
+            for r in 0..count {
+                // SAFETY: `r < count`.
+                sum += unsafe { (*ptr.add(r)).0 } as usize;
+            }
+        }
+        st.observed_sum_in_cond.store(sum, Ordering::Relaxed);
+        if st.allow.load(Ordering::Relaxed) {
+            FfiResult::OK
+        } else {
+            FfiResult::NOT_FOUND
+        }
+    }
+
+    unsafe extern "C" fn main_changed_writer_cb(
+        ctx: *mut BamSystemCtx,
+        ud: *mut c_void,
+    ) -> FfiResult {
+        // SAFETY: `ud` points to live `CondState`.
+        let st = unsafe { &*ud.cast::<CondState>() };
+        st.main_calls.fetch_add(1, Ordering::Relaxed);
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        // SAFETY: Valid `BamSystemCtx`.
+        assert_eq!(unsafe { host_sys_query(ctx, 0, &mut iter) }, FfiResult::OK);
+        let mut count = 0usize;
+        let mut rows = 0usize;
+        // SAFETY: Valid `BamIter`.
+        while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
+            // SAFETY: Column 0 is `WRITE | CHANGED` -> must return non-null mutable pointer!
+            let ptr = unsafe { host_iter_column_mutable(iter, 0) }.cast::<SummaryVal>();
+            assert!(!ptr.is_null());
+            rows += count;
+            for r in 0..count {
+                // SAFETY: `r < count`.
+                unsafe { (*ptr.add(r)).0 += 1.0 };
+            }
+        }
+        st.observed_changed_rows.store(rows, Ordering::Relaxed);
+        FfiResult::OK
+    }
+
+    let mut world = World::new();
+    let cid = world.register_component::<SummaryVal>();
+    let mut reg = ModRegistry::new();
+    let h = reg
+        .register_component::<SummaryVal>(cid, ComponentOptions::new())
+        .unwrap();
+    world.insert_resource(reg.clone());
+    let e = world.spawn(SummaryVal(5.0)).id();
+
+    let state = CondState {
+        allow: AtomicBool::new(true),
+        panic_now: AtomicBool::new(false),
+        cond_calls: AtomicUsize::new(0),
+        main_calls: AtomicUsize::new(0),
+        observed_changed_rows: AtomicUsize::new(0),
+        observed_sum_in_cond: AtomicUsize::new(0),
+    };
+    let ud_ptr = (&state as *const CondState).cast_mut().cast::<c_void>();
+
+    let main_term = BamTermDesc::write(h).with_changed();
+    let cond_term = BamTermDesc::read(h);
+
+    let mut sys = GuestSystem::new(
+        "cond_sys",
+        vec![BamQuerySpecOwned::new(vec![main_term])],
+        main_changed_writer_cb,
+        ud_ptr,
+        reg.clone(),
+    )
+    .with_run_if_ctx(Some((
+        cond_cb,
+        BamQuerySpecOwned::new(vec![cond_term]),
+        ud_ptr,
+    )))
+    .with_error_policy(ModErrorPolicy::ReportToBevy);
+    sys.initialize(&mut world);
+
+    // Frame 1: `cond_cb` returns OK -> `main_changed_writer_cb` runs and advances `last_run`.
+    sys.run((), &mut world).unwrap();
+    assert_eq!(state.cond_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(state.main_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(state.observed_sum_in_cond.load(Ordering::Relaxed), 5);
+    assert_eq!(state.observed_changed_rows.load(Ordering::Relaxed), 1);
+
+    // Frame 2: `e` is mutated AFTER Frame 1, while `cond_cb` returns `NOT_FOUND` (skip).
+    // Skipping MUST NOT advance `sys.last_run`!
+    world.increment_change_tick();
+    world.get_mut::<SummaryVal>(e).unwrap().0 = 20.0;
+    state.allow.store(false, Ordering::Relaxed);
+    sys.run((), &mut world).unwrap();
+    assert_eq!(state.cond_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(state.main_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(state.observed_sum_in_cond.load(Ordering::Relaxed), 20);
+
+    // Frame 3: advance change tick again with NO mutation; re-enable `cond_cb`.
+    // Because `last_run` stayed at Frame 1, Frame 2's mutation MUST STILL be detected!
+    world.increment_change_tick();
+    state.allow.store(true, Ordering::Relaxed);
+    state.observed_changed_rows.store(0, Ordering::Relaxed);
+    sys.run((), &mut world).unwrap();
+    assert_eq!(state.cond_calls.load(Ordering::Relaxed), 3);
+    assert_eq!(state.main_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(state.observed_changed_rows.load(Ordering::Relaxed), 1);
+
+    // Frame 4: `PANIC_CAUGHT` inside `run_if_ctx` triggers fault quarantine without running main cb.
+    state.panic_now.store(true, Ordering::Relaxed);
+    assert!(sys.run((), &mut world).is_err());
+    assert!(!sys.is_enabled());
+    assert_eq!(state.main_calls.load(Ordering::Relaxed), 2);
+
+    // Also confirm `GuestSystem` with 16 queries (`MAX_QUERIES_PER_SYSTEM = 16`) executes all 16 query handles.
+    unsafe extern "C" fn sys_16_cb(ctx: *mut BamSystemCtx, ud: *mut c_void) -> FfiResult {
+        // SAFETY: `ud` points to `AtomicUsize`.
+        let hits = unsafe { &*ud.cast::<AtomicUsize>() };
+        for q in 0..MAX_QUERIES_PER_SYSTEM {
+            let mut iter: *mut BamIter = core::ptr::null_mut();
+            // SAFETY: Valid `BamSystemCtx`.
+            assert_eq!(unsafe { host_sys_query(ctx, q, &mut iter) }, FfiResult::OK);
+            let mut count = 0usize;
+            // SAFETY: Valid `BamIter`.
+            while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
+                hits.fetch_add(count, Ordering::Relaxed);
+            }
+        }
+        FfiResult::OK
+    }
+
+    let hits = AtomicUsize::new(0);
+    let specs_16 = vec![BamQuerySpecOwned::new(vec![BamTermDesc::read(h)]); MAX_QUERIES_PER_SYSTEM];
+    let mut sys16 = GuestSystem::new(
+        "sys_16_queries",
+        specs_16,
+        sys_16_cb,
+        (&hits as *const AtomicUsize).cast_mut().cast::<c_void>(),
+        reg,
+    );
+    sys16.initialize(&mut world);
+    sys16.run((), &mut world).unwrap();
+    assert_eq!(hits.load(Ordering::Relaxed), MAX_QUERIES_PER_SYSTEM);
 }

@@ -85,12 +85,12 @@ int main(void) {
 
     assert(BAM_HOST_API_MIN_V0_2_SIZE == 224u);
 #if UINTPTR_MAX == 0xffffffffffffffffULL
-    assert(sizeof(BamHostApi) == 552u);
+    assert(sizeof(BamHostApi) == 592u);
 #else
-    assert(sizeof(BamHostApi) == 280u);
+    assert(sizeof(BamHostApi) == 300u);
 #endif
     assert(BAM_ALIGNOF(BamHostApi) == sizeof(void*));
-    assert(BAM_HOST_API_SLOT_COUNT == 68u);
+    assert(BAM_HOST_API_SLOT_COUNT == 73u);
 
     memset(&desc, 0, sizeof(desc));
     desc.struct_size = (uint32_t)sizeof(BamComponentDesc);

@@ -8,7 +8,7 @@
 
 | Crate | Policy | Role | Crate Docs |
 |---|---|---|---|
-| `bamabi_host_sys` | Host `unsafe` isolated behind sealed `pub(crate)` `ffi/` | 68/68 `HOST_API` slots, `GuestSystem`, `HostIter`, `CommandArena`, `DROP_PAGES`, `ModRegistry`, `ModHost`, `signing` | [`README`](crates/bamabi_host_sys/README.md) · [`ARCHITECTURE`](crates/bamabi_host_sys/ARCHITECTURE.md) · [`TESTS`](crates/bamabi_host_sys/TESTS.md) · [`GEMINI`](crates/bamabi_host_sys/GEMINI.md) |
+| `bamabi_host_sys` | Host `unsafe` isolated behind sealed `pub(crate)` `ffi/` | 73/73 `HOST_API` slots, `GuestSystem`, `HostIter`, `CommandArena`, `DROP_PAGES`, `ModRegistry`, `ModHost`, `signing` | [`README`](crates/bamabi_host_sys/README.md) · [`ARCHITECTURE`](crates/bamabi_host_sys/ARCHITECTURE.md) · [`TESTS`](crates/bamabi_host_sys/TESTS.md) · [`GEMINI`](crates/bamabi_host_sys/GEMINI.md) |
 | `bamabi_host` | **`#![forbid(unsafe_code)]`** (strictly headless) | `AbiModPlugin`, `ModLifecycleFlush`, `ModAppExt`, `ModWorldExt`, `ModCommandsExt`, `ModBudgetPolicy`, `ModDagErrorKind` | [`README`](crates/bamabi_host/README.md) · [`ARCHITECTURE`](crates/bamabi_host/ARCHITECTURE.md) · [`TESTS`](crates/bamabi_host/TESTS.md) · [`GEMINI`](crates/bamabi_host/GEMINI.md) |
 | `bamabi_watcher` | **`#![forbid(unsafe_code)]`** (`notify` isolated here) | `ModHotReloadPlugin`, `ModHotReloadWatcher`, `ModHotReloadHistory` | [`README`](crates/bamabi_watcher/README.md) · [`ARCHITECTURE`](crates/bamabi_watcher/ARCHITECTURE.md) · [`TESTS`](crates/bamabi_watcher/TESTS.md) · [`GEMINI`](crates/bamabi_watcher/GEMINI.md) |
 

@@ -203,6 +203,7 @@ BAM_EXPORT BamResult bamabi_init(const BamHostApi* api, BamLoadCtx* load_ctx, Ba
     if (r != BAM_RESULT_OK) return r;
     BamTermDesc term = bam_term_desc(g_state.counter_res, BAM_ACCESS_RESOURCE_WRITE, 0u);
     BamQueryDesc q;
+    memset(&q, 0, sizeof(q));
     q.struct_size = (uint32_t)sizeof(BamQueryDesc);
     q.flags = 0u;
     q.terms = &term;

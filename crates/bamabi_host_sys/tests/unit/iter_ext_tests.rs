@@ -136,6 +136,7 @@ fn par_readonly_dense_sparse_permissions_and_error_propagation() {
         component: BamComponent::from_raw(1),
         component_id: cid,
         mode,
+        flags: 0,
         uuid: ComponentUuid::from_canonical_name("iter_ext::test"),
         size,
         align: 8,
@@ -306,6 +307,7 @@ fn iter_read_removed_guards_and_batch_read() {
         component: BamComponent::from_raw(1),
         component_id: cid,
         mode,
+        flags: 0,
         uuid: ComponentUuid::from_canonical_name("iter_ext::removed"),
         size: core::mem::size_of::<ParRoVal>(),
         align: 8,
@@ -611,6 +613,7 @@ fn iter_read_removed_partial_batch_conservation() {
         component: BamComponent::from_raw(1),
         component_id: val_cid,
         mode: AccessMode::REMOVED_READ,
+        flags: 0,
         uuid: ComponentUuid::from_canonical_name("iter_ext::removed_cons"),
         size: core::mem::size_of::<ParRoVal>(),
         align: 8,
@@ -675,4 +678,426 @@ fn iter_read_removed_partial_batch_conservation() {
         }
         assert_eq!(collected, spawned);
     }
+}
+
+#[test]
+#[allow(clippy::cast_ptr_alignment)]
+fn host_iter_next_chunk_batch_and_column_ticks_with_miri_interleaving() {
+    use crate::ffi::iter::{
+        host_iter_column_mutable, host_iter_column_ticks, host_iter_mark_changed_range,
+        host_iter_next_chunk_batch,
+    };
+    use bamabi_sys::{BAM_TERM_FLAG_CHANGED, FfiBool, FfiEntity};
+
+    #[repr(C)]
+    #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+    struct BatchCompB(i64);
+
+    let mut world = World::new();
+    let cid_a = world.register_component::<ParRoVal>();
+    let cid_b = world.register_component::<BatchCompB>();
+    let cid_sp = world.register_component::<ParRoSparse>();
+
+    let e0 = world
+        .spawn((ParRoVal(10), BatchCompB(100), ParRoSparse(1)))
+        .id();
+    let e1 = world
+        .spawn((ParRoVal(20), BatchCompB(200), ParRoSparse(2)))
+        .id();
+    let _e_no_sp = world.spawn((ParRoVal(30), BatchCompB(300))).id();
+
+    let added_tick = world.change_tick();
+    world.increment_change_tick();
+    let mutate_tick = world.change_tick();
+    world.get_mut::<BatchCompB>(e1).unwrap().0 = 205;
+    let last_run = added_tick;
+    world.increment_change_tick();
+    let this_run = world.change_tick();
+
+    let plan = QueryPlan::from_terms(vec![
+        QueryTermMeta {
+            component: BamComponent::from_raw(1),
+            component_id: cid_a,
+            mode: AccessMode::WRITE,
+            flags: 0,
+            uuid: ComponentUuid::from_canonical_name("batch_ticks::A"),
+            size: core::mem::size_of::<ParRoVal>(),
+            align: 8,
+            storage_flags: 0,
+            msg_read_batch_fn: None,
+            msg_send_fn: None,
+            msg_write_batch_fn: None,
+        },
+        QueryTermMeta {
+            component: BamComponent::from_raw(2),
+            component_id: cid_b,
+            mode: AccessMode::READ,
+            flags: 0,
+            uuid: ComponentUuid::from_canonical_name("batch_ticks::B"),
+            size: core::mem::size_of::<BatchCompB>(),
+            align: 8,
+            storage_flags: 0,
+            msg_read_batch_fn: None,
+            msg_send_fn: None,
+            msg_write_batch_fn: None,
+        },
+        QueryTermMeta {
+            component: BamComponent::from_raw(3),
+            component_id: cid_sp,
+            mode: AccessMode::OPTIONAL_READ,
+            flags: 0,
+            uuid: ComponentUuid::from_canonical_name("batch_ticks::Sp"),
+            size: core::mem::size_of::<ParRoSparse>(),
+            align: 8,
+            storage_flags: BAM_STORAGE_FLAG_SPARSE_SET,
+            msg_read_batch_fn: None,
+            msg_send_fn: None,
+            msg_write_batch_fn: None,
+        },
+        QueryTermMeta {
+            component: BamComponent::from_raw(4),
+            component_id: cid_b,
+            mode: AccessMode::HAS,
+            flags: 0,
+            uuid: ComponentUuid::from_canonical_name("batch_ticks::HasB"),
+            size: 0,
+            align: 1,
+            storage_flags: 0,
+            msg_read_batch_fn: None,
+            msg_send_fn: None,
+            msg_write_batch_fn: None,
+        },
+    ]);
+    let _ = BAM_TERM_FLAG_CHANGED;
+
+    let tables = &world.storages().tables;
+    let archetypes = &world.archetypes();
+    let sparse_sets = &world.storages().sparse_sets;
+    let matched_archs: Vec<_> = archetypes
+        .iter()
+        .filter(|a| a.contains(cid_a) && a.contains(cid_b))
+        .map(|a| a.id())
+        .collect();
+    let mut scratch = SparseRowScratch::default();
+    scratch.ensure_terms(plan.terms.len());
+    let mut iter = HostIter::new_archetypal(
+        tables,
+        archetypes,
+        sparse_sets,
+        &matched_archs,
+        &plan,
+        &mut scratch,
+        last_run,
+        this_run,
+    );
+
+    // Null guards.
+    let mut out_count = 0usize;
+    let mut out_ents: *const FfiEntity = core::ptr::null();
+    let mut out_cols = [core::ptr::dangling_mut::<u8>(); 6];
+    // SAFETY: Intentional invalid-pointer guard checks.
+    unsafe {
+        assert_eq!(
+            host_iter_next_chunk_batch(
+                core::ptr::null_mut(),
+                &raw mut out_count,
+                &raw mut out_ents,
+                out_cols.as_mut_ptr(),
+                6,
+                0,
+            ),
+            FfiBool::FALSE
+        );
+        assert_eq!(
+            host_iter_column_ticks(
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            ),
+            FfiResult::NULL_POINTER
+        );
+    }
+
+    let mut total_rows = 0usize;
+    let mut saw_e0_changed = false;
+    let mut saw_e1_changed = false;
+    // Mark column 0 changed selectively via `mark_changed_mask = 0b01`!
+    // SAFETY: `iter` and output stack buffers are valid.
+    while unsafe {
+        host_iter_next_chunk_batch(
+            iter.as_ffi_ptr(),
+            &raw mut out_count,
+            &raw mut out_ents,
+            out_cols.as_mut_ptr(),
+            6,
+            1,
+        )
+    }
+    .get()
+    {
+        total_rows += out_count;
+        assert!(!out_ents.is_null());
+        assert!(!out_cols[0].is_null());
+        assert!(!out_cols[1].is_null());
+        assert!(!out_cols[3].is_null());
+        assert!(
+            out_cols[4].is_null(),
+            "trailing unused column slots must be zeroed"
+        );
+        assert!(out_cols[5].is_null());
+
+        let mut added_ptr: *const u32 = core::ptr::null();
+        let mut changed_ptr: *const u32 = core::ptr::null();
+        let mut out_last = 0u32;
+        let mut out_this = 0u32;
+
+        // Interleave `host_iter_column_ticks`, `host_iter_column_mutable`, `host_iter_mark_changed_range`,
+        // and dereference of `*const u32` tick slices (Tree-Borrows verification!).
+        // SAFETY: Valid `HostIter` with active chunk.
+        unsafe {
+            assert_eq!(
+                host_iter_column_ticks(
+                    iter.as_ffi_ptr(),
+                    0,
+                    &raw mut added_ptr,
+                    &raw mut changed_ptr,
+                    &raw mut out_last,
+                    &raw mut out_this,
+                ),
+                FfiResult::OK
+            );
+            assert_eq!(out_last, last_run.get());
+            assert_eq!(out_this, this_run.get());
+            assert!(!added_ptr.is_null());
+            assert!(!changed_ptr.is_null());
+
+            let col0_mut = host_iter_column_mutable(iter.as_ffi_ptr(), 0);
+            assert_eq!(col0_mut, out_cols[0]);
+            (*col0_mut.cast::<ParRoVal>()).0 += 1;
+            assert_eq!(
+                host_iter_mark_changed_range(iter.as_ffi_ptr(), 0, 0, 1),
+                FfiResult::OK
+            );
+            // Re-read `added_ptr` / `changed_ptr` after mutable column/mark calls.
+            assert_eq!(*added_ptr, added_tick.get());
+            assert_eq!(*changed_ptr, this_run.get());
+
+            // Column 1 (`BatchCompB`, READ) ticks reflect prior mutation on `e1`.
+            assert_eq!(
+                host_iter_column_ticks(
+                    iter.as_ffi_ptr(),
+                    1,
+                    core::ptr::null_mut(),
+                    &raw mut changed_ptr,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                ),
+                FfiResult::OK
+            );
+            for r in 0..out_count {
+                let ent = (*out_ents.add(r)).to_bits();
+                let chg = *changed_ptr.add(r);
+                if ent == e0.to_bits() && chg == added_tick.get() {
+                    saw_e0_changed = true;
+                }
+                if ent == e1.to_bits() && chg == mutate_tick.get() {
+                    saw_e1_changed = true;
+                }
+            }
+
+            // Column 2 (`ParRoSparse`) is SparseSet -> `UNSUPPORTED`.
+            assert_eq!(
+                host_iter_column_ticks(
+                    iter.as_ffi_ptr(),
+                    2,
+                    &raw mut added_ptr,
+                    &raw mut changed_ptr,
+                    &raw mut out_last,
+                    &raw mut out_this,
+                ),
+                FfiResult::UNSUPPORTED
+            );
+            // Column 3 (`HAS`) has no backing component array -> `INVALID_COMPONENT`.
+            assert_eq!(
+                host_iter_column_ticks(
+                    iter.as_ffi_ptr(),
+                    3,
+                    &raw mut added_ptr,
+                    &raw mut changed_ptr,
+                    &raw mut out_last,
+                    &raw mut out_this,
+                ),
+                FfiResult::INVALID_COMPONENT
+            );
+            // Out of range column index -> `OUT_OF_RANGE`.
+            assert_eq!(
+                host_iter_column_ticks(
+                    iter.as_ffi_ptr(),
+                    4,
+                    &raw mut added_ptr,
+                    &raw mut changed_ptr,
+                    &raw mut out_last,
+                    &raw mut out_this,
+                ),
+                FfiResult::OUT_OF_RANGE
+            );
+        }
+    }
+    assert_eq!(total_rows, 3);
+    assert!(saw_e0_changed);
+    assert!(saw_e1_changed);
+    assert_eq!(world.get::<ParRoVal>(e0).unwrap().0, 11);
+}
+
+#[test]
+#[allow(clippy::cast_ptr_alignment)]
+fn term_flags_changed_added_write_read_filter_only_optional_and_or_group() {
+    use crate::ffi::iter::{
+        host_iter_column_mutable, host_iter_column_readonly, host_iter_entities,
+    };
+    use bamabi_sys::{BAM_TERM_FLAG_ADDED, BAM_TERM_FLAG_CHANGED};
+
+    #[repr(C)]
+    #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+    struct FlagB(i64);
+
+    let mut world = World::new();
+    let cid_a = world.register_component::<ParRoVal>();
+    let cid_b = world.register_component::<FlagB>();
+    let cid_sp = world.register_component::<ParRoSparse>();
+
+    // Spawn `e_old` at frame 1, advance tick, spawn `e_new` & mutate `e_old`'s `FlagB` later.
+    let e_old = world.spawn((ParRoVal(1), FlagB(10))).id();
+    let e_neither = world.spawn((ParRoVal(2), FlagB(20))).id();
+    world.increment_change_tick();
+    let last_run = world.change_tick();
+    world.increment_change_tick();
+
+    // Mutate `ParRoVal` on `e_old`, keep `e_neither` untouched, spawn `e_new` with `ParRoSparse` added.
+    world.get_mut::<ParRoVal>(e_old).unwrap().0 = 100;
+    let e_new = world.spawn((ParRoVal(3), FlagB(30), ParRoSparse(9))).id();
+    world.increment_change_tick();
+    let this_run = world.change_tick();
+
+    // 1. `WRITE | BAM_TERM_FLAG_CHANGED` must keep column ptr (NOT suppressed!) and filter to `e_old` + `e_new`.
+    let write_changed_plan = QueryPlan::from_terms(vec![QueryTermMeta {
+        component: BamComponent::from_raw(1),
+        component_id: cid_a,
+        mode: AccessMode::WRITE,
+        flags: BAM_TERM_FLAG_CHANGED,
+        uuid: ComponentUuid::from_canonical_name("tf::A"),
+        size: core::mem::size_of::<ParRoVal>(),
+        align: 8,
+        storage_flags: 0,
+        msg_read_batch_fn: None,
+        msg_send_fn: None,
+        msg_write_batch_fn: None,
+    }]);
+    let mut matched = Vec::new();
+    let table_ids = [world.entity(e_old).archetype().table_id()];
+    let mut iter = HostIter::new_dense(
+        &world.storages().tables,
+        &table_ids,
+        &write_changed_plan,
+        last_run,
+        this_run,
+    );
+    let mut count = 0usize;
+    // SAFETY: Valid `HostIter`.
+    while unsafe { host_iter_next_chunk(iter.as_ffi_ptr(), &mut count) }.get() {
+        // SAFETY: Chunk active and column 0 is `WRITE | CHANGED` (must return non-null ptr!).
+        unsafe {
+            let mut_ptr = host_iter_column_mutable(iter.as_ffi_ptr(), 0).cast::<ParRoVal>();
+            assert!(
+                !mut_ptr.is_null(),
+                "WRITE | CHANGED must NOT suppress column pointer"
+            );
+            let ents = host_iter_entities(iter.as_ffi_ptr());
+            for r in 0..count {
+                (*mut_ptr.add(r)).0 += 1000;
+                matched.push((*ents.add(r)).to_bits());
+            }
+        }
+    }
+    matched.sort();
+    let mut expected = vec![e_old.to_bits(), e_new.to_bits()];
+    expected.sort();
+    assert_eq!(matched, expected);
+    assert_eq!(world.get::<ParRoVal>(e_old).unwrap().0, 1100);
+    assert_eq!(world.get::<ParRoVal>(e_neither).unwrap().0, 2);
+
+    // 2. `READ | ADDED` (`or_group = 0`) combined with `or_group = 1` `(FILTER_ONLY | CHANGED)` OR `(OPTIONAL_READ | CHANGED)`!
+    let or_plan = QueryPlan::from_terms_with_or_groups(
+        vec![
+            QueryTermMeta {
+                component: BamComponent::from_raw(1),
+                component_id: cid_b,
+                mode: AccessMode::READ,
+                flags: BAM_TERM_FLAG_ADDED,
+                uuid: ComponentUuid::from_canonical_name("tf::B"),
+                size: core::mem::size_of::<FlagB>(),
+                align: 8,
+                storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
+                msg_write_batch_fn: None,
+            },
+            QueryTermMeta {
+                component: BamComponent::from_raw(2),
+                component_id: cid_a,
+                mode: AccessMode::FILTER_ONLY,
+                flags: BAM_TERM_FLAG_CHANGED,
+                uuid: ComponentUuid::from_canonical_name("tf::FilterA"),
+                size: core::mem::size_of::<ParRoVal>(),
+                align: 8,
+                storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
+                msg_write_batch_fn: None,
+            },
+            QueryTermMeta {
+                component: BamComponent::from_raw(3),
+                component_id: cid_sp,
+                mode: AccessMode::OPTIONAL_READ,
+                flags: BAM_TERM_FLAG_CHANGED,
+                uuid: ComponentUuid::from_canonical_name("tf::Sp"),
+                size: core::mem::size_of::<ParRoSparse>(),
+                align: 8,
+                storage_flags: BAM_STORAGE_FLAG_SPARSE_SET,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
+                msg_write_batch_fn: None,
+            },
+        ],
+        &[0, 1, 1],
+    );
+    let mut scratch = SparseRowScratch::default();
+    scratch.ensure_terms(or_plan.terms.len());
+    let archs: Vec<_> = world.archetypes().iter().map(|a| a.id()).collect();
+    let mut or_iter = HostIter::new_archetypal(
+        &world.storages().tables,
+        world.archetypes(),
+        &world.storages().sparse_sets,
+        &archs,
+        &or_plan,
+        &mut scratch,
+        last_run,
+        this_run,
+    );
+    let mut or_matched = Vec::new();
+    // SAFETY: Valid `HostIter`.
+    while unsafe { host_iter_next_chunk(or_iter.as_ffi_ptr(), &mut count) }.get() {
+        // SAFETY: Valid chunk; col 0 (`READ | ADDED`) must return non-null ptr.
+        unsafe {
+            assert!(!host_iter_column_readonly(or_iter.as_ffi_ptr(), 0).is_null());
+            let ents = host_iter_entities(or_iter.as_ffi_ptr());
+            for r in 0..count {
+                or_matched.push((*ents.add(r)).to_bits());
+            }
+        }
+    }
+    assert_eq!(or_matched, vec![e_new.to_bits()]);
 }

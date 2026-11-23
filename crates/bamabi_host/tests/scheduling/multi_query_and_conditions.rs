@@ -204,10 +204,12 @@ fn test_multi_query_without_filter_and_intra_system_conflict_detection() {
             vec![
                 BamQuerySpecOwned {
                     flags: 0,
+                    param_set_group: 0,
                     terms: vec![BamTermDesc::write(bad_pos_h)],
                 },
                 BamQuerySpecOwned {
                     flags: 0,
+                    param_set_group: 0,
                     terms: vec![BamTermDesc::read(bad_pos_h)],
                 },
             ],
@@ -229,6 +231,7 @@ fn test_multi_query_without_filter_and_intra_system_conflict_detection() {
         vec![
             BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![
                     BamTermDesc::write(pos_h),
                     BamTermDesc::filter_only(mass_h),
@@ -237,6 +240,7 @@ fn test_multi_query_without_filter_and_intra_system_conflict_detection() {
             },
             BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![
                     BamTermDesc::read(vel_h),
                     BamTermDesc::filter_only(armor_h),
@@ -995,6 +999,7 @@ mod multi_query_nesting_stress {
             "zero_entity_sys",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::read(pos_h), BamTermDesc::write(vel_h)],
             }],
             zero_entity_callback,
@@ -1038,6 +1043,7 @@ mod multi_query_nesting_stress {
             "single_entity_sys",
             vec![BamQuerySpecOwned {
                 flags: 0,
+                param_set_group: 0,
                 terms: vec![BamTermDesc::read(pos_h2), BamTermDesc::write(vel_h2)],
             }],
             single_entity_callback,
@@ -1086,10 +1092,12 @@ mod multi_query_nesting_stress {
                 vec![
                     BamQuerySpecOwned {
                         flags: 0,
+                        param_set_group: 0,
                         terms: vec![BamTermDesc::write(pos_h)],
                     },
                     BamQuerySpecOwned {
                         flags: 0,
+                        param_set_group: 0,
                         terms: vec![BamTermDesc::write(pos_h)],
                     },
                 ],
@@ -1115,10 +1123,12 @@ mod multi_query_nesting_stress {
                 vec![
                     BamQuerySpecOwned {
                         flags: 0,
+                        param_set_group: 0,
                         terms: vec![BamTermDesc::write(pos_h)],
                     },
                     BamQuerySpecOwned {
                         flags: 0,
+                        param_set_group: 0,
                         terms: vec![BamTermDesc::read(pos_h)],
                     },
                 ],
@@ -1161,10 +1171,12 @@ mod multi_query_nesting_stress {
             vec![
                 BamQuerySpecOwned {
                     flags: 0,
+                    param_set_group: 0,
                     terms: vec![BamTermDesc::read(pos_h), BamTermDesc::filter_only(drone_h)],
                 },
                 BamQuerySpecOwned {
                     flags: 0,
+                    param_set_group: 0,
                     terms: vec![BamTermDesc::read(pos_h), BamTermDesc::filter_only(player_h)],
                 },
             ],

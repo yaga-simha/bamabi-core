@@ -555,10 +555,10 @@ fn runaway_loop_watchdog_auto_quarantines_emits_messages_preserves_siblings_and_
         let state = unsafe { &*(user_data as *const RunawayState) };
         state.calls.fetch_add(1, Ordering::SeqCst);
         if state.should_stall.load(Ordering::Acquire) {
-            // Busy-wait / sleep reliably longer than the 500us p99 budget ceiling.
-            let target = Duration::from_millis(4);
+            // Busy-wait / sleep reliably longer than the 25ms p99 budget ceiling.
+            let target = Duration::from_millis(50);
             let start = Instant::now();
-            std::thread::sleep(Duration::from_millis(3));
+            std::thread::sleep(Duration::from_millis(45));
             while start.elapsed() < target {
                 core::hint::spin_loop();
             }
@@ -579,7 +579,7 @@ fn runaway_loop_watchdog_auto_quarantines_emits_messages_preserves_siblings_and_
     let mut app = App::new();
     app.add_plugins(AbiModPlugin::with_budget_policy(
         ModBudgetPolicy::default()
-            .with_max_p99_system_micros(Some(500))
+            .with_max_p99_system_micros(Some(25_000))
             .with_window_size(4)
             .with_max_consecutive_breaches(2),
     ));
@@ -655,8 +655,12 @@ fn runaway_loop_watchdog_auto_quarantines_emits_messages_preserves_siblings_and_
         assert_eq!(b.mod_name, "bad_mod");
         assert_eq!(b.system_name, "runaway_loop");
         assert_eq!(b.kind, ModBudgetBreachKind::FrameTimeP99Exceeded);
-        assert!(b.observed > 500, "expected p99 > 500us, got {}", b.observed);
-        assert_eq!(b.limit, 500);
+        assert!(
+            b.observed > 25_000,
+            "expected p99 > 25000us, got {}",
+            b.observed
+        );
+        assert_eq!(b.limit, 25_000);
         assert_eq!(b.count, 2);
         assert!(b.quarantined);
     }
@@ -681,8 +685,8 @@ fn runaway_loop_watchdog_auto_quarantines_emits_messages_preserves_siblings_and_
         .resource::<ModBudgetTelemetry>()
         .system_snapshot(Some(bad_mod), "runaway_loop")
         .unwrap();
-    assert!(snap.p99_us > 500);
-    assert!(snap.p50_us > 500);
+    assert!(snap.p99_us > 25_000);
+    assert!(snap.p50_us > 25_000);
     assert_eq!(snap.breach_count, 1);
     assert!(snap.quarantined);
 
