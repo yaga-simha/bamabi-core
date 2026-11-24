@@ -44,13 +44,16 @@ fn snapshot_and_restore_cover_dynamic_resources_zsts_errors_and_cleanup() {
         // SAFETY: `src` points to live `DynResVal`.
         let val = unsafe { (*src.cast::<DynResVal>()).count };
         let bytes = val.to_ne_bytes();
-        // SAFETY: `ctx` and `bytes` live for this synchronous callback.
+        let name_view = StrView::from_str("count");
+        let tag_view = StrView::from_str("u32");
+        let slice = FfiSlice::from_slice(&bytes);
+        // SAFETY: `ctx`, `name_view`, `tag_view`, and `slice` live for this synchronous callback.
         unsafe {
             sink_fn(
                 ctx,
-                StrView::from_str("count"),
-                StrView::from_str("u32"),
-                FfiSlice::from_slice(&bytes),
+                &raw const name_view,
+                &raw const tag_view,
+                &raw const slice,
             )
         }
     }
@@ -65,13 +68,16 @@ fn snapshot_and_restore_cover_dynamic_resources_zsts_errors_and_cleanup() {
         let Some(sink_fn) = sink else {
             return FfiResult::NULL_POINTER;
         };
-        // SAFETY: `ctx` is valid and `FfiSlice::empty()` has `len == 0`.
+        let name_view = StrView::from_str("tag");
+        let tag_view = StrView::from_str("()");
+        let slice = FfiSlice::empty();
+        // SAFETY: `ctx` is valid and `slice` has `len == 0`.
         unsafe {
             sink_fn(
                 ctx,
-                StrView::from_str("tag"),
-                StrView::from_str("()"),
-                FfiSlice::empty(),
+                &raw const name_view,
+                &raw const tag_view,
+                &raw const slice,
             )
         }
     }
@@ -85,18 +91,21 @@ fn snapshot_and_restore_cover_dynamic_resources_zsts_errors_and_cleanup() {
     }
     unsafe extern "C" fn import_res(
         dst: *mut c_void,
-        name: StrView,
-        _tag: StrView,
-        payload: FfiSlice<u8>,
+        name: *const StrView,
+        _tag: *const StrView,
+        payload: *const FfiSlice<u8>,
     ) -> FfiResult {
         if FAIL_IMPORT.load(Ordering::SeqCst) {
             return FfiResult::INVALID_ARGUMENT;
         }
-        // SAFETY: `name` is valid UTF-8.
-        let key = unsafe { name.try_as_str() }.unwrap_or("");
-        if key == "count" && payload.len == 4 {
-            // SAFETY: `payload` holds 4 readable bytes.
-            let v = u32::from_ne_bytes(unsafe { payload.as_slice() }.try_into().unwrap());
+        if name.is_null() || payload.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: `name` and `payload` are readable pointers from caller.
+        let (key, payload_ref) = unsafe { ((*name).try_as_str().unwrap_or(""), &*payload) };
+        if key == "count" && payload_ref.len == 4 {
+            // SAFETY: `payload_ref` holds 4 readable bytes.
+            let v = u32::from_ne_bytes(unsafe { payload_ref.as_slice() }.try_into().unwrap());
             // SAFETY: `dst` points to aligned `DynResVal`.
             unsafe { (*dst.cast::<DynResVal>()).count = v };
             return FfiResult::OK;

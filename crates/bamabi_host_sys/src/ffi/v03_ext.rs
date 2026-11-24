@@ -3,16 +3,18 @@
 //! and rollback, entity relationships, symbol interning, named object binding, ancestor cascades,
 //! read-only parallel chunk iteration, schedule sets, and live component column migration.
 
-use crate::ffi::register::{register_system_inner, validate_active_load_ctx};
+use crate::ffi::register::{
+    parse_and_validate_run_if_query, register_system_inner, validate_active_load_ctx,
+};
 use crate::handle_header::{
     decode_live_entity, ffi_try, validate_commands_mut, validate_host_ctx, validate_iter_mut,
     validate_non_empty_cstr,
 };
-use crate::loader::ModHost;
 use crate::schedule::{
     ModNamedSystemSet, ModScheduleSetRegistry, ScheduleSetConfig, ScheduleSetMode,
     ensure_mod_schedule_set_pass_if_schedules_present, resolve_schedule_id_in_world,
 };
+use crate::sync_ptr::GuestUserData;
 use crate::system::error_policy::record_active_guest_fault;
 use bamabi_sys::{
     BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
@@ -25,14 +27,32 @@ use core::ffi::c_void;
 use core::ptr::null;
 use std::sync::Arc;
 
+/// Validates a `*const StrView` pointer and decodes its UTF-8 string slice.
+///
+/// # Safety
+/// - If `view` is non-null and aligned, it must point to an initialized [`StrView`] whose
+///   `ptr` references `len` readable bytes when `len > 0`.
 #[inline]
-unsafe fn validate_str_view<'a>(view: StrView) -> Result<&'a str, FfiResult> {
-    // SAFETY: Caller guarantees `view.ptr` references `view.len` readable bytes when non-null.
-    unsafe { view.try_as_str() }
+unsafe fn validate_str_view<'a>(view: *const StrView) -> Result<&'a str, FfiResult> {
+    if view.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    if !(view as usize).is_multiple_of(core::mem::align_of::<StrView>()) {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    // SAFETY: `view` is non-null, properly aligned, and caller guarantees initialized `StrView`.
+    let raw = unsafe { *view };
+    // SAFETY: Caller guarantees `raw.ptr` references `raw.len` readable bytes when `raw.len > 0`.
+    unsafe { raw.try_as_str() }
 }
 
+/// Validates a `*const StrView` pointer and ensures the resulting UTF-8 slice is non-empty.
+///
+/// # Safety
+/// - If `view` is non-null and aligned, it must point to an initialized [`StrView`] whose
+///   `ptr` references `len` readable bytes when `len > 0`.
 #[inline]
-unsafe fn validate_non_empty_str_view<'a>(view: StrView) -> Result<&'a str, FfiResult> {
+unsafe fn validate_non_empty_str_view<'a>(view: *const StrView) -> Result<&'a str, FfiResult> {
     // SAFETY: Forwarding under caller's initialized-bytes contract.
     let s = unsafe { validate_str_view(view) }?;
     if s.is_empty() {
@@ -41,6 +61,10 @@ unsafe fn validate_non_empty_str_view<'a>(view: StrView) -> Result<&'a str, FfiR
     Ok(s)
 }
 
+/// Reads `count` [`BamSystemSet`] handles from a caller-provided FFI array.
+///
+/// # Safety
+/// - If `count > 0`, `ptr` must be non-null and point to `count` readable [`BamSystemSet`] values.
 #[inline]
 unsafe fn read_set_handles(ptr: *const BamSystemSet, count: u32) -> Vec<BamSystemSet> {
     let n = count as usize;
@@ -57,11 +81,12 @@ unsafe fn read_set_handles(ptr: *const BamSystemSet, count: u32) -> Vec<BamSyste
 ///
 /// # Safety
 /// - `ctx` must point to an active [`crate::HostContext`] cast to [`BamHostCtx`], or null.
-/// - When `message.len > 0`, `message.ptr` must point to `message.len` initialized readable bytes.
+/// - `message` must point to a readable [`StrView`] whose `ptr` references `len` initialized
+///   readable bytes when `len > 0`.
 pub unsafe extern "C" fn host_log_diagnostic(
     ctx: *const BamHostCtx,
     level: u32,
-    message: StrView,
+    message: *const StrView,
 ) -> FfiResult {
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
     let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
@@ -97,10 +122,11 @@ pub unsafe extern "C" fn host_log_diagnostic(
 ///
 /// # Safety
 /// - `ctx` must point to an active [`crate::HostContext`] cast to [`BamHostCtx`], or null.
-/// - When `message.len > 0`, `message.ptr` must point to `message.len` initialized readable bytes.
+/// - `message` must point to a readable [`StrView`] whose `ptr` references `len` initialized
+///   readable bytes when `len > 0`.
 pub unsafe extern "C" fn host_report_guest_fault(
     ctx: *const BamHostCtx,
-    message: StrView,
+    message: *const StrView,
 ) -> FfiResult {
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
     let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
@@ -139,6 +165,9 @@ pub unsafe extern "C" fn host_resolve_component_by_uuid(
     if out_component.is_null() {
         return FfiResult::NULL_POINTER;
     }
+    if !out_component.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
     let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
     if uuid.is_null() {
@@ -175,6 +204,9 @@ pub unsafe extern "C" fn host_component_layout_info(
 ) -> FfiResult {
     if out_info.is_null() {
         return FfiResult::NULL_POINTER;
+    }
+    if !out_info.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
     }
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
     let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
@@ -217,6 +249,9 @@ pub unsafe extern "C" fn host_iter_count(iter: *mut BamIter, out_count: *mut usi
     if out_count.is_null() {
         return FfiResult::NULL_POINTER;
     }
+    if !out_count.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
     let host_iter = ffi_try!(unsafe { validate_iter_mut(iter) });
 
@@ -242,6 +277,9 @@ pub unsafe extern "C" fn host_register_system_handle(
     if out_system.is_null() {
         return FfiResult::NULL_POINTER;
     }
+    if !out_system.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
     // SAFETY: Caller upholds `load_ctx` and `desc_ptr` FFI contract.
     let handle = ffi_try!(unsafe { register_system_inner(load_ctx, desc_ptr) });
     // SAFETY: `out_system` was checked non-null and caller guarantees writable `BamSystem` storage.
@@ -262,6 +300,9 @@ pub unsafe extern "C" fn host_cmd_checkpoint(
 ) -> FfiResult {
     if out_checkpoint.is_null() {
         return FfiResult::NULL_POINTER;
+    }
+    if !out_checkpoint.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
     }
     // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
     let cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
@@ -307,15 +348,18 @@ pub unsafe extern "C" fn host_register_relation(
 ///
 /// # Safety
 /// - `ctx` must point to an active [`crate::HostContext`] cast to [`BamHostCtx`], or null.
-/// - When `symbol.len > 0`, `symbol.ptr` must point to `symbol.len` readable bytes.
+/// - `symbol` must point to a readable [`StrView`] whose `ptr` references `len` readable bytes.
 /// - `out_symbol` must point to writable [`BamSymbol`] storage, or null.
 pub unsafe extern "C" fn host_intern_symbol(
     ctx: *const BamHostCtx,
-    symbol: StrView,
+    symbol: *const StrView,
     out_symbol: *mut BamSymbol,
 ) -> FfiResult {
     if out_symbol.is_null() {
         return FfiResult::NULL_POINTER;
+    }
+    if !out_symbol.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
     }
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
     let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
@@ -346,10 +390,10 @@ pub unsafe extern "C" fn host_intern_symbol(
 ///
 /// # Safety
 /// - `ctx` must point to an active [`crate::HostContext`] cast to [`BamHostCtx`], or null.
-/// - When `name.len > 0`, `name.ptr` must point to `name.len` readable bytes.
+/// - `name` must point to a readable [`StrView`] whose `ptr` references `len` readable bytes.
 pub unsafe extern "C" fn host_bind_named_object(
     ctx: *const BamHostCtx,
-    name: StrView,
+    name: *const StrView,
     entity: FfiEntity,
 ) -> FfiResult {
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
@@ -442,6 +486,9 @@ pub unsafe extern "C" fn host_configure_schedule_set(
     if out_set.is_null() {
         return FfiResult::NULL_POINTER;
     }
+    if !out_set.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
     // SAFETY: Validates active `LoadContext` header and `in_init` state.
     let ctx = ffi_try!(unsafe { validate_active_load_ctx(load_ctx) });
     // SAFETY: `read_descriptor` checks null and `struct_size >= BamScheduleSetDesc::MIN_V0_3_SIZE`.
@@ -495,6 +542,46 @@ pub unsafe extern "C" fn host_configure_schedule_set(
     // SAFETY: Same as above for `after_sets`.
     let after_sets = unsafe { read_set_handles(desc.after_sets, desc.after_count) };
 
+    let has_run_if_ctx = desc.covers_slot(
+        core::mem::offset_of!(BamScheduleSetDesc, run_if_ctx_user_data),
+        core::mem::size_of::<*mut c_void>(),
+    );
+    let (run_if_ctx, run_if_query, run_if_ctx_user_data) =
+        if has_run_if_ctx && let Some(cond_fn) = desc.run_if_ctx {
+            let cond_query = if !desc.run_if_query.is_null() {
+                // SAFETY: `desc.run_if_query` is non-null and caller guarantees readable `BamQueryDesc`.
+                match unsafe {
+                    parse_and_validate_run_if_query(desc.run_if_query, ctx.registry.snapshot())
+                } {
+                    Ok(spec) => Some(spec),
+                    Err((err, msg)) => {
+                        ctx.host_ctx.set_last_error(msg);
+                        return err;
+                    }
+                }
+            } else {
+                None
+            };
+            (
+                Some(cond_fn),
+                cond_query,
+                GuestUserData::new(desc.run_if_ctx_user_data),
+            )
+        } else {
+            (None, None, GuestUserData::new(core::ptr::null_mut()))
+        };
+
+    let has_parent_sets = desc.covers_slot(
+        core::mem::offset_of!(BamScheduleSetDesc, parent_set_count),
+        core::mem::size_of::<u32>(),
+    );
+    let parent_handles = if has_parent_sets && desc.parent_set_count > 0 {
+        // SAFETY: `desc.validate()` verified non-null `parent_sets` when `parent_set_count > 0`.
+        unsafe { read_set_handles(desc.parent_sets, desc.parent_set_count) }
+    } else {
+        Vec::new()
+    };
+
     // SAFETY: `ctx.world_ptr` was checked non-null and references the exclusively borrowed
     // `&mut World` for the duration of `bamabi_init`.
     let world = unsafe { &mut *ctx.world_ptr };
@@ -507,11 +594,37 @@ pub unsafe extern "C" fn host_configure_schedule_set(
         return FfiResult::NOT_FOUND;
     }
 
-    let generation = world
-        .get_resource::<ModHost>()
-        .map(|h| h.mod_generation(parsed.mod_name.as_ref()))
-        .unwrap_or(0);
+    let generation = ctx.mod_generation_for(Some(world), parsed.mod_name.as_ref());
     world.init_resource::<ModScheduleSetRegistry>();
+
+    let parent_sets = if parent_handles.is_empty() {
+        Vec::new()
+    } else {
+        let reg = world.resource::<ModScheduleSetRegistry>();
+        let mut names = Vec::with_capacity(parent_handles.len());
+        for parent_handle in parent_handles {
+            let Some(parent_entry) = reg.get(parent_handle) else {
+                ctx.host_ctx.set_last_error(format!(
+                    "configure_schedule_set parent_set handle {} is not registered",
+                    parent_handle.0
+                ));
+                return FfiResult::INVALID_ARGUMENT;
+            };
+            if parent_entry.schedule != desc.schedule {
+                ctx.host_ctx.set_last_error(format!(
+                    "configure_schedule_set parent_set handle {} belongs to schedule {} rather than {}",
+                    parent_handle.0, parent_entry.schedule.0, desc.schedule.0
+                ));
+                return FfiResult::INVALID_ARGUMENT;
+            }
+            names.push(format!(
+                "{}::{}",
+                parent_entry.mod_name, parent_entry.set_name
+            ));
+        }
+        names
+    };
+
     let handle = match world
         .resource_mut::<ModScheduleSetRegistry>()
         .configure_set(ScheduleSetConfig {
@@ -525,6 +638,10 @@ pub unsafe extern "C" fn host_configure_schedule_set(
             after_sets,
             before_weak: (desc.flags & BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK) != 0,
             after_weak: (desc.flags & BAM_SCHEDULE_SET_FLAG_AFTER_WEAK) != 0,
+            run_if_ctx,
+            run_if_query,
+            run_if_ctx_user_data,
+            parent_sets,
         }) {
         Ok(h) => h,
         Err((err, msg)) => {
@@ -611,10 +728,7 @@ pub unsafe extern "C" fn host_mount_system_in_schedule(
                     .map(Arc::from)
             })
             .unwrap_or_else(|| Arc::from("unscoped"));
-        let sys_gen = world
-            .get_resource::<ModHost>()
-            .map(|h| h.mod_generation(sys_mod_name.as_ref()))
-            .unwrap_or(0);
+        let sys_gen = ctx.mod_generation_for(Some(world), sys_mod_name.as_ref());
         let sys_name_arc = ctx.registered_systems[sys_idx].system_name_arc();
         let sys_own_set =
             ModNamedSystemSet::with_generation(Arc::clone(&sys_mod_name), sys_name_arc, sys_gen);
@@ -776,6 +890,89 @@ pub unsafe extern "C" fn host_migrate_component_column(
             user_data,
         )
     }
+}
+
+/// Resolves a canonical UTF-8 object/prefab `name` previously registered via
+/// `host_bind_named_object` back to its [`FfiEntity`] in `*out_entity`.
+///
+/// # Safety
+/// - `ctx` must point to an active [`crate::HostContext`] cast to [`BamHostCtx`], or null.
+/// - `name` must point to a readable [`StrView`] whose `ptr` references `len` readable bytes.
+/// - `out_entity` must point to aligned writable [`FfiEntity`] storage, or null.
+pub unsafe extern "C" fn host_resolve_named_object(
+    ctx: *const BamHostCtx,
+    name: *const StrView,
+    out_entity: *mut FfiEntity,
+) -> FfiResult {
+    if out_entity.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if !out_entity.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
+    let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
+    // SAFETY: Caller guarantees `name` points to an initialized `StrView` with `len` readable bytes.
+    let name_str = match unsafe { validate_non_empty_str_view(name) } {
+        Ok(s) => s,
+        Err(err) => {
+            host_ctx.set_last_error(format!(
+                "resolve_named_object `name` validation failed ({err})"
+            ));
+            return err;
+        }
+    };
+    match crate::loader::symbols::resolve_named_object_for_host_ctx(host_ctx, name_str) {
+        Ok(Some(entity)) => {
+            // SAFETY: `out_entity` was checked non-null and caller guarantees writable `FfiEntity`.
+            unsafe {
+                *out_entity = FfiEntity::from_bits(entity.to_bits());
+            }
+            FfiResult::OK
+        }
+        Ok(None) => {
+            // SAFETY: `out_entity` was checked non-null and caller guarantees writable `FfiEntity`.
+            unsafe {
+                *out_entity = FfiEntity::NULL;
+            }
+            FfiResult::NOT_FOUND
+        }
+        Err(err) => {
+            // SAFETY: `out_entity` was checked non-null and caller guarantees writable `FfiEntity`.
+            unsafe {
+                *out_entity = FfiEntity::NULL;
+            }
+            err
+        }
+    }
+}
+
+/// Resolves an interned [`BamSymbol`] back to its UTF-8 string [`StrView`] in `*out_str`.
+///
+/// # Safety
+/// - `ctx` must point to an active [`crate::HostContext`] cast to [`BamHostCtx`], or null.
+/// - `out_str` must point to aligned writable [`StrView`] storage, or null.
+pub unsafe extern "C" fn host_resolve_symbol_str(
+    ctx: *const BamHostCtx,
+    symbol: BamSymbol,
+    out_str: *mut StrView,
+) -> FfiResult {
+    if out_str.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if !out_str.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
+    let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
+    let view = ffi_try!(crate::loader::symbols::resolve_symbol_str_for_host_ctx(
+        host_ctx, symbol
+    ));
+    // SAFETY: `out_str` was checked non-null and caller guarantees writable `StrView`.
+    unsafe {
+        *out_str = view;
+    }
+    FfiResult::OK
 }
 
 /// Retains a single place checking the `host_cmd_*` imports used in unit tests cleanly while

@@ -317,7 +317,11 @@ fn is_watchable_mod_path_accepts_dylibs_and_manifests_only() {
     assert!(is_watchable_mod_path(Path::new("mods/a/a.dll")));
     assert!(is_watchable_mod_path(Path::new("mods/a/mod.toml")));
 
-    assert!(!is_watchable_mod_path(Path::new("mods/a/liba.dylib.sig")));
+    assert!(is_watchable_mod_path(Path::new("mods/a/liba.dylib.sig")));
+    assert!(is_watchable_mod_path(Path::new("mods/a/liba.bampack")));
+    assert!(is_watchable_mod_path(Path::new(
+        "mods/a/a.schedule_delta.json"
+    )));
     assert!(!is_watchable_mod_path(Path::new("mods/a/Cargo.toml")));
     assert!(!is_watchable_mod_path(Path::new("mods/a/main.c")));
     assert!(!is_watchable_mod_path(Path::new("mods/a/README.md")));
@@ -486,7 +490,7 @@ fn disconnected_channel_after_poll_events_still_records_outcome_once_in_flush_sc
 
         let history = app.world().resource::<ModHotReloadHistory>();
         assert_eq!(
-            history.outcomes,
+            history.outcomes.iter().cloned().collect::<Vec<_>>(),
             vec![ModHotReloadOutcome {
                 path: temp.0.clone(),
                 mod_id: None,
@@ -752,7 +756,7 @@ fn sync_dir_fingerprint_suppresses_stale_event_but_allows_modified_file() {
     let dylib_path = sub_dir.join(dylib_filename("fp_mod"));
     std::fs::write(
         sub_dir.join("mod.toml"),
-        "[mod]\nid = \"fp_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n",
+        "[mod]\nid = \"fp_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n",
     )
     .expect("write mod.toml");
     if !compile_c_unit_mod(&build_dir, &dylib_path, "fp_mod", "1.0.0", 1) {
@@ -1054,31 +1058,31 @@ fn sync_dir_and_validate_dir_dag_cover_error_and_cascade_paths() {
 
     std::fs::write(
         valid_sub.join("mod.toml"),
-        "[mod]\nid = \"valid_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n",
+        "[mod]\nid = \"valid_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n",
     )
     .expect("write valid_a");
     let bad_toml_path = bad_sub.join("mod.toml");
     std::fs::write(&bad_toml_path, "[mod]\nid = \"unclosed\n").expect("write bad_toml");
     std::fs::write(
         unsat_sub.join("mod.toml"),
-        "[mod]\nid = \"unsat_dep\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nmissing_mod = \"^1.0\"\n",
+        "[mod]\nid = \"unsat_dep\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n\n[dependencies]\nmissing_mod = \"^1.0\"\n",
     )
     .expect("write unsat_dep");
     std::fs::write(
         missing_lib_sub.join("mod.toml"),
-        "[mod]\nid = \"missing_lib\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n",
+        "[mod]\nid = \"missing_lib\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n",
     )
     .expect("write missing_lib");
     std::fs::write(
         cascade_sub.join("mod.toml"),
-        "[mod]\nid = \"cascade_dep\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nmissing_lib = \"^1.0\"\n",
+        "[mod]\nid = \"cascade_dep\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n\n[dependencies]\nmissing_lib = \"^1.0\"\n",
     )
     .expect("write cascade_dep");
     let corrupt_entry = dylib_filename("corrupt_bin");
     std::fs::write(
         corrupt_sub.join("mod.toml"),
         format!(
-            "[mod]\nid = \"corrupt_bin\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\nentry = \"{corrupt_entry}\"\n"
+            "[mod]\nid = \"corrupt_bin\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\nentry = \"{corrupt_entry}\"\n"
         ),
     )
     .expect("write corrupt_bin mod.toml");
@@ -1086,12 +1090,12 @@ fn sync_dir_and_validate_dir_dag_cover_error_and_cascade_paths() {
         .expect("write corrupt binary");
     std::fs::write(
         cyc_a_sub.join("mod.toml"),
-        "[mod]\nid = \"cyc_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\ncyc_b = \"^1.0\"\n",
+        "[mod]\nid = \"cyc_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n\n[dependencies]\ncyc_b = \"^1.0\"\n",
     )
     .expect("write cyc_a");
     std::fs::write(
         cyc_b_sub.join("mod.toml"),
-        "[mod]\nid = \"cyc_b\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\ncyc_a = \"^1.0\"\n",
+        "[mod]\nid = \"cyc_b\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n\n[dependencies]\ncyc_a = \"^1.0\"\n",
     )
     .expect("write cyc_b");
 
@@ -1179,7 +1183,7 @@ fn apply_hot_reload_events_handles_manifest_reload_leased_failure_and_delete() {
     std::fs::write(
         &manifest_path,
         format!(
-            "[mod]\nid = \"pkg_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\nentry = \"{}\"\n",
+            "[mod]\nid = \"pkg_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\nentry = \"{}\"\n",
             dylib_filename("pkg_v1")
         ),
     )
@@ -1230,7 +1234,7 @@ fn apply_hot_reload_events_handles_manifest_reload_leased_failure_and_delete() {
     std::fs::write(
         &manifest_path,
         format!(
-            "[mod]\nid = \"pkg_mod\"\nversion = \"2.0.0\"\nabi_version = \"^0.3.0\"\nentry = \"{}\"\n",
+            "[mod]\nid = \"pkg_mod\"\nversion = \"2.0.0\"\nabi_version = \"^0.4.0\"\nentry = \"{}\"\n",
             dylib_filename("pkg_v2")
         ),
     )
@@ -1287,7 +1291,7 @@ fn apply_hot_reload_events_handles_manifest_reload_leased_failure_and_delete() {
     std::fs::write(
         &manifest_path,
         format!(
-            "[mod]\nid = \"pkg_mod\"\nversion = \"2.0.0\"\nabi_version = \"^0.3.0\"\nentry = \"{}\"\n",
+            "[mod]\nid = \"pkg_mod\"\nversion = \"2.0.0\"\nabi_version = \"^0.4.0\"\nentry = \"{}\"\n",
             dylib_filename("pkg_v2")
         ),
     )
@@ -1301,7 +1305,7 @@ fn apply_hot_reload_events_handles_manifest_reload_leased_failure_and_delete() {
     std::fs::write(
         &manifest_path,
         format!(
-            "[mod]\nid = \"pkg_mod\"\nversion = \"3.0.0\"\nabi_version = \"^0.3.0\"\nentry = \"{corrupt_name}\"\n"
+            "[mod]\nid = \"pkg_mod\"\nversion = \"3.0.0\"\nabi_version = \"^0.4.0\"\nentry = \"{corrupt_name}\"\n"
         ),
     )
     .expect("write v3 corrupt mod.toml");
@@ -1397,7 +1401,7 @@ fn apply_hot_reload_events_handles_corrupt_dylib_and_sidecar_dag_errors() {
     let a_toml = sub_a.join("mod.toml");
     std::fs::write(
         &a_toml,
-        "[mod]\nid = \"sidecar_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\next_dep = \"^1.0\"\n",
+        "[mod]\nid = \"sidecar_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n\n[dependencies]\next_dep = \"^1.0\"\n",
     )
     .expect("write sidecar_a mod.toml");
     let sync_a = load_unloaded_dag_mods(app.world_mut(), &mods_dir, &opts);
@@ -1411,12 +1415,12 @@ fn apply_hot_reload_events_handles_corrupt_dylib_and_sidecar_dag_errors() {
     // Introduce cycle in sidecar `mod.toml` files and deliver `.dylib` change -> `validate_dir_dag_for_reload` fails.
     std::fs::write(
         &a_toml,
-        "[mod]\nid = \"sidecar_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nsidecar_b = \"^1.0\"\n",
+        "[mod]\nid = \"sidecar_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n\n[dependencies]\nsidecar_b = \"^1.0\"\n",
     )
     .expect("write cyclic sidecar_a");
     std::fs::write(
         sub_b.join("mod.toml"),
-        "[mod]\nid = \"sidecar_b\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nsidecar_a = \"^1.0\"\n",
+        "[mod]\nid = \"sidecar_b\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n\n[dependencies]\nsidecar_a = \"^1.0\"\n",
     )
     .expect("write cyclic sidecar_b");
     let sidecar_fail = apply_hot_reload_events(
@@ -1436,7 +1440,7 @@ fn apply_hot_reload_events_handles_corrupt_dylib_and_sidecar_dag_errors() {
     let _ = std::fs::remove_file(sub_b.join("mod.toml"));
     std::fs::write(
         &a_toml,
-        "[mod]\nid = \"sidecar_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n",
+        "[mod]\nid = \"sidecar_a\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n",
     )
     .expect("restore valid sidecar_a");
     std::fs::write(&a_dylib, b"corrupt_replacement_dylib").expect("overwrite a_dylib");
@@ -1446,4 +1450,294 @@ fn apply_hot_reload_events_handles_corrupt_dylib_and_sidecar_dag_errors() {
         dylib_fail.outcomes[0].action,
         ModHotReloadAction::Failed(_)
     ));
+}
+
+#[test]
+fn two_poll_stability_invalid_magic_and_schedule_delta_hot_rewire_unit() {
+    let temp = TempDirGuard::new("bam_watcher_r43_unit");
+    let build_dir = temp.0.join("build");
+    let mods_dir = temp.0.join("mods");
+    std::fs::create_dir_all(&build_dir).expect("create build_dir");
+    std::fs::create_dir_all(&mods_dir).expect("create mods_dir");
+
+    let (tx, rx) = mpsc::channel::<DebounceEventResult>();
+    let watcher = ModHotReloadWatcher::from_receiver_for_test(
+        &mods_dir,
+        Duration::ZERO,
+        rx,
+        LoadOptions::default(),
+    )
+    .with_stability_polls(2);
+
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.insert_resource(UnitCounter::default());
+    app.register_mod_resource::<UnitCounter>()
+        .expect("register UnitCounter");
+
+    // 1. Corrupt bytes fail binary header check on 2nd stable poll without dlopen.
+    let bad_dylib = mods_dir.join(dylib_filename("corrupt_unit"));
+    std::fs::write(&bad_dylib, b"NOT_A_NATIVE_BINARY").expect("write bad dylib");
+    let _ = tx.send(Ok(vec![DebouncedEvent::new(
+        Event::new(EventKind::Create(CreateKind::File)).add_path(bad_dylib.clone()),
+        Instant::now(),
+    )]));
+
+    assert!(
+        watcher.process_pending_reloads(app.world_mut()).is_empty(),
+        "poll 1 must stabilize before loading"
+    );
+    let poll2 = watcher.process_pending_reloads(app.world_mut());
+    assert_eq!(poll2.len(), 1);
+    assert!(matches!(
+        &poll2[0].action,
+        ModHotReloadAction::Failed(msg) if msg.contains("header")
+    ));
+    let _ = std::fs::remove_file(&bad_dylib);
+
+    // 2. Compile valid C fixture, load across 2 polls, and rewire via `.schedule_delta.json`.
+    let good_dylib = mods_dir.join(dylib_filename("r43_delta_mod"));
+    if !compile_c_unit_mod(&build_dir, &good_dylib, "r43_delta_mod", "0.1.0", 1) {
+        return;
+    }
+    let _ = tx.send(Ok(vec![DebouncedEvent::new(
+        Event::new(EventKind::Create(CreateKind::File)).add_path(good_dylib),
+        Instant::now(),
+    )]));
+    assert!(watcher.process_pending_reloads(app.world_mut()).is_empty());
+    let loaded = watcher.process_pending_reloads(app.world_mut());
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].action, ModHotReloadAction::Loaded);
+    let mod_id = loaded[0].mod_id.expect("loaded mod id");
+    app.world_mut().run_schedule(ModLifecycleFlush);
+
+    let set_handle = {
+        let mut reg = app
+            .world_mut()
+            .resource_mut::<bamabi_host::ModScheduleSetRegistry>();
+        reg.configure_set(bamabi_host::ScheduleSetConfig {
+            mod_id: Some(mod_id),
+            mod_name: std::sync::Arc::from("r43_delta_mod"),
+            set_name: std::sync::Arc::from("live_group"),
+            generation: 0,
+            schedule: bamabi_sys::ScheduleId::UPDATE,
+            mode: bamabi_host::ScheduleSetMode::Parallel,
+            ..bamabi_host::ScheduleSetConfig::default()
+        })
+        .expect("configure set")
+    };
+
+    let delta_path = mods_dir.join("r43_delta_mod.schedule_delta.json");
+    std::fs::write(
+        &delta_path,
+        r#"{"schedule": "Update", "sets": [{"set": "r43_delta_mod::live_group", "mode": "Sequence"}]}"#,
+    )
+    .expect("write schedule delta");
+    let _ = tx.send(Ok(vec![DebouncedEvent::new(
+        Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any))).add_path(delta_path),
+        Instant::now(),
+    )]));
+    assert!(watcher.process_pending_reloads(app.world_mut()).is_empty());
+    let delta_res = watcher.process_pending_reloads(app.world_mut());
+    assert_eq!(delta_res.len(), 1);
+    assert_eq!(delta_res[0].action, ModHotReloadAction::Reloaded);
+    assert_eq!(
+        app.world()
+            .resource::<bamabi_host::ModScheduleSetRegistry>()
+            .get(set_handle)
+            .unwrap()
+            .mode,
+        bamabi_host::ScheduleSetMode::Sequence
+    );
+}
+
+#[test]
+fn parse_schedule_delta_json_variants_escapes_and_errors() {
+    let complex_json = r#"{
+        "schedule": "FixedUpdate",
+        "ignored_obj": {"nested": [1, -2.5e+1, true, false, null, "str\"\\\/\n\r\t"]},
+        "sets": [
+            {
+                "schedule": 4,
+                "set": "mod_a::group_1",
+                "mode": "Parallel",
+                "before": ["mod_a::group_2"],
+                "after": [],
+                "before_weak": true,
+                "after_weak": false,
+                "parent_sets": ["host::root"],
+                "extra": {}
+            },
+            {
+                "name": "mod_a::group_2",
+                "mode": "sequence_weak",
+                "before_sets": [],
+                "after_sets": ["mod_a::group_1"],
+                "skipped_empty_arr": []
+            }
+        ]
+    }"#;
+    let parsed = parse_schedule_delta_json(complex_json).expect("parse complex delta JSON");
+    assert_eq!(parsed.schedule, bamabi_sys::ScheduleId::FIXED_UPDATE);
+    assert_eq!(parsed.sets.len(), 2);
+    assert_eq!(
+        parsed.sets[0].schedule_override,
+        Some(bamabi_sys::ScheduleId(4))
+    );
+    assert_eq!(parsed.sets[0].set, "mod_a::group_1");
+    assert_eq!(
+        parsed.sets[0].mode,
+        Some(bamabi_host::ScheduleSetMode::Parallel)
+    );
+    assert_eq!(parsed.sets[0].before_weak, Some(true));
+    assert_eq!(parsed.sets[0].after_weak, Some(false));
+    assert_eq!(
+        parsed.sets[0].parent_sets.as_deref(),
+        Some(&["host::root".to_string()][..])
+    );
+    assert_eq!(parsed.sets[1].set, "mod_a::group_2");
+    assert_eq!(
+        parsed.sets[1].mode,
+        Some(bamabi_host::ScheduleSetMode::SequenceWeak)
+    );
+
+    // Top-level single-set shorthand and all schedule names.
+    for (sched_name, expected_id) in [
+        ("Startup", bamabi_sys::ScheduleId::STARTUP),
+        ("PreUpdate", bamabi_sys::ScheduleId::PRE_UPDATE),
+        ("Update", bamabi_sys::ScheduleId::UPDATE),
+        ("PostUpdate", bamabi_sys::ScheduleId::POST_UPDATE),
+        ("Last", bamabi_sys::ScheduleId::LAST),
+    ] {
+        let single = format!(
+            r#"{{"schedule":"{sched_name}","set":"m::s","mode":"Sequence","before":["a"],"after":["b"],"before_weak":false,"after_weak":true,"parent_sets":["p"],"x":123}}"#
+        );
+        let doc = parse_schedule_delta_json(&single).expect("parse single-set delta");
+        assert_eq!(doc.schedule, expected_id);
+        assert_eq!(doc.sets.len(), 1);
+    }
+
+    // Invalid JSON error paths.
+    for bad in [
+        "[]",
+        "{}",
+        r#"{"sets": []}"#,
+        r#"{"sets": [{}]}"#,
+        r#"{"sets": [{"set": ""}]}"#,
+        r#"{"schedule": "UnknownSched", "set": "m::s"}"#,
+        r#"{"set": "m::s", "mode": "BogusMode"}"#,
+        r#"{"set": "m::s", "before_weak": maybe}"#,
+        r#"{"schedule": bad, "set": "m::s"}"#,
+        r#"{"set": "m::s", "before": "not_array"}"#,
+        r#"{"set": "m::s", "before": ["a" "b"]}"#,
+        r#"{"set": "unterminated"#,
+        r#"{"set": "bad\xescape"}"#,
+        r#"{"set" "missing_colon"}"#,
+        r#"{"sets": "not_array"}"#,
+        r#"{"sets": ["not_object"]}"#,
+        r#"{"set": "m::s", "extra": nul}"#,
+        r#"{"set": "m::s", "extra": [1 2]}"#,
+        r#"{"set": "m::s", "extra": {"k" 1}}"#,
+        r#"{"set": "m::s", "extra": {"k": 1 "k2": 2}}"#,
+        r#"{"set": "m::s", "extra": ?}"#,
+    ] {
+        assert!(
+            parse_schedule_delta_json(bad).is_err(),
+            "expected parse error for {bad}"
+        );
+    }
+}
+
+#[cfg(feature = "signature-verification")]
+#[test]
+fn bampack_and_sig_sidecar_watch_paths_work_in_unit_harness() {
+    let temp = TempDirGuard::new("bam_watcher_bampack_unit");
+    let build_dir = temp.0.join("build");
+    let mods_dir = temp.0.join("mods");
+    std::fs::create_dir_all(&build_dir).expect("create build_dir");
+    std::fs::create_dir_all(&mods_dir).expect("create mods_dir");
+
+    let (tx, rx) = mpsc::channel::<DebounceEventResult>();
+    let watcher = ModHotReloadWatcher::from_receiver_for_test(
+        &mods_dir,
+        Duration::ZERO,
+        rx,
+        LoadOptions::default(),
+    )
+    .with_stability_polls(2);
+
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.insert_resource(UnitCounter::default());
+    app.register_mod_resource::<UnitCounter>()
+        .expect("register UnitCounter");
+    app.world_mut()
+        .insert_resource(bamabi_host::ModTrustPolicy::disabled());
+
+    // 1. Corrupt `.bampack` fails BAMPACK magic check on 2nd stable poll.
+    let bad_pack = mods_dir.join("corrupt.bampack");
+    std::fs::write(&bad_pack, b"BADPACK!").expect("write bad bampack");
+    let _ = tx.send(Ok(vec![DebouncedEvent::new(
+        Event::new(EventKind::Create(CreateKind::File)).add_path(bad_pack.clone()),
+        Instant::now(),
+    )]));
+    assert!(watcher.process_pending_reloads(app.world_mut()).is_empty());
+    let bad_res = watcher.process_pending_reloads(app.world_mut());
+    assert_eq!(bad_res.len(), 1);
+    assert!(matches!(
+        &bad_res[0].action,
+        ModHotReloadAction::Failed(msg) if msg.contains("BAMPACK")
+    ));
+    let _ = std::fs::remove_file(&bad_pack);
+
+    // 2. Valid `.bampack` load + `.sig` sidecar trigger + `.bampack` reload.
+    let dylib_v1 = build_dir.join(dylib_filename("pack_unit_v1"));
+    let dylib_v2 = build_dir.join(dylib_filename("pack_unit_v2"));
+    if !compile_c_unit_mod(&build_dir, &dylib_v1, "pack_unit", "0.1.0", 5) {
+        return;
+    }
+    if !compile_c_unit_mod(&build_dir, &dylib_v2, "pack_unit", "0.2.0", 9) {
+        return;
+    }
+    let bytes_v1 = std::fs::read(&dylib_v1).expect("read v1");
+    let bytes_v2 = std::fs::read(&dylib_v2).expect("read v2");
+
+    let pack_path = mods_dir.join("pack_unit.bampack");
+    let pack_v1 = bamabi_host_sys::BamPackBuilder::new()
+        .add_entry(format!("bin/{}", dylib_filename("pack_unit")), bytes_v1)
+        .expect("add v1")
+        .build_unsigned()
+        .expect("build v1");
+    std::fs::write(&pack_path, pack_v1).expect("write pack_v1");
+
+    let _ = tx.send(Ok(vec![DebouncedEvent::new(
+        Event::new(EventKind::Create(CreateKind::File)).add_path(pack_path.clone()),
+        Instant::now(),
+    )]));
+    assert!(watcher.process_pending_reloads(app.world_mut()).is_empty());
+    let loaded = watcher.process_pending_reloads(app.world_mut());
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].action, ModHotReloadAction::Loaded);
+    let mod_id_v1 = loaded[0].mod_id.expect("loaded bampack mod_id");
+    app.world_mut().run_schedule(ModLifecycleFlush);
+
+    // Update `.bampack` + send `.sig` sidecar change event -> resolves target `.bampack` and reloads.
+    let pack_v2 = bamabi_host_sys::BamPackBuilder::new()
+        .add_entry(format!("bin/{}", dylib_filename("pack_unit")), bytes_v2)
+        .expect("add v2")
+        .build_unsigned()
+        .expect("build v2");
+    std::fs::write(&pack_path, pack_v2).expect("write pack_v2");
+    let sig_path = mods_dir.join("pack_unit.bampack.sig");
+    std::fs::write(&sig_path, b"dummy_sig_update").expect("write sig");
+
+    let _ = tx.send(Ok(vec![DebouncedEvent::new(
+        Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any))).add_path(sig_path),
+        Instant::now(),
+    )]));
+    assert!(watcher.process_pending_reloads(app.world_mut()).is_empty());
+    let reloaded = watcher.process_pending_reloads(app.world_mut());
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[0].action, ModHotReloadAction::Reloaded);
+    assert_ne!(reloaded[0].mod_id, Some(mod_id_v1));
 }

@@ -3,7 +3,7 @@
 use crate::plugin::ModLifecycleFlush;
 use crate::schedule_sets::leased_schedules;
 use crate::world_ext::ModWorldExt;
-use bamabi_host_sys::{LoadOptions, ModId};
+use bamabi_host_sys::{InMemoryModEntrypoints, LoadOptions, ModId};
 use bevy_app::Main;
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::schedule::ScheduleLabel;
@@ -106,6 +106,30 @@ pub trait ModCommandsExt {
 
     /// Queues a deferred [`ModWorldExt::reload_mod_with`] operation for `id`.
     fn reload_mod_with(&mut self, id: ModId, options: LoadOptions);
+
+    /// Queues a deferred [`ModWorldExt::load_mod_from_entrypoints`] operation.
+    fn load_mod_from_entrypoints<P: AsRef<Path>>(
+        &mut self,
+        virtual_path: P,
+        entrypoints: InMemoryModEntrypoints,
+    );
+
+    /// Queues a deferred [`ModWorldExt::load_mod_from_entrypoints_with`] operation.
+    fn load_mod_from_entrypoints_with<P: AsRef<Path>>(
+        &mut self,
+        virtual_path: P,
+        entrypoints: InMemoryModEntrypoints,
+        options: LoadOptions,
+    );
+
+    /// Queues a deferred [`ModWorldExt::reload_mod_from_entrypoints`] operation.
+    fn reload_mod_from_entrypoints<P: AsRef<Path>>(
+        &mut self,
+        id: ModId,
+        virtual_path: P,
+        entrypoints: InMemoryModEntrypoints,
+        options: LoadOptions,
+    );
 }
 
 fn queue_mod_lifecycle<F>(commands: &mut Commands<'_, '_>, op: F)
@@ -145,6 +169,43 @@ impl ModCommandsExt for Commands<'_, '_> {
         queue_mod_lifecycle(self, move |w| {
             if let Err(err) = w.reload_mod_with(id, options) {
                 tracing::error!(mod_id = ?id, error = %err, "deferred Commands::reload_mod_with failed");
+            }
+        });
+    }
+
+    fn load_mod_from_entrypoints<P: AsRef<Path>>(
+        &mut self,
+        virtual_path: P,
+        entrypoints: InMemoryModEntrypoints,
+    ) {
+        self.load_mod_from_entrypoints_with(virtual_path, entrypoints, LoadOptions::default());
+    }
+
+    fn load_mod_from_entrypoints_with<P: AsRef<Path>>(
+        &mut self,
+        virtual_path: P,
+        entrypoints: InMemoryModEntrypoints,
+        options: LoadOptions,
+    ) {
+        let path_buf = virtual_path.as_ref().to_path_buf();
+        queue_mod_lifecycle(self, move |w| {
+            if let Err(err) = w.load_mod_from_entrypoints_with(&path_buf, entrypoints, options) {
+                tracing::error!(path = %path_buf.display(), error = %err, "deferred Commands::load_mod_from_entrypoints_with failed");
+            }
+        });
+    }
+
+    fn reload_mod_from_entrypoints<P: AsRef<Path>>(
+        &mut self,
+        id: ModId,
+        virtual_path: P,
+        entrypoints: InMemoryModEntrypoints,
+        options: LoadOptions,
+    ) {
+        let path_buf = virtual_path.as_ref().to_path_buf();
+        queue_mod_lifecycle(self, move |w| {
+            if let Err(err) = w.reload_mod_from_entrypoints(id, &path_buf, entrypoints, options) {
+                tracing::error!(mod_id = ?id, path = %path_buf.display(), error = %err, "deferred Commands::reload_mod_from_entrypoints failed");
             }
         });
     }

@@ -14,12 +14,15 @@
 //!   and `CLEANUP_REMOVE` without scanning unrelated entities.
 
 use crate::ffi::register::validate_active_load_ctx;
-use crate::handle_header::{ffi_try, validate_commands_mut, validate_non_empty_cstr};
+use crate::handle_header::{
+    decode_live_entity, ffi_try, init_out_ptr, validate_commands_mut, validate_non_empty_cstr,
+    validate_sys_ctx_ref,
+};
 use crate::registry::RelationRegSpec;
 use crate::registry::catalog::{ModRegistry, RegisteredRelation, RegistrySnapshot};
 use bamabi_sys::{
-    BAM_RELATION_FLAG_EXCLUSIVE, BamCommands, BamComponent, BamLoadCtx, BamRelationDesc, FfiEntity,
-    FfiResult, read_descriptor,
+    BAM_RELATION_FLAG_EXCLUSIVE, BamCommands, BamComponent, BamLoadCtx, BamRelationDesc,
+    BamSystemCtx, FfiEntity, FfiResult, read_descriptor,
 };
 use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, ComponentId, StorageType};
 use bevy_ecs::entity::Entity;
@@ -232,6 +235,8 @@ impl RelationEdgeTable {
         if start == goal {
             return true;
         }
+        let skip_set: Option<HashSet<(Entity, Entity)>> =
+            (skip_edges.len() > 8).then(|| skip_edges.iter().copied().collect());
         let mut visited: HashSet<Entity> = HashSet::new();
         let mut queue: VecDeque<Entity> = VecDeque::new();
         visited.insert(start);
@@ -242,7 +247,12 @@ impl RelationEdgeTable {
                 continue;
             };
             for &(next, _) in neighbors {
-                if skip_edges.contains(&(cur, next)) {
+                let skipped = if let Some(ref set) = skip_set {
+                    set.contains(&(cur, next))
+                } else {
+                    !skip_edges.is_empty() && skip_edges.contains(&(cur, next))
+                };
+                if skipped {
                     continue;
                 }
                 if next == goal {
@@ -402,8 +412,18 @@ impl ModRelationGraph {
     }
 
     #[inline]
-    fn handle_by_component_id(&self, comp_id: ComponentId) -> Option<BamComponent> {
+    pub(crate) fn handle_by_component_id(&self, comp_id: ComponentId) -> Option<BamComponent> {
         self.by_component_id.get(&comp_id).copied()
+    }
+
+    /// Returns the first outgoing target entity of `source` for `relation`, if any.
+    #[inline]
+    pub(crate) fn first_target(&self, relation: BamComponent, source: Entity) -> Option<Entity> {
+        self.tables
+            .get(&relation)
+            .and_then(|t| t.outgoing.get(&source))
+            .and_then(|edges| edges.first())
+            .map(|&(target, _)| target)
     }
 
     /// Returns the number of relationships registered in this graph.
@@ -452,6 +472,48 @@ impl ModRelationGraph {
             .and_then(|t| t.incoming.get(&target))
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Appends `source`'s outgoing targets for `relation` as [`FfiEntity`] into `out`, reusing `out`'s capacity.
+    #[inline]
+    pub(crate) fn fill_targets_ffi(
+        &self,
+        relation: BamComponent,
+        source: Entity,
+        out: &mut Vec<FfiEntity>,
+    ) -> bool {
+        out.clear();
+        let Some(table) = self.tables.get(&relation) else {
+            return false;
+        };
+        if let Some(edges) = table.outgoing.get(&source) {
+            out.reserve(edges.len());
+            for (target, _) in edges {
+                out.push(FfiEntity::from_bits(target.to_bits()));
+            }
+        }
+        true
+    }
+
+    /// Appends `target`'s incoming sources for `relation` as [`FfiEntity`] into `out`, reusing `out`'s capacity.
+    #[inline]
+    pub(crate) fn fill_sources_ffi(
+        &self,
+        relation: BamComponent,
+        target: Entity,
+        out: &mut Vec<FfiEntity>,
+    ) -> bool {
+        out.clear();
+        let Some(table) = self.tables.get(&relation) else {
+            return false;
+        };
+        if let Some(srcs) = table.incoming.get(&target) {
+            out.reserve(srcs.len());
+            for src in srcs {
+                out.push(FfiEntity::from_bits(src.to_bits()));
+            }
+        }
+        true
     }
 
     /// Returns read-only `(target, data)` views for all outgoing edges of `source` in `relation`.
@@ -828,6 +890,9 @@ pub(crate) unsafe fn register_relation_impl(
     if out_component.is_null() {
         return FfiResult::NULL_POINTER;
     }
+    if !out_component.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
     // SAFETY: Validates active `LoadContext` header and `in_init` state.
     let ctx = ffi_try!(unsafe { validate_active_load_ctx(load_ctx) });
     // SAFETY: `read_descriptor` checks null and `struct_size >= BamRelationDesc::MIN_V0_3_SIZE`.
@@ -1053,46 +1118,216 @@ pub(crate) fn apply_remove_relation(
     })
 }
 
-/// Evaluates whether adding `(entity -> target)` to an `ACYCLIC` relation would close a cycle
-/// purely within the pending `(is_insert, entity, target)` command sequence.
-pub(crate) fn check_pending_acyclic(
-    rel: &RegisteredRelation,
-    pending_ops: impl Iterator<Item = PendingRelationOp>,
-    new_entity: Entity,
-    new_target: Entity,
-) -> FfiResult {
-    if new_entity == new_target {
-        return FfiResult::CYCLE_DETECTED;
-    }
-    let mut table = RelationEdgeTable::new(rel.clone());
-    for op in pending_ops {
-        match op {
-            PendingRelationOp::Insert { entity, target } => {
-                let _ = table.evict_exclusive_edges(entity, target);
-                table.insert_directed_raw(entity, target, Box::new([]));
-                if table.meta.is_symmetric() && entity != target {
-                    table.insert_directed_raw(target, entity, Box::new([]));
-                }
-            }
-            PendingRelationOp::Remove { entity, target } => {
-                table.remove_directed_raw(entity, target);
-                if table.meta.is_symmetric() && entity != target {
-                    table.remove_directed_raw(target, entity);
-                }
-            }
-            PendingRelationOp::Despawn { entity } => {
-                let _ = table.remove_all_for_entity(entity);
-            }
-        }
-    }
-    table.check_acyclic(new_entity, new_target)
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PendingRelationOp {
     Insert { entity: Entity, target: Entity },
     Remove { entity: Entity, target: Entity },
     Despawn { entity: Entity },
+}
+
+/// Incremental per-relation acyclic validation graph maintained alongside pending command queues,
+/// eliminating `O(K^2)` full-buffer rebuilds when queueing batches of `InsertRelation` commands.
+pub(crate) struct PendingAcyclicTracker {
+    table: RelationEdgeTable,
+    pub(crate) applied_cmd_len: usize,
+}
+
+impl PendingAcyclicTracker {
+    #[inline]
+    pub(crate) fn new(rel: RegisteredRelation) -> Self {
+        Self {
+            table: RelationEdgeTable::new(rel),
+            applied_cmd_len: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn apply_op(&mut self, op: PendingRelationOp) {
+        match op {
+            PendingRelationOp::Insert { entity, target } => {
+                let _ = self.table.evict_exclusive_edges(entity, target);
+                self.table.insert_directed_raw(entity, target, Box::new([]));
+                if self.table.meta.is_symmetric() && entity != target {
+                    self.table.insert_directed_raw(target, entity, Box::new([]));
+                }
+            }
+            PendingRelationOp::Remove { entity, target } => {
+                self.table.remove_directed_raw(entity, target);
+                if self.table.meta.is_symmetric() && entity != target {
+                    self.table.remove_directed_raw(target, entity);
+                }
+            }
+            PendingRelationOp::Despawn { entity } => {
+                let _ = self.table.remove_all_for_entity(entity);
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn check_acyclic(&self, new_entity: Entity, new_target: Entity) -> FfiResult {
+        self.table.check_acyclic(new_entity, new_target)
+    }
+
+    #[inline]
+    pub(crate) fn reset(&mut self) {
+        self.table.outgoing.clear();
+        self.table.incoming.clear();
+        self.applied_cmd_len = 0;
+    }
+}
+
+/// Queries all outgoing target entities of `relation` from `entity` (ABI `0.4` slot `82`).
+///
+/// Writes a borrowed `*const FfiEntity` pointer into `*out_targets` and count into `*out_len`.
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`crate::HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+/// - `out_targets` must point to writable aligned `*const FfiEntity` storage, or null.
+/// - `out_len` must point to writable aligned `usize` storage, or null.
+pub unsafe extern "C" fn host_sys_relation_targets(
+    sys_ctx: *const BamSystemCtx,
+    entity: FfiEntity,
+    relation: BamComponent,
+    out_targets: *mut *const FfiEntity,
+    out_len: *mut usize,
+) -> FfiResult {
+    // SAFETY: Validates null/alignment and initializes outputs on entry.
+    ffi_try!(unsafe { init_out_ptr(out_targets, core::ptr::null()) });
+    // SAFETY: Validates null/alignment and initializes outputs on entry.
+    ffi_try!(unsafe { init_out_ptr(out_len, 0) });
+
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let ctx = ffi_try!(unsafe { validate_sys_ctx_ref(sys_ctx) });
+    let bevy_entity = ffi_try!(decode_live_entity(entity));
+
+    let (snapshot, world_opt) = ctx.snapshot_and_world();
+    let Some(world) = world_opt else {
+        return FfiResult::INVALID_STATE;
+    };
+    if snapshot.get_relation(relation).is_none() {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    if world.get_entity(bevy_entity).is_err() {
+        return FfiResult::INVALID_ENTITY;
+    }
+
+    // SAFETY: `ModRelationGraph` is never mutably borrowed concurrently with system execution.
+    if let Some(graph) = unsafe { world.get_resource::<ModRelationGraph>() } {
+        // SAFETY: `ctx` is `!Sync` and `relation_targets_scratch_mut` is used synchronously for this call.
+        let scratch = unsafe { ctx.relation_targets_scratch_mut() };
+        if graph.fill_targets_ffi(relation, bevy_entity, scratch) && !scratch.is_empty() {
+            // SAFETY: `out_targets` and `out_len` were validated non-null, aligned, and writable above.
+            unsafe {
+                *out_targets = scratch.as_ptr();
+                *out_len = scratch.len();
+            }
+        }
+    }
+    FfiResult::OK
+}
+
+/// Queries all incoming source entities targeting `target` via `relation` (ABI `0.4` slot `83`).
+///
+/// Writes a borrowed `*const FfiEntity` pointer into `*out_sources` and count into `*out_len`.
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`crate::HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+/// - `out_sources` must point to writable aligned `*const FfiEntity` storage, or null.
+/// - `out_len` must point to writable aligned `usize` storage, or null.
+pub unsafe extern "C" fn host_sys_relation_sources(
+    sys_ctx: *const BamSystemCtx,
+    target: FfiEntity,
+    relation: BamComponent,
+    out_sources: *mut *const FfiEntity,
+    out_len: *mut usize,
+) -> FfiResult {
+    // SAFETY: Validates null/alignment and initializes outputs on entry.
+    ffi_try!(unsafe { init_out_ptr(out_sources, core::ptr::null()) });
+    // SAFETY: Validates null/alignment and initializes outputs on entry.
+    ffi_try!(unsafe { init_out_ptr(out_len, 0) });
+
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let ctx = ffi_try!(unsafe { validate_sys_ctx_ref(sys_ctx) });
+    let bevy_target = ffi_try!(decode_live_entity(target));
+
+    let (snapshot, world_opt) = ctx.snapshot_and_world();
+    let Some(world) = world_opt else {
+        return FfiResult::INVALID_STATE;
+    };
+    if snapshot.get_relation(relation).is_none() {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    if world.get_entity(bevy_target).is_err() {
+        return FfiResult::INVALID_ENTITY;
+    }
+
+    // SAFETY: `ModRelationGraph` is never mutably borrowed concurrently with system execution.
+    if let Some(graph) = unsafe { world.get_resource::<ModRelationGraph>() } {
+        // SAFETY: `ctx` is `!Sync` and `relation_sources_scratch_mut` is used synchronously for this call.
+        let scratch = unsafe { ctx.relation_sources_scratch_mut() };
+        if graph.fill_sources_ffi(relation, bevy_target, scratch) && !scratch.is_empty() {
+            // SAFETY: `out_sources` and `out_len` were validated non-null, aligned, and writable above.
+            unsafe {
+                *out_sources = scratch.as_ptr();
+                *out_len = scratch.len();
+            }
+        }
+    }
+    FfiResult::OK
+}
+
+/// Queries optional edge payload bytes attached to `(entity, relation, target)` (ABI `0.4` slot `84`).
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`crate::HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+/// - `out_ptr` must point to writable aligned `*const c_void` storage, or null.
+/// - `out_size` must point to writable aligned `usize` storage, or null.
+pub unsafe extern "C" fn host_sys_relation_edge_data(
+    sys_ctx: *const BamSystemCtx,
+    entity: FfiEntity,
+    relation: BamComponent,
+    target: FfiEntity,
+    out_ptr: *mut *const c_void,
+    out_size: *mut usize,
+) -> FfiResult {
+    // SAFETY: Validates null/alignment and initializes outputs on entry.
+    ffi_try!(unsafe { init_out_ptr(out_ptr, core::ptr::null()) });
+    // SAFETY: Validates null/alignment and initializes outputs on entry.
+    ffi_try!(unsafe { init_out_ptr(out_size, 0) });
+
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let ctx = ffi_try!(unsafe { validate_sys_ctx_ref(sys_ctx) });
+    let bevy_entity = ffi_try!(decode_live_entity(entity));
+    let bevy_target = ffi_try!(decode_live_entity(target));
+
+    let (snapshot, world_opt) = ctx.snapshot_and_world();
+    let Some(world) = world_opt else {
+        return FfiResult::INVALID_STATE;
+    };
+    if snapshot.get_relation(relation).is_none() {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    if world.get_entity(bevy_entity).is_err() || world.get_entity(bevy_target).is_err() {
+        return FfiResult::INVALID_ENTITY;
+    }
+
+    // SAFETY: `ModRelationGraph` is never mutably borrowed concurrently with system execution.
+    let Some(graph) = (unsafe { world.get_resource::<ModRelationGraph>() }) else {
+        return FfiResult::NOT_FOUND;
+    };
+    let Some(bytes) = graph.edge_data(relation, bevy_entity, bevy_target) else {
+        return FfiResult::NOT_FOUND;
+    };
+    // SAFETY: `out_ptr` and `out_size` were validated non-null, aligned, and writable above.
+    unsafe {
+        *out_ptr = if bytes.is_empty() {
+            core::ptr::NonNull::<c_void>::dangling().as_ptr()
+        } else {
+            bytes.as_ptr().cast::<c_void>()
+        };
+        *out_size = bytes.len();
+    }
+    FfiResult::OK
 }
 
 #[cfg(test)]

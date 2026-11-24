@@ -301,7 +301,10 @@ pub(crate) struct ActiveGuestFaultMeta {
 #[derive(Debug)]
 struct ActiveGuestFaultSlot {
     host_ctx_addr: usize,
-    meta: ActiveGuestFaultMeta,
+    mod_id: Option<ModId>,
+    mod_namespace_ptr: Option<*const str>,
+    generation: u64,
+    system_name_ptr: *const str,
     reported_message: Option<String>,
 }
 
@@ -317,22 +320,25 @@ pub(crate) struct ActiveGuestFaultGuard {
 }
 
 impl ActiveGuestFaultGuard {
-    /// Installs an active guest-fault capture slot for `host_ctx_ptr` on the current thread.
-    pub(crate) fn enter(
+    /// Installs an active guest-fault capture slot for `host_ctx_ptr` on the current thread
+    /// with zero per-tick `Arc::clone`s on the healthy fast path.
+    ///
+    /// # Safety
+    /// `mod_namespace` and `system_name` must outlive this guard (and remain immutable for its
+    /// duration). Calling [`Self::finish`] or dropping the guard removes the thread-local slot.
+    pub(crate) unsafe fn enter(
         host_ctx_ptr: *const BamHostCtx,
         mod_id: Option<ModId>,
-        mod_namespace: Option<Arc<str>>,
+        mod_namespace: Option<&str>,
         generation: u64,
-        system_name: Arc<str>,
+        system_name: &str,
     ) -> Self {
         let slot = ActiveGuestFaultSlot {
             host_ctx_addr: host_ctx_ptr as usize,
-            meta: ActiveGuestFaultMeta {
-                mod_id,
-                mod_namespace,
-                generation,
-                system_name,
-            },
+            mod_id,
+            mod_namespace_ptr: mod_namespace.map(|s| s as *const str),
+            generation,
+            system_name_ptr: system_name as *const str,
             reported_message: None,
         };
         let previous = ACTIVE_GUEST_FAULT.with(|cell| cell.borrow_mut().replace(slot));
@@ -380,7 +386,17 @@ pub(crate) fn record_active_guest_fault(
                 return None;
             }
             slot.reported_message = Some(message.to_owned());
-            Some(slot.meta.clone())
+            // SAFETY: `ActiveGuestFaultGuard::enter` guarantees `mod_namespace_ptr` and
+            // `system_name_ptr` stay alive and immutable until the guard finishes/drops.
+            let mod_namespace = unsafe { slot.mod_namespace_ptr.map(|p| Arc::from(&*p)) };
+            // SAFETY: Same lifetime invariant as `mod_namespace_ptr`.
+            let system_name = unsafe { Arc::from(&*slot.system_name_ptr) };
+            Some(ActiveGuestFaultMeta {
+                mod_id: slot.mod_id,
+                mod_namespace,
+                generation: slot.generation,
+                system_name,
+            })
         })
         .ok()
         .flatten()
@@ -433,6 +449,16 @@ pub struct BudgetWatchdogAction {
 /// Safe runtime quota & frame-time watchdog hook installed into [`ModBudgetRuntime`] by
 /// `bamabi_host` (`#![forbid(unsafe_code)]`).
 pub trait ModBudgetHook: Send + Sync + 'static {
+    /// Returns `true` when any budget policy, frame/system quota, watchdog rule, or telemetry
+    /// observer is active and requires per-tick timing/metric collection.
+    ///
+    /// Returns `false` when running under the default unlimited/unobserved configuration so
+    /// [`crate::GuestSystem`] can take the zero-overhead fast path.
+    #[inline]
+    fn is_active_or_observing(&self) -> bool {
+        true
+    }
+
     /// Resolves active [`CommandQuotaLimits`] and an optional shared per-mod frame spawn counter
     /// enforced atomically across parallel systems in the same frame.
     fn prepare_system_quotas(
@@ -458,6 +484,12 @@ impl ModBudgetRuntime {
     #[inline]
     pub fn new(hook: Arc<dyn ModBudgetHook>) -> Self {
         Self { hook }
+    }
+
+    /// Returns `true` when any budget enforcement or telemetry observation is active.
+    #[inline]
+    pub fn is_active_or_observing(&self) -> bool {
+        self.hook.is_active_or_observing()
     }
 
     /// Resolves active [`CommandQuotaLimits`] and optional shared per-mod frame spawn counter for

@@ -146,10 +146,12 @@ fn error_policy_display_quarantine_fault_guard_drop_and_init_codes() {
     let mut ctx_b = 2u64;
     let ptr_a = (&raw mut ctx_a).cast::<BamHostCtx>();
     let ptr_b = (&raw mut ctx_b).cast::<BamHostCtx>();
-    let outer = ActiveGuestFaultGuard::enter(ptr_a, Some(ModId(1)), None, 0, Arc::from("outer"));
+    // SAFETY: `"outer"` and `"inner"` are `'static` `&str` values outliving both guards.
+    let outer = unsafe { ActiveGuestFaultGuard::enter(ptr_a, Some(ModId(1)), None, 0, "outer") };
     {
+        // SAFETY: `"inner"` is `'static` and outlives `_inner`.
         let _inner =
-            ActiveGuestFaultGuard::enter(ptr_b, Some(ModId(2)), None, 0, Arc::from("inner"));
+            unsafe { ActiveGuestFaultGuard::enter(ptr_b, Some(ModId(2)), None, 0, "inner") };
         assert!(record_active_guest_fault(ptr_a, "wrong ctx").is_none());
         assert!(record_active_guest_fault(ptr_b, "inner msg").is_some());
     }

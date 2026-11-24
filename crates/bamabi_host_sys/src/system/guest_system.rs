@@ -1,12 +1,12 @@
 //! `GuestSystem` implementation of Bevy's `System` trait and `HostSystemCtx` (`BamSystemCtx`).
 
 use crate::ffi::commands::{CommandQuotaLimits, HostCommands, HostCommandsStorage};
-use crate::ffi::iter::{HostIter, QueryPlan};
+use crate::ffi::iter::{HostIter, QueryGroupIterInput, QueryPlan};
 #[cfg(feature = "diagnostics")]
 use crate::handle_header::lock_unpoison;
 use crate::handle_header::{
-    HandleHeader, HostContext, SYS_CTX_MAGIC, decode_live_entity, ffi_try, validate_sys_ctx_mut,
-    validate_sys_ctx_ref,
+    HandleHeader, HostContext, SYS_CTX_MAGIC, decode_live_entity, ffi_try,
+    next_non_zero_generation, validate_sys_ctx_mut, validate_sys_ctx_ref,
 };
 use crate::loader::{ModHost, ModId};
 use crate::registry::{ModRegistry, RegistrySnapshot};
@@ -23,10 +23,12 @@ use crate::system::error_policy::{
 use crate::system::query_group::{BamQuerySpecOwned, CachedQueryGroup, MAX_SYSTEM_QUERIES};
 use bamabi_sys::{
     AccessMode, BamChangeTicks, BamCommands, BamComponent, BamHostCtx, BamIter, BamRunIfFn,
-    BamSystemCtx, BamSystemFn, BamSystemSet, FfiEntity, FfiResult, ScheduleId,
+    BamSystemCtx, BamSystemFn, BamSystemSet, BamTimeInfo, FfiEntity, FfiResult, MappedWireVTable,
+    ScheduleId,
 };
 use bevy_ecs::archetype::ArchetypeId;
 use bevy_ecs::change_detection::{CheckChangeTicks, Tick};
+use bevy_ecs::component::ComponentId;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::message::Messages;
 #[cfg(feature = "diagnostics")]
@@ -37,6 +39,7 @@ use bevy_ecs::system::{RunSystemError, System, SystemAccess, SystemIn, SystemSta
 use bevy_ecs::utils::DebugName;
 use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
 use bevy_ecs::world::{CommandQueue, DeferredWorld, World};
+use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -99,6 +102,65 @@ pub(crate) struct RandomQueryView<'w> {
     pub(crate) has_query_state: bool,
 }
 
+/// Builds bucket-specialized stack-local [`HostIter`] and [`RandomQueryView`] slots of size `N`
+/// over `query_groups` using an explicit `generation`.
+///
+/// # Safety
+/// Caller must hold scheduler or exclusive world access covering every component, resource, and
+/// message term referenced in `query_groups` for the duration of `'w`.
+pub(crate) unsafe fn build_query_slot_iters_bucketed<'q, 'w: 'q, const N: usize>(
+    world: UnsafeWorldCell<'w>,
+    query_groups: &'q mut [CachedQueryGroup],
+    last_run: Tick,
+    this_run: Tick,
+    generation: u32,
+) -> (
+    usize,
+    [Option<HostIter<'q>>; N],
+    [Option<RandomQueryView<'q>>; N],
+) {
+    // SAFETY: Caller guarantees declared query access on `world` for `'w`.
+    let storages = unsafe { world.storages() };
+    let archetypes = world.archetypes();
+
+    let count = query_groups.len().min(N);
+    let mut host_iters: [Option<HostIter<'q>>; N] = [const { None }; N];
+    let mut query_views: [Option<RandomQueryView<'q>>; N] = [None; N];
+
+    for (i, group) in query_groups.iter_mut().take(count).enumerate() {
+        query_views[i] = Some(RandomQueryView {
+            plan: &group.plan,
+            is_dense: group.is_dense,
+            matched_tables: &group.matched_tables,
+            matched_archetypes: &group.matched_archetypes,
+            has_query_state: group.query_state.is_some(),
+        });
+        let has_masks = if group.is_dense {
+            group.table_has_masks.as_slice()
+        } else {
+            group.arch_has_masks.as_slice()
+        };
+        host_iters[i] = Some(HostIter::from_query_group(
+            world,
+            (&storages.tables, archetypes, &storages.sparse_sets),
+            QueryGroupIterInput {
+                is_dense: group.is_dense,
+                matched_tables: &group.matched_tables,
+                matched_archetypes: &group.matched_archetypes,
+                has_masks,
+                plan: &group.plan,
+                sparse_scratch: &mut group.sparse_scratch,
+                msg_cursors: &mut group.msg_cursors,
+            },
+            last_run,
+            this_run,
+            generation,
+        ));
+    }
+
+    (count, host_iters, query_views)
+}
+
 /// Builds stack-local [`HostIter`] and [`RandomQueryView`] slots over `query_groups` for a single
 /// guest system or context-aware observer invocation.
 ///
@@ -115,50 +177,16 @@ pub(crate) unsafe fn build_query_slot_iters<'q, 'w: 'q>(
     [Option<HostIter<'q>>; MAX_SYSTEM_QUERIES],
     [Option<RandomQueryView<'q>>; MAX_SYSTEM_QUERIES],
 ) {
-    // SAFETY: Caller guarantees declared query access on `world` for `'w`.
-    let storages = unsafe { world.storages() };
-    let archetypes = world.archetypes();
-
-    let count = query_groups.len().min(MAX_SYSTEM_QUERIES);
-    let mut host_iters: [Option<HostIter<'q>>; MAX_SYSTEM_QUERIES] =
-        [const { None }; MAX_SYSTEM_QUERIES];
-    let mut query_views: [Option<RandomQueryView<'q>>; MAX_SYSTEM_QUERIES] =
-        [None; MAX_SYSTEM_QUERIES];
-
-    for (i, group) in query_groups.iter_mut().take(count).enumerate() {
-        query_views[i] = Some(RandomQueryView {
-            plan: &group.plan,
-            is_dense: group.is_dense,
-            matched_tables: &group.matched_tables,
-            matched_archetypes: &group.matched_archetypes,
-            has_query_state: group.query_state.is_some(),
-        });
-        let iter = if group.is_dense {
-            HostIter::new_dense(
-                &storages.tables,
-                &group.matched_tables,
-                &group.plan,
-                last_run,
-                this_run,
-            )
-        } else {
-            HostIter::new_archetypal(
-                &storages.tables,
-                archetypes,
-                &storages.sparse_sets,
-                &group.matched_archetypes,
-                &group.plan,
-                &mut group.sparse_scratch,
-                last_run,
-                this_run,
-            )
-        }
-        .with_world(world)
-        .with_msg_cursors(&mut group.msg_cursors);
-        host_iters[i] = Some(iter);
+    // SAFETY: Caller upholds query access and lifetime `'w`.
+    unsafe {
+        build_query_slot_iters_bucketed::<MAX_SYSTEM_QUERIES>(
+            world,
+            query_groups,
+            last_run,
+            this_run,
+            next_non_zero_generation(),
+        )
     }
-
-    (count, host_iters, query_views)
 }
 
 /// Concrete `#[repr(C)]` system invocation context backing opaque [`BamSystemCtx`].
@@ -166,17 +194,22 @@ pub(crate) unsafe fn build_query_slot_iters<'q, 'w: 'q>(
 pub struct HostSystemCtx<'w> {
     /// Leading handle validation header (`SYS_CTX_MAGIC`) at byte offset `0`.
     pub header: HandleHeader,
-    host_ctx: HostContext,
-    iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES],
-    query_views: [Option<RandomQueryView<'w>>; MAX_SYSTEM_QUERIES],
+    host_ctx: Option<HostContext>,
+    iter_ptrs: &'w [*mut BamIter],
+    owned_iter_ptrs: Option<Box<[*mut BamIter; MAX_SYSTEM_QUERIES]>>,
+    query_views: &'w [Option<RandomQueryView<'w>>],
     query_count: usize,
+    res_lookup: &'w [(BamComponent, ComponentId, AccessMode, bool)],
     commands_ptr: *mut BamCommands,
     world: Option<UnsafeWorldCell<'w>>,
     last_run: Tick,
     this_run: Tick,
+    relation_targets_scratch: UnsafeCell<Vec<FfiEntity>>,
+    relation_sources_scratch: UnsafeCell<Vec<FfiEntity>>,
 }
 
 const _: () = assert!(core::mem::offset_of!(HostSystemCtx<'_>, header) == 0);
+const _: () = assert!(core::mem::size_of::<HostSystemCtx<'_>>() <= 256);
 
 impl<'w> HostSystemCtx<'w> {
     /// Creates an active stack-scoped [`HostSystemCtx`] for one `GuestSystem` callback invocation.
@@ -188,25 +221,65 @@ impl<'w> HostSystemCtx<'w> {
         query_count: usize,
         commands_ptr: *mut BamCommands,
     ) -> Self {
+        let host_ctx =
+            HostContext::with_error_buffer(snapshot, error_buf).with_namespace(mod_namespace);
+        let owned_iter_ptrs = (query_count > 0).then(|| Box::new(iter_ptrs));
         Self {
-            header: HandleHeader::new(SYS_CTX_MAGIC),
-            host_ctx: HostContext::with_error_buffer(snapshot, error_buf)
-                .with_namespace(mod_namespace),
-            iter_ptrs,
-            query_views: [None; MAX_SYSTEM_QUERIES],
+            header: HandleHeader::with_generation(SYS_CTX_MAGIC, next_non_zero_generation()),
+            host_ctx: Some(host_ctx),
+            iter_ptrs: &[],
+            owned_iter_ptrs,
+            query_views: &[],
             query_count,
+            res_lookup: &[],
             commands_ptr,
             world: None,
             last_run: Tick::new(0),
             this_run: Tick::new(0),
+            relation_targets_scratch: UnsafeCell::new(Vec::new()),
+            relation_sources_scratch: UnsafeCell::new(Vec::new()),
         }
     }
 
     #[inline]
+    pub(crate) fn new_reused_full(
+        host_ctx: HostContext,
+        generation: u32,
+        iter_ptrs: &'w [*mut BamIter],
+        query_views: &'w [Option<RandomQueryView<'w>>],
+        commands_ptr: *mut BamCommands,
+        world_and_ticks: (UnsafeWorldCell<'w>, Tick, Tick),
+        res_and_rel: (
+            &'w [(BamComponent, ComponentId, AccessMode, bool)],
+            Vec<FfiEntity>,
+            Vec<FfiEntity>,
+        ),
+    ) -> Self {
+        let (world, last_run, this_run) = world_and_ticks;
+        let (res_lookup, rel_targets, rel_sources) = res_and_rel;
+        Self {
+            header: HandleHeader::with_generation(SYS_CTX_MAGIC, generation),
+            host_ctx: Some(host_ctx),
+            iter_ptrs,
+            owned_iter_ptrs: None,
+            query_views,
+            query_count: iter_ptrs.len(),
+            res_lookup,
+            commands_ptr,
+            world: Some(world),
+            last_run,
+            this_run,
+            relation_targets_scratch: UnsafeCell::new(rel_targets),
+            relation_sources_scratch: UnsafeCell::new(rel_sources),
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
     pub(crate) fn with_world_and_queries(
         mut self,
         world: UnsafeWorldCell<'w>,
-        query_views: [Option<RandomQueryView<'w>>; MAX_SYSTEM_QUERIES],
+        query_views: &'w [Option<RandomQueryView<'w>>],
         last_run: Tick,
         this_run: Tick,
     ) -> Self {
@@ -217,10 +290,38 @@ impl<'w> HostSystemCtx<'w> {
         self
     }
 
+    #[inline]
+    fn iter_ptr(&self, query_index: usize) -> Option<*mut BamIter> {
+        if query_index >= self.query_count {
+            return None;
+        }
+        if let Some(ref boxed) = self.owned_iter_ptrs {
+            boxed.get(query_index).copied()
+        } else {
+            self.iter_ptrs.get(query_index).copied()
+        }
+    }
+
     /// Reclaims the internal diagnostic `String` capacity for zero-allocation reuse across frames.
     #[inline]
     pub fn reclaim_error_buffer(&mut self) -> String {
-        self.host_ctx.reclaim_error_buffer()
+        self.host_ctx
+            .as_mut()
+            .map(HostContext::reclaim_error_buffer)
+            .unwrap_or_default()
+    }
+
+    /// Reclaims the owned [`HostContext`] (preserving its `Arc<RegistrySnapshot>`, namespace, and
+    /// `last_error` buffer) plus reusable relation scratch buffers across frames.
+    #[inline]
+    pub(crate) fn reclaim_cached_state(
+        &mut self,
+    ) -> Option<(HostContext, Vec<FfiEntity>, Vec<FfiEntity>)> {
+        let mut hc = self.host_ctx.take()?;
+        hc.header.poison();
+        let targets = core::mem::take(self.relation_targets_scratch.get_mut());
+        let sources = core::mem::take(self.relation_sources_scratch.get_mut());
+        Some((hc, targets, sources))
     }
 
     /// Casts `&mut self` to an opaque `*mut BamSystemCtx` FFI pointer.
@@ -232,13 +333,50 @@ impl<'w> HostSystemCtx<'w> {
     /// Returns the opaque [`BamHostCtx`] pointer for this invocation's embedded [`HostContext`].
     #[inline]
     pub(crate) fn host_ctx_ffi_ptr(&self) -> *const BamHostCtx {
-        self.host_ctx.as_ffi_ptr()
+        self.host_ctx
+            .as_ref()
+            .map_or(core::ptr::null(), HostContext::as_ffi_ptr)
     }
 
     /// Borrows the system's active [`RegistrySnapshot`] and [`UnsafeWorldCell`].
     #[inline]
     pub(crate) fn snapshot_and_world(&self) -> (&RegistrySnapshot, Option<UnsafeWorldCell<'w>>) {
-        (self.host_ctx.snapshot(), self.world)
+        static EMPTY: std::sync::OnceLock<RegistrySnapshot> = std::sync::OnceLock::new();
+        let snap = self.host_ctx.as_ref().map_or_else(
+            || EMPTY.get_or_init(RegistrySnapshot::default),
+            HostContext::snapshot,
+        );
+        (snap, self.world)
+    }
+
+    /// Borrows the mutable relation targets scratch vector.
+    ///
+    /// # Safety
+    /// Caller must ensure single-threaded non-aliasing access during `sys_relation_targets` and
+    /// not hold the returned reference across subsequent `relation_targets_scratch_mut` calls.
+    #[inline]
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "HostSystemCtx is !Sync and used synchronously inside one guest callback"
+    )]
+    pub(crate) unsafe fn relation_targets_scratch_mut(&self) -> &mut Vec<FfiEntity> {
+        // SAFETY: `HostSystemCtx` is `!Sync` and used synchronously inside one guest callback.
+        unsafe { &mut *self.relation_targets_scratch.get() }
+    }
+
+    /// Borrows the mutable relation sources scratch vector.
+    ///
+    /// # Safety
+    /// Caller must ensure single-threaded non-aliasing access during `sys_relation_sources` and
+    /// not hold the returned reference across subsequent `relation_sources_scratch_mut` calls.
+    #[inline]
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "HostSystemCtx is !Sync and used synchronously inside one guest callback"
+    )]
+    pub(crate) unsafe fn relation_sources_scratch_mut(&self) -> &mut Vec<FfiEntity> {
+        // SAFETY: `HostSystemCtx` is `!Sync` and used synchronously inside one guest callback.
+        unsafe { &mut *self.relation_sources_scratch.get() }
     }
 
     /// Returns `true` if any declared query in this system holds entity-column read/write access
@@ -248,8 +386,9 @@ impl<'w> HostSystemCtx<'w> {
         &self,
         component_id: bevy_ecs::component::ComponentId,
     ) -> bool {
-        self.query_views[..self.query_count]
+        self.query_views
             .iter()
+            .take(self.query_count)
             .flatten()
             .any(|view| {
                 view.plan.terms.iter().any(|term| {
@@ -278,14 +417,140 @@ pub unsafe extern "C" fn host_sys_host_ctx(sys_ctx: *const BamSystemCtx) -> *con
     let Ok(ctx) = (unsafe { validate_sys_ctx_ref(sys_ctx) }) else {
         return core::ptr::null();
     };
-    ctx.host_ctx.as_ffi_ptr()
+    ctx.host_ctx_ffi_ptr()
+}
+
+/// Reads the running system's `(last_run, this_run)` change-detection tick window (ABI `0.4` slot `79`).
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+/// - Non-null `out_last_run` and `out_this_run` pointers must point to aligned writable `u32` storage.
+pub unsafe extern "C" fn host_sys_current_ticks(
+    sys_ctx: *const BamSystemCtx,
+    out_last_run: *mut u32,
+    out_this_run: *mut u32,
+) -> FfiResult {
+    if (!out_last_run.is_null() && !out_last_run.is_aligned())
+        || (!out_this_run.is_null() && !out_this_run.is_aligned())
+    {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let ctx = ffi_try!(unsafe { validate_sys_ctx_ref(sys_ctx) });
+    if !out_last_run.is_null() {
+        // SAFETY: `out_last_run` is non-null, aligned, and writable.
+        unsafe {
+            *out_last_run = ctx.last_run.get();
+        }
+    }
+    if !out_this_run.is_null() {
+        // SAFETY: `out_this_run` is non-null, aligned, and writable.
+        unsafe {
+            *out_this_run = ctx.this_run.get();
+        }
+    }
+    FfiResult::OK
+}
+
+/// Reads frame and fixed-timestep timing info into `*out_info` (ABI `0.4` slot `80`).
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+/// - `out_info` must point to writable aligned [`BamTimeInfo`] storage with `out_info.struct_size`
+///   initialized, or null.
+pub unsafe extern "C" fn host_sys_time_info(
+    sys_ctx: *const BamSystemCtx,
+    out_info: *mut BamTimeInfo,
+) -> FfiResult {
+    if out_info.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if !out_info.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    // SAFETY: `out_info` is non-null and aligned for `u32`; `struct_size` is at offset 0.
+    let caller_size = unsafe { core::ptr::read(out_info.cast::<u32>()) } as usize;
+    if caller_size < BamTimeInfo::MIN_V0_4_SIZE {
+        return FfiResult::INVALID_VERSION;
+    }
+    // SAFETY: `out_info` is non-null, aligned, and writable for `BamTimeInfo`.
+    unsafe {
+        *out_info = BamTimeInfo::new();
+    }
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let ctx = ffi_try!(unsafe { validate_sys_ctx_ref(sys_ctx) });
+    let (snapshot, world_opt) = ctx.snapshot_and_world();
+    let Some(world) = world_opt else {
+        return FfiResult::INVALID_STATE;
+    };
+
+    const TIME_RESOURCE_NAMES: [&str; 4] = [
+        "bamabi::TimeInfo",
+        "bamabi_sys::system::BamTimeInfo",
+        "bevy_time::time::Time<()>",
+        "Time",
+    ];
+    for name in TIME_RESOURCE_NAMES {
+        let Some(meta) = snapshot.get_by_name(name) else {
+            continue;
+        };
+        if !meta.is_resource() {
+            continue;
+        }
+        // SAFETY: Shared read-only inspection of registered time resource during system execution.
+        let Some(ptr) = (unsafe { world.get_resource_by_id(meta.component_id) }) else {
+            continue;
+        };
+        if !meta.vtable_ptr.is_null() {
+            let vt_ptr = meta
+                .vtable_ptr
+                .as_ptr()
+                .cast::<MappedWireVTable<BamTimeInfo>>();
+            if vt_ptr.is_aligned() {
+                // SAFETY: Non-null aligned vtable pointer; inspect leading `struct_size`.
+                let vt_size = unsafe { core::ptr::read(vt_ptr.cast::<u32>()) } as usize;
+                if vt_size >= core::mem::size_of::<MappedWireVTable<BamTimeInfo>>() {
+                    // SAFETY: Verified vtable header size for `MappedWireVTable<BamTimeInfo>`.
+                    let vt = unsafe { &*vt_ptr };
+                    if vt.header.uuid == meta.uuid
+                        && let Some(get_fn) = vt.get
+                    {
+                        // SAFETY: `ptr` points to resource `T` and `out_info` is writable `BamTimeInfo`.
+                        let rc = unsafe { get_fn(ptr.as_ptr().cast::<c_void>(), out_info) };
+                        if rc.is_ok() {
+                            // SAFETY: Stamp canonical `MIN_V0_4_SIZE`.
+                            unsafe {
+                                (*out_info).struct_size = BamTimeInfo::MIN_V0_4_SIZE as u32;
+                            }
+                        }
+                        return rc;
+                    }
+                }
+            }
+        }
+        if meta.size == core::mem::size_of::<BamTimeInfo>() {
+            // SAFETY: `ptr` points to `size_of::<BamTimeInfo>()` readable bytes.
+            let mut info = unsafe { core::ptr::read_unaligned(ptr.as_ptr().cast::<BamTimeInfo>()) };
+            let status = info.validate();
+            if status.is_err() {
+                return status;
+            }
+            info.struct_size = BamTimeInfo::MIN_V0_4_SIZE as u32;
+            // SAFETY: `out_info` is non-null, aligned, and writable.
+            unsafe {
+                *out_info = info;
+            }
+            return FfiResult::OK;
+        }
+    }
+    FfiResult::NOT_FOUND
 }
 
 /// Borrows the [`BamIter`] handle for declared query `query_index` (`0..query_count`).
 ///
 /// # Safety
 /// - `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
-/// - `out_iter` must point to writable `*mut BamIter` storage, or null.
+/// - `out_iter` must point to aligned writable `*mut BamIter` storage, or null.
 pub unsafe extern "C" fn host_sys_query(
     sys_ctx: *mut BamSystemCtx,
     query_index: usize,
@@ -294,14 +559,17 @@ pub unsafe extern "C" fn host_sys_query(
     if out_iter.is_null() {
         return FfiResult::NULL_POINTER;
     }
+    if !out_iter.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
     // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
     let ctx = ffi_try!(unsafe { validate_sys_ctx_mut(sys_ctx) });
-    if query_index >= ctx.query_count {
+    let Some(iter_ptr) = ctx.iter_ptr(query_index) else {
         return FfiResult::OUT_OF_RANGE;
-    }
-    // SAFETY: `out_iter` is non-null and writable.
+    };
+    // SAFETY: `out_iter` is non-null, aligned, and writable.
     unsafe {
-        *out_iter = ctx.iter_ptrs[query_index];
+        *out_iter = iter_ptr;
     }
     FfiResult::OK
 }
@@ -310,7 +578,7 @@ pub unsafe extern "C" fn host_sys_query(
 ///
 /// # Safety
 /// - `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
-/// - `out_commands` must point to writable `*mut BamCommands` storage, or null.
+/// - `out_commands` must point to aligned writable `*mut BamCommands` storage, or null.
 pub unsafe extern "C" fn host_sys_commands(
     sys_ctx: *mut BamSystemCtx,
     out_commands: *mut *mut BamCommands,
@@ -318,9 +586,12 @@ pub unsafe extern "C" fn host_sys_commands(
     if out_commands.is_null() {
         return FfiResult::NULL_POINTER;
     }
+    if !out_commands.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
     // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
     let ctx = ffi_try!(unsafe { validate_sys_ctx_mut(sys_ctx) });
-    // SAFETY: `out_commands` is non-null and writable.
+    // SAFETY: `out_commands` is non-null, aligned, and writable.
     unsafe {
         *out_commands = ctx.commands_ptr;
     }
@@ -342,14 +613,18 @@ fn entity_matches_random_query_view<'w>(
         .ok()?;
     let location = entity_cell.location();
     let archetype_matched = if view.is_dense {
-        view.matched_tables.contains(&location.table_id)
+        view.matched_tables
+            .binary_search_by_key(&location.table_id.as_usize(), |t| t.as_usize())
+            .is_ok()
     } else {
-        view.matched_archetypes.contains(&location.archetype_id)
+        view.matched_archetypes
+            .binary_search_by_key(&location.archetype_id.index(), |a| a.index())
+            .is_ok()
     };
     if !archetype_matched {
         return None;
     }
-    if !view.plan.tick_filters.is_empty() {
+    if !view.plan.tick_filters.is_empty() || !view.plan.or_groups.is_empty() {
         // SAFETY: `FilteredAccessSet` declared read/write access on every tick-filter component in `view.plan`.
         let storages = unsafe { world.storages() };
         for tf in &view.plan.tick_filters {
@@ -384,6 +659,63 @@ fn entity_matches_random_query_view<'w>(
                 return None;
             }
         }
+
+        if !view.plan.or_groups.is_empty() {
+            let arch = world.archetypes().get(location.archetype_id)?;
+            for group in &view.plan.or_groups {
+                let mut group_ok = false;
+                for clause in &group.terms {
+                    let clause_ok = if clause.has_tick_filter() {
+                        let tick_opt = if clause.is_sparse {
+                            storages
+                                .sparse_sets
+                                .get(clause.component_id)
+                                .and_then(|ss| {
+                                    let cell = if clause.has_added_filter() {
+                                        ss.get_added_tick(entity)?
+                                    } else {
+                                        ss.get_changed_tick(entity)?
+                                    };
+                                    // SAFETY: Shared tick access declared in `FilteredAccessSet`.
+                                    Some(unsafe { *cell.get() })
+                                })
+                        } else {
+                            storages.tables.get(location.table_id).and_then(|table| {
+                                let col = table.get_column(clause.component_id)?;
+                                let table_len = table.entity_count() as usize;
+                                let row = location.table_row.index();
+                                if row >= table_len {
+                                    return None;
+                                }
+                                let slice = if clause.has_added_filter() {
+                                    // SAFETY: `table_len == table.entity_count() as usize`.
+                                    unsafe { col.get_added_ticks_slice(table_len) }
+                                } else {
+                                    // SAFETY: `table_len == table.entity_count() as usize`.
+                                    unsafe { col.get_changed_ticks_slice(table_len) }
+                                };
+                                // SAFETY: `row < table_len == slice.len()`.
+                                Some(unsafe { *slice.get_unchecked(row).get() })
+                            })
+                        };
+                        tick_opt.is_some_and(|t| t.is_newer_than(last_run, this_run))
+                    } else if clause.mode == AccessMode::FILTER_ONLY {
+                        arch.contains(clause.component_id)
+                    } else if clause.mode == AccessMode::WITHOUT {
+                        !arch.contains(clause.component_id)
+                    } else {
+                        false
+                    };
+                    if clause_ok {
+                        group_ok = true;
+                        break;
+                    }
+                }
+                if !group_ok {
+                    return None;
+                }
+            }
+        }
     }
     Some(entity_cell)
 }
@@ -403,7 +735,7 @@ fn resolve_random_entity_cell<'w>(
         return None;
     }
     let bevy_entity = decode_live_entity(entity).ok()?;
-    let view = ctx.query_views[query_index].as_ref()?;
+    let view = ctx.query_views.get(query_index).and_then(Option::as_ref)?;
     let term = view.plan.terms.get(term_index)?;
     if term.is_resource() || term.is_message() {
         return None;
@@ -503,46 +835,64 @@ unsafe fn resolve_resource_entity<'w>(
         "sys_res_ptr"
     };
     if !out_ticks.is_null() && !out_ticks.is_aligned() {
-        ctx.host_ctx
-            .set_last_error(format!("{op}: misaligned out_ticks pointer"));
+        if let Some(ref hc) = ctx.host_ctx {
+            hc.set_last_error(format!("{op}: misaligned out_ticks pointer"));
+        }
         return None;
     }
-    let Some(term) = ctx
-        .query_views
-        .iter()
-        .take(ctx.query_count)
-        .flatten()
-        .flat_map(|v| v.plan.terms.iter())
-        .find(|t| {
-            t.component == component
-                && t.is_resource()
-                && if mutable {
-                    t.mode == AccessMode::RESOURCE_WRITE
+    let resolved: Option<(ComponentId, bool)> = if !ctx.res_lookup.is_empty() {
+        ctx.res_lookup
+            .binary_search_by_key(&component.0, |entry| entry.0.0)
+            .ok()
+            .and_then(|idx| {
+                let (_, comp_id, mode, is_immutable) = ctx.res_lookup[idx];
+                if mutable && mode != AccessMode::RESOURCE_WRITE {
+                    None
                 } else {
-                    t.mode.is_resource()
+                    Some((comp_id, is_immutable))
                 }
-        })
-    else {
-        ctx.host_ctx.set_last_error(if mutable {
-            "sys_res_mut_ptr: resource handle was not declared with ResourceWrite in this system"
-        } else {
-            "sys_res_ptr: resource handle was not declared with ResourceRead or ResourceWrite in any query of this system"
-        });
+            })
+    } else {
+        ctx.query_views
+            .iter()
+            .take(ctx.query_count)
+            .flatten()
+            .flat_map(|v| v.plan.terms.iter())
+            .find(|t| {
+                t.component == component
+                    && t.is_resource()
+                    && if mutable {
+                        t.mode == AccessMode::RESOURCE_WRITE
+                    } else {
+                        t.mode.is_resource()
+                    }
+            })
+            .map(|t| (t.component_id, t.is_immutable()))
+    };
+    let Some((comp_id, is_immutable)) = resolved else {
+        if let Some(ref hc) = ctx.host_ctx {
+            hc.set_last_error(if mutable {
+                "sys_res_mut_ptr: resource handle was not declared with ResourceWrite in this system"
+            } else {
+                "sys_res_ptr: resource handle was not declared with ResourceRead or ResourceWrite in any query of this system"
+            });
+        }
         return None;
     };
-    if mutable && term.is_immutable() {
-        ctx.host_ctx
-            .set_last_error("sys_res_mut_ptr: resource is immutable");
+    if mutable && is_immutable {
+        if let Some(ref hc) = ctx.host_ctx {
+            hc.set_last_error("sys_res_mut_ptr: resource is immutable");
+        }
         return None;
     }
     let world = ctx.world?;
-    // SAFETY: `RESOURCE_READ` or `RESOURCE_WRITE` on `term.component_id` was declared in `FilteredAccessSet`.
-    let entity = unsafe { world.resource_entities() }.get(term.component_id)?;
+    // SAFETY: `RESOURCE_READ` or `RESOURCE_WRITE` on `comp_id` was declared in `FilteredAccessSet`.
+    let entity = unsafe { world.resource_entities() }.get(comp_id)?;
     if !out_ticks.is_null()
         && let Ok(read_cell) = world.get_entity(entity)
         && let Some(ticks) =
             // SAFETY: Declared read/write access; reading change ticks before any mutable borrow.
-            unsafe { read_cell.get_change_ticks_by_id(term.component_id) }
+            unsafe { read_cell.get_change_ticks_by_id(comp_id) }
     {
         // SAFETY: `out_ticks` is non-null, aligned, and exclusively writable per caller contract.
         unsafe {
@@ -554,7 +904,7 @@ unsafe fn resolve_resource_entity<'w>(
             };
         }
     }
-    Some((world, entity, term.component_id))
+    Some((world, entity, comp_id))
 }
 
 /// Looks up a singleton read-only `Resource` by its pre-resolved [`BamComponent`] handle
@@ -673,6 +1023,11 @@ pub struct GuestSystem {
     fault_queue: CommandQueue,
     last_error_buf: String,
     init_count: u64,
+    local_gen: u32,
+    cached_host_ctx: std::sync::Mutex<Option<HostContext>>,
+    relation_targets_scratch: Vec<FfiEntity>,
+    relation_sources_scratch: Vec<FfiEntity>,
+    res_lookup: Vec<(BamComponent, ComponentId, AccessMode, bool)>,
 
     registry: ModRegistry,
     cached_registry_gen: u64,
@@ -696,6 +1051,7 @@ impl GuestSystem {
         let query_groups = query_specs.into_iter().map(CachedQueryGroup::new).collect();
         let cached_registry_gen = registry.generation();
         let snapshot = registry.snapshot_arc();
+        let cached_host_ctx = std::sync::Mutex::new(Some(HostContext::new(Arc::clone(&snapshot))));
 
         Self {
             name: name_arc,
@@ -732,6 +1088,11 @@ impl GuestSystem {
             fault_queue: CommandQueue::default(),
             last_error_buf: String::new(),
             init_count: 0,
+            local_gen: next_non_zero_generation(),
+            cached_host_ctx,
+            relation_targets_scratch: Vec::new(),
+            relation_sources_scratch: Vec::new(),
+            res_lookup: Vec::new(),
             registry,
             cached_registry_gen,
             snapshot,
@@ -775,6 +1136,9 @@ impl GuestSystem {
     pub(crate) fn set_registry(&mut self, registry: ModRegistry) {
         self.cached_registry_gen = registry.generation();
         self.snapshot = registry.snapshot_arc();
+        if let Ok(Some(hc)) = self.cached_host_ctx.get_mut() {
+            hc.set_snapshot(Arc::clone(&self.snapshot));
+        }
         self.registry = registry;
     }
 
@@ -842,13 +1206,20 @@ impl GuestSystem {
     /// Sets the canonical module namespace (`BamManifest::name`) attached to `BamHostCtx`.
     #[inline]
     pub fn set_mod_namespace(&mut self, namespace: Option<Arc<str>>) {
-        self.mod_namespace = namespace;
+        self.mod_namespace = namespace.clone();
+        if let Ok(Some(hc)) = self.cached_host_ctx.get_mut() {
+            hc.set_namespace(namespace);
+        }
     }
 
     /// Builder helper to attach the canonical module namespace (`BamManifest::name`).
     #[inline]
     pub fn with_mod_namespace(mut self, namespace: impl Into<Arc<str>>) -> Self {
-        self.mod_namespace = Some(namespace.into());
+        let ns: Arc<str> = namespace.into();
+        self.mod_namespace = Some(Arc::clone(&ns));
+        if let Ok(Some(hc)) = self.cached_host_ctx.get_mut() {
+            hc.set_namespace(Some(ns));
+        }
         self
     }
 
@@ -1221,6 +1592,116 @@ impl GuestSystem {
             }
         }
     }
+
+    #[inline(always)]
+    fn run_bucket<const N: usize>(
+        &mut self,
+        world: UnsafeWorldCell<'_>,
+        last_run: Tick,
+        change_tick: Tick,
+        local_gen: u32,
+        quota_limits: CommandQuotaLimits,
+        shared_frame_spawns: Option<&core::sync::atomic::AtomicUsize>,
+    ) -> (FfiResult, Option<String>, usize, usize) {
+        // SAFETY: Scheduler verified access via `FilteredAccessSet`; no intra-system conflict exists.
+        let (count, mut host_iters, query_views_bucket) = unsafe {
+            build_query_slot_iters_bucketed::<N>(
+                world,
+                &mut self.query_groups,
+                last_run,
+                change_tick,
+                local_gen,
+            )
+        };
+
+        let mut iter_ptrs: [*mut BamIter; N] = [core::ptr::null_mut(); N];
+
+        let (status, reported_fault) = {
+            let mut host_commands = HostCommands::with_generation(
+                local_gen,
+                &mut self.commands_storage,
+                world.entity_allocator(),
+                &self.snapshot,
+            )
+            .with_mod_context_ref(self.mod_id, Some(&self.is_active))
+            .with_registry(&self.registry)
+            .with_quotas(quota_limits, shared_frame_spawns);
+            let raw_cmds_ptr: *mut HostCommands<'_> = &raw mut host_commands;
+            let commands_ptr = raw_cmds_ptr.cast::<BamCommands>();
+            for i in 0..count {
+                if let Some(ref mut it) = host_iters[i] {
+                    it.set_par_commands(raw_cmds_ptr);
+                    iter_ptrs[i] = it.as_ffi_ptr();
+                }
+            }
+
+            let host_ctx = match self.cached_host_ctx.get_mut().ok().and_then(Option::take) {
+                Some(mut hc) => {
+                    hc.rearm_with_generation(local_gen);
+                    hc
+                }
+                None => {
+                    let err_buf = core::mem::take(&mut self.last_error_buf);
+                    HostContext::with_generation_error_buffer(
+                        Arc::clone(&self.snapshot),
+                        err_buf,
+                        local_gen,
+                    )
+                    .with_namespace(self.mod_namespace.clone())
+                }
+            };
+            let mut sys_ctx = HostSystemCtx::new_reused_full(
+                host_ctx,
+                local_gen,
+                &iter_ptrs[..count],
+                &query_views_bucket[..count],
+                commands_ptr,
+                (world, last_run, change_tick),
+                (
+                    &self.res_lookup,
+                    core::mem::take(&mut self.relation_targets_scratch),
+                    core::mem::take(&mut self.relation_sources_scratch),
+                ),
+            );
+            let host_ctx_ptr = sys_ctx.host_ctx_ffi_ptr();
+            let sys_ctx_ptr = sys_ctx.as_ffi_ptr();
+            let GuestFnPtr(callback) = self.callback;
+            // SAFETY: `self.mod_namespace` and `self.name` outlive `fault_guard` and remain
+            // immutable until `fault_guard.finish()` removes the thread-local slot.
+            let fault_guard = unsafe {
+                ActiveGuestFaultGuard::enter(
+                    host_ctx_ptr,
+                    self.mod_id,
+                    self.mod_namespace.as_deref(),
+                    self.mod_generation,
+                    &self.name,
+                )
+            };
+            // SAFETY: Calling foreign `extern "C"` callback with stack-scoped `HostSystemCtx`,
+            // `HostIter`s, and `HostCommands` whose headers are poisoned when this block exits.
+            let res = unsafe { callback(sys_ctx_ptr, self.user_data.as_ptr()) };
+            let reported = fault_guard.finish();
+            if let Some((mut hc, rel_t, rel_s)) = sys_ctx.reclaim_cached_state() {
+                self.last_error_buf = hc.reclaim_error_buffer();
+                if let Ok(slot) = self.cached_host_ctx.get_mut() {
+                    *slot = Some(hc);
+                }
+                self.relation_targets_scratch = rel_t;
+                self.relation_sources_scratch = rel_s;
+            }
+            (res, reported)
+        };
+
+        let mut total_chunks = 0usize;
+        let mut total_entities = 0usize;
+        for it in host_iters.iter().take(count).flatten() {
+            let (c, e) = it.stats();
+            total_chunks += c;
+            total_entities += e;
+        }
+        drop(host_iters);
+        (status, reported_fault, total_chunks, total_entities)
+    }
 }
 
 impl System for GuestSystem {
@@ -1348,8 +1829,39 @@ impl System for GuestSystem {
                 }
                 self.access = SystemAccess::Shared(access_set);
                 let cell = world.as_unsafe_world_cell();
+                self.res_lookup.clear();
                 for group in &mut self.query_groups {
                     group.update_archetypes(cell);
+                    for term in &group.plan.terms {
+                        if term.is_resource() && term.mode.is_resource() {
+                            if let Some(existing) =
+                                self.res_lookup.iter_mut().find(|e| e.0 == term.component)
+                            {
+                                if term.mode == AccessMode::RESOURCE_WRITE {
+                                    existing.2 = AccessMode::RESOURCE_WRITE;
+                                }
+                            } else {
+                                self.res_lookup.push((
+                                    term.component,
+                                    term.component_id,
+                                    term.mode,
+                                    term.is_immutable(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                self.res_lookup.sort_unstable_by_key(|e| e.0.0);
+                if let Ok(slot) = self.cached_host_ctx.get_mut() {
+                    if let Some(hc) = slot {
+                        hc.set_snapshot(Arc::clone(&self.snapshot));
+                        hc.set_namespace(self.mod_namespace.clone());
+                    } else {
+                        *slot = Some(
+                            HostContext::new(Arc::clone(&self.snapshot))
+                                .with_namespace(self.mod_namespace.clone()),
+                        );
+                    }
                 }
                 if let Some(ref mut cond_state) = self.run_if_ctx {
                     cond_state.query_group.update_archetypes(cell);
@@ -1420,6 +1932,13 @@ impl System for GuestSystem {
         }
     }
 
+    /// Executes this guest system's C-ABI callback (`BamSystemFn`) over scheduler-verified
+    /// `UnsafeWorldCell` borrows.
+    ///
+    /// # Safety
+    /// Caller (Bevy's schedule executor) must ensure `world` grants all reads and writes declared
+    /// in `self.access` returned by `System::initialize`, and that `run_unsafe` is not invoked
+    /// concurrently with overlapping mutable accesses to the same `GuestSystem` instance.
     unsafe fn run_unsafe(
         &mut self,
         _input: SystemIn<'_, Self>,
@@ -1433,11 +1952,21 @@ impl System for GuestSystem {
             return Ok(());
         }
 
+        // Advance per-system monotonic non-zero generation locally (zero atomic cache-line bouncing).
+        self.local_gen = self.local_gen.wrapping_add(1);
+        if self.local_gen == 0 {
+            self.local_gen = 1;
+        }
+        let local_gen = self.local_gen;
+
         // Refresh cached `Arc<RegistrySnapshot>` in O(1) only if `ModRegistry` generation advanced.
         let latest_gen = self.registry.latest_generation();
         if latest_gen != self.cached_registry_gen {
             self.snapshot = self.registry.latest_snapshot_arc();
             self.cached_registry_gen = latest_gen;
+            if let Ok(Some(hc)) = self.cached_host_ctx.get_mut() {
+                hc.set_snapshot(Arc::clone(&self.snapshot));
+            }
         }
 
         if let Some((GuestFnPtr(cond_fn), cond_ud)) = self.run_if {
@@ -1457,41 +1986,9 @@ impl System for GuestSystem {
             let archetypes = world.archetypes();
 
             let has_terms = !cond_ctx.query_group.spec.terms.is_empty();
+            let mut query_views: [Option<RandomQueryView<'_>>; 1] = [None; 1];
+            let mut iter_ptrs: [*mut BamIter; 1] = [core::ptr::null_mut(); 1];
             let mut cond_iter = if has_terms {
-                Some(
-                    if cond_ctx.query_group.is_dense {
-                        HostIter::new_dense(
-                            &storages.tables,
-                            &cond_ctx.query_group.matched_tables,
-                            &cond_ctx.query_group.plan,
-                            last_run,
-                            current_tick,
-                        )
-                    } else {
-                        HostIter::new_archetypal(
-                            &storages.tables,
-                            archetypes,
-                            &storages.sparse_sets,
-                            &cond_ctx.query_group.matched_archetypes,
-                            &cond_ctx.query_group.plan,
-                            &mut cond_ctx.query_group.sparse_scratch,
-                            last_run,
-                            current_tick,
-                        )
-                    }
-                    .with_world(world)
-                    .with_msg_cursors(&mut cond_ctx.query_group.msg_cursors),
-                )
-            } else {
-                None
-            };
-
-            let mut iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES] =
-                [core::ptr::null_mut(); MAX_SYSTEM_QUERIES];
-            let mut query_views: [Option<RandomQueryView<'_>>; MAX_SYSTEM_QUERIES] =
-                [None; MAX_SYSTEM_QUERIES];
-            let cond_query_count = if let Some(ref mut it) = cond_iter {
-                iter_ptrs[0] = it.as_ffi_ptr();
                 query_views[0] = Some(RandomQueryView {
                     plan: &cond_ctx.query_group.plan,
                     is_dense: cond_ctx.query_group.is_dense,
@@ -1499,37 +1996,93 @@ impl System for GuestSystem {
                     matched_archetypes: &cond_ctx.query_group.matched_archetypes,
                     has_query_state: cond_ctx.query_group.query_state.is_some(),
                 });
+                let has_masks = if cond_ctx.query_group.is_dense {
+                    cond_ctx.query_group.table_has_masks.as_slice()
+                } else {
+                    cond_ctx.query_group.arch_has_masks.as_slice()
+                };
+                Some(HostIter::from_query_group(
+                    world,
+                    (&storages.tables, archetypes, &storages.sparse_sets),
+                    QueryGroupIterInput {
+                        is_dense: cond_ctx.query_group.is_dense,
+                        matched_tables: &cond_ctx.query_group.matched_tables,
+                        matched_archetypes: &cond_ctx.query_group.matched_archetypes,
+                        has_masks,
+                        plan: &cond_ctx.query_group.plan,
+                        sparse_scratch: &mut cond_ctx.query_group.sparse_scratch,
+                        msg_cursors: &mut cond_ctx.query_group.msg_cursors,
+                    },
+                    last_run,
+                    current_tick,
+                    local_gen,
+                ))
+            } else {
+                None
+            };
+
+            let cond_query_count = if let Some(ref mut it) = cond_iter {
+                iter_ptrs[0] = it.as_ffi_ptr();
                 1
             } else {
                 0
             };
 
             let (cond_res, reported_fault) = {
-                let err_buf = core::mem::take(&mut self.last_error_buf);
-                let mut sys_ctx = HostSystemCtx::new(
-                    Arc::clone(&self.snapshot),
-                    self.mod_namespace.clone(),
-                    err_buf,
-                    iter_ptrs,
-                    cond_query_count,
+                let host_ctx = match self.cached_host_ctx.get_mut().ok().and_then(Option::take) {
+                    Some(mut hc) => {
+                        hc.rearm_with_generation(local_gen);
+                        hc
+                    }
+                    None => {
+                        let err_buf = core::mem::take(&mut self.last_error_buf);
+                        HostContext::with_generation_error_buffer(
+                            Arc::clone(&self.snapshot),
+                            err_buf,
+                            local_gen,
+                        )
+                        .with_namespace(self.mod_namespace.clone())
+                    }
+                };
+                let mut sys_ctx = HostSystemCtx::new_reused_full(
+                    host_ctx,
+                    local_gen,
+                    &iter_ptrs[..cond_query_count],
+                    &query_views[..cond_query_count],
                     core::ptr::null_mut(),
-                )
-                .with_world_and_queries(world, query_views, last_run, current_tick);
+                    (world, last_run, current_tick),
+                    (
+                        &[],
+                        core::mem::take(&mut self.relation_targets_scratch),
+                        core::mem::take(&mut self.relation_sources_scratch),
+                    ),
+                );
                 let host_ctx_ptr = sys_ctx.host_ctx_ffi_ptr();
                 let sys_ctx_ptr = sys_ctx.as_ffi_ptr();
                 let GuestFnPtr(cond_fn) = cond_ctx.callback;
-                let fault_guard = ActiveGuestFaultGuard::enter(
-                    host_ctx_ptr,
-                    self.mod_id,
-                    self.mod_namespace.clone(),
-                    self.mod_generation,
-                    Arc::clone(&self.name),
-                );
+                // SAFETY: `self.mod_namespace` and `self.name` outlive `fault_guard` and remain
+                // immutable until `fault_guard.finish()` removes the thread-local slot.
+                let fault_guard = unsafe {
+                    ActiveGuestFaultGuard::enter(
+                        host_ctx_ptr,
+                        self.mod_id,
+                        self.mod_namespace.as_deref(),
+                        self.mod_generation,
+                        &self.name,
+                    )
+                };
                 // SAFETY: Calling foreign `extern "C"` `run_if_ctx` predicate with stack-scoped
                 // read-only `HostSystemCtx` (`commands_ptr = null`) and optional `HostIter`.
                 let res = unsafe { cond_fn(sys_ctx_ptr, cond_ctx.user_data.as_ptr()) };
                 let reported = fault_guard.finish();
-                self.last_error_buf = sys_ctx.reclaim_error_buffer();
+                if let Some((mut hc, rel_t, rel_s)) = sys_ctx.reclaim_cached_state() {
+                    self.last_error_buf = hc.reclaim_error_buffer();
+                    if let Ok(slot) = self.cached_host_ctx.get_mut() {
+                        *slot = Some(hc);
+                    }
+                    self.relation_targets_scratch = rel_t;
+                    self.relation_sources_scratch = rel_s;
+                }
                 (res, reported)
             };
             drop(cond_iter);
@@ -1562,10 +2115,6 @@ impl System for GuestSystem {
             group.update_archetypes(world);
         }
 
-        // SAFETY: Scheduler verified access via `FilteredAccessSet`; no intra-system conflict exists.
-        let storages = unsafe { world.storages() };
-        let archetypes = world.archetypes();
-
         let budget_runtime: Option<&ModBudgetRuntime> = self.budget_runtime_id.and_then(|bid| {
             // SAFETY: Shared read access to `ModBudgetRuntime` (`bid`) was declared in `FilteredAccessSet`.
             unsafe { world.get_resource_by_id(bid) }.map(|ptr| {
@@ -1575,45 +2124,42 @@ impl System for GuestSystem {
         });
 
         let mod_label = self.mod_namespace.as_deref().unwrap_or("unscoped");
-        let (quota_limits, shared_frame_spawns, table_metrics) = if let Some(rt) = budget_runtime {
-            let (limits, shared) = rt.prepare_system_quotas(self.mod_id, mod_label);
-            let tm = compute_query_table_metrics(
-                &self.query_groups,
-                &storages.tables,
-                archetypes,
-                last_run,
-                change_tick,
-            );
-            (limits, shared, tm)
+        let budget_active = budget_runtime.is_some_and(ModBudgetRuntime::is_active_or_observing);
+        let (quota_limits, shared_frame_spawns, table_metrics) =
+            if budget_active && let Some(rt) = budget_runtime {
+                // SAFETY: Scheduler verified access via `FilteredAccessSet`; no intra-system conflict exists.
+                let storages = unsafe { world.storages() };
+                let archetypes = world.archetypes();
+                let (limits, shared) = rt.prepare_system_quotas(self.mod_id, mod_label);
+                let tm = compute_query_table_metrics(
+                    &self.query_groups,
+                    &storages.tables,
+                    archetypes,
+                    last_run,
+                    change_tick,
+                );
+                (limits, shared, tm)
+            } else {
+                (
+                    CommandQuotaLimits::UNLIMITED,
+                    None,
+                    QueryTableMetrics::default(),
+                )
+            };
+
+        let sys_span = if tracing::enabled!(tracing::Level::DEBUG) {
+            Some(tracing::debug_span!(
+                "bam_guest_system",
+                mod_name = %mod_label,
+                system = %self.name,
+                chunks = tracing::field::Empty,
+                entities = tracing::field::Empty,
+                commands = tracing::field::Empty,
+            ))
         } else {
-            (
-                CommandQuotaLimits::UNLIMITED,
-                None,
-                QueryTableMetrics::default(),
-            )
+            None
         };
-
-        // SAFETY: Scheduler verified access via `FilteredAccessSet`; no intra-system conflict exists.
-        let (count, mut host_iters, query_views) =
-            unsafe { build_query_slot_iters(world, &mut self.query_groups, last_run, change_tick) };
-
-        let mut iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES] =
-            [core::ptr::null_mut(); MAX_SYSTEM_QUERIES];
-        for i in 0..count {
-            if let Some(ref mut it) = host_iters[i] {
-                iter_ptrs[i] = it.as_ffi_ptr();
-            }
-        }
-
-        let sys_span = tracing::debug_span!(
-            "bam_guest_system",
-            mod_name = %mod_label,
-            system = %self.name,
-            chunks = tracing::field::Empty,
-            entities = tracing::field::Empty,
-            commands = tracing::field::Empty,
-        );
-        let _span_guard = sys_span.enter();
+        let _span_guard = sys_span.as_ref().map(tracing::Span::enter);
 
         if self.commands_storage.is_empty() {
             self.commands_storage.reset_invocation_counters();
@@ -1625,73 +2171,67 @@ impl System for GuestSystem {
         let has_diagnostics = false;
 
         let start_time =
-            (has_diagnostics || budget_runtime.is_some()).then(std::time::Instant::now);
+            (!cfg!(miri) && (has_diagnostics || budget_active)).then(std::time::Instant::now);
 
-        let (status, reported_fault) = {
-            let mut host_commands = HostCommands::new(
-                &mut self.commands_storage,
-                world.entity_allocator(),
-                &self.snapshot,
-            )
-            .with_mod_context(self.mod_id, Some(Arc::clone(&self.is_active)))
-            .with_registry(&self.registry)
-            .with_quotas(quota_limits, shared_frame_spawns.as_deref());
-            let commands_ptr = host_commands.as_ffi_ptr();
-            let err_buf = core::mem::take(&mut self.last_error_buf);
-            let mut sys_ctx = HostSystemCtx::new(
-                Arc::clone(&self.snapshot),
-                self.mod_namespace.clone(),
-                err_buf,
-                iter_ptrs,
-                count,
-                commands_ptr,
-            )
-            .with_world_and_queries(world, query_views, last_run, change_tick);
-            let host_ctx_ptr = sys_ctx.host_ctx_ffi_ptr();
-            let sys_ctx_ptr = sys_ctx.as_ffi_ptr();
-            let GuestFnPtr(callback) = self.callback;
-            let fault_guard = ActiveGuestFaultGuard::enter(
-                host_ctx_ptr,
-                self.mod_id,
-                self.mod_namespace.clone(),
-                self.mod_generation,
-                Arc::clone(&self.name),
-            );
-            // SAFETY: Calling foreign `extern "C"` callback with stack-scoped `HostSystemCtx`,
-            // `HostIter`s, and `HostCommands` whose headers are poisoned when this block exits.
-            let res = unsafe { callback(sys_ctx_ptr, self.user_data.as_ptr()) };
-            let reported = fault_guard.finish();
-            self.last_error_buf = sys_ctx.reclaim_error_buffer();
-            (res, reported)
+        let (status, reported_fault, total_chunks, total_entities) = match self.query_groups.len() {
+            0 => self.run_bucket::<0>(
+                world,
+                last_run,
+                change_tick,
+                local_gen,
+                quota_limits,
+                shared_frame_spawns.as_deref(),
+            ),
+            1 => self.run_bucket::<1>(
+                world,
+                last_run,
+                change_tick,
+                local_gen,
+                quota_limits,
+                shared_frame_spawns.as_deref(),
+            ),
+            2..=4 => self.run_bucket::<4>(
+                world,
+                last_run,
+                change_tick,
+                local_gen,
+                quota_limits,
+                shared_frame_spawns.as_deref(),
+            ),
+            _ => self.run_bucket::<MAX_SYSTEM_QUERIES>(
+                world,
+                last_run,
+                change_tick,
+                local_gen,
+                quota_limits,
+                shared_frame_spawns.as_deref(),
+            ),
         };
 
         let elapsed = start_time.map(|t| t.elapsed());
 
-        let mut total_chunks = 0usize;
-        let mut total_entities = 0usize;
-        for it in host_iters.iter().take(count).flatten() {
-            let (c, e) = it.stats();
-            total_chunks += c;
-            total_entities += e;
-        }
-        drop(host_iters);
-
-        let commands_queued = self.commands_storage.len();
-        let arena_bytes_used = self.commands_storage.arena_bytes_used();
-        let spawns_queued = self.commands_storage.spawns_queued();
-        let arena_breaches = self.commands_storage.arena_breaches();
-        let spawn_breaches = self.commands_storage.spawn_breaches();
-        if !sys_span.is_disabled() {
-            sys_span.record("chunks", total_chunks);
-            sys_span.record("entities", total_entities);
-            sys_span.record("commands", commands_queued);
+        let commands_queued = if budget_active || has_diagnostics || sys_span.is_some() {
+            self.commands_storage.len()
+        } else {
+            0
+        };
+        if let Some(ref span) = sys_span
+            && !span.is_disabled()
+        {
+            span.record("chunks", total_chunks);
+            span.record("entities", total_entities);
+            span.record("commands", commands_queued);
         }
 
         let faulted =
             status == FfiResult::PANIC_CAUGHT || status.is_err() || reported_fault.is_some();
 
         let mut watchdog_quarantined = false;
-        if let Some(rt) = budget_runtime {
+        if budget_active && let Some(rt) = budget_runtime {
+            let arena_bytes_used = self.commands_storage.arena_bytes_used();
+            let spawns_queued = self.commands_storage.spawns_queued();
+            let arena_breaches = self.commands_storage.arena_breaches();
+            let spawn_breaches = self.commands_storage.spawn_breaches();
             let duration_us = elapsed
                 .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
                 .unwrap_or(0);

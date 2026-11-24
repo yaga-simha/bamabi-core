@@ -204,6 +204,12 @@ impl BamSymbolTable {
             .map(Box::as_ref)
     }
 
+    /// Alias for [`Self::resolve_symbol_str`] matching the ABI `0.4.0` symbol resolver contract.
+    #[inline]
+    pub fn resolve_str(&self, symbol: BamSymbol) -> Option<&str> {
+        self.resolve_symbol_str(symbol)
+    }
+
     /// Returns the total number of distinct symbols interned in this table.
     #[inline]
     pub fn len(&self) -> usize {
@@ -354,6 +360,12 @@ impl ModNamedObjects {
     /// Looks up the bound [`Entity`] for `name`.
     pub fn get(&self, name: &str) -> Option<Entity> {
         read_unpoison(&self.inner.state).by_name.get(name).copied()
+    }
+
+    /// Resolves the bound [`Entity`] for `name` (alias for [`Self::get`]).
+    #[inline]
+    pub fn resolve(&self, name: &str) -> Option<Entity> {
+        self.get(name)
     }
 
     /// Looks up the bound [`FfiEntity`] for `name`.
@@ -575,6 +587,56 @@ pub(crate) fn bind_named_object_for_host_ctx(
     };
     objects.bind(name, entity);
     Ok(())
+}
+
+pub(crate) fn resolve_named_object_for_host_ctx(
+    host_ctx: &HostContext,
+    name: &str,
+) -> Result<Option<Entity>, FfiResult> {
+    if name.is_empty() {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    let Some(world_id) = host_ctx.snapshot().world_tables_id() else {
+        host_ctx.set_last_error(
+            "resolve_named_object: HostContext is not bound to a World ModNamedObjects",
+        );
+        return Err(FfiResult::INVALID_STATE);
+    };
+    let Some(objects) = lookup_named_objects_by_id(world_id) else {
+        host_ctx
+            .set_last_error("resolve_named_object: backing World ModNamedObjects has been dropped");
+        return Err(FfiResult::INVALID_STATE);
+    };
+    Ok(objects.resolve(name))
+}
+
+pub(crate) fn resolve_symbol_str_for_host_ctx(
+    host_ctx: &HostContext,
+    symbol: BamSymbol,
+) -> Result<bamabi_sys::StrView, FfiResult> {
+    if !symbol.is_valid() {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    let Some(world_id) = host_ctx.snapshot().world_tables_id() else {
+        host_ctx.set_last_error(
+            "resolve_symbol_str: HostContext is not bound to a World BamSymbolTable",
+        );
+        return Err(FfiResult::INVALID_STATE);
+    };
+    let Some(table) = lookup_symbol_table_by_id(world_id) else {
+        host_ctx
+            .set_last_error("resolve_symbol_str: backing World BamSymbolTable has been dropped");
+        return Err(FfiResult::INVALID_STATE);
+    };
+    let Some(text) = table.resolve_str(symbol) else {
+        return Err(FfiResult::NOT_FOUND);
+    };
+    // SAFETY: `text` resides inside an append-only `OnceLock<Box<str>>` slot owned by the
+    // world-scoped `BamSymbolTable` resource; its address stays immutable until the `World` drops.
+    Ok(bamabi_sys::StrView {
+        ptr: text.as_ptr(),
+        len: text.len(),
+    })
 }
 
 #[cfg(test)]

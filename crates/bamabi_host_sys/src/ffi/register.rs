@@ -10,8 +10,12 @@ use crate::handle_header::{
     lock_unpoison, validate_host_ctx, validate_load_ctx_mut, validate_load_ctx_ref,
     validate_non_empty_cstr,
 };
-use crate::loader::ModId;
+use crate::loader::schema_migration::{
+    StagedColumnMigrationUndo, rollback_staged_column_migrations,
+};
 use crate::loader::symbols::ensure_symbol_tables_in_world;
+use crate::loader::{ModHost, ModId};
+use crate::registry::catalog::{DynamicMessageReg, DynamicResourceReg, OwnedFieldStrings};
 use crate::registry::{
     DynamicComponentReg, ExtractEventTargetFn, ModRegistry, RegistrySnapshot,
     component_flags_to_storage_flags, extract_owned_dynamic_fields,
@@ -22,8 +26,9 @@ use crate::system::access_builder::validate_system_queries_against_snapshot;
 use crate::system::{BamQuerySpecOwned, GuestSystem};
 use bamabi_sys::{
     BAM_QUERY_FLAG_PARAM_SET, BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN,
-    BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BAM_REQUIRED_KNOWN_FLAGS, BamComponent, BamEventKind,
-    BamHostCtx, BamLoadCtx, BamObserverCtxFn, BamObserverDesc, BamObserverFn, BamObserverMutFn,
+    BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BAM_REQUIRED_KNOWN_FLAGS, BAM_STORAGE_FLAG_MESSAGE,
+    BAM_STORAGE_FLAG_RESOURCE, BamComponent, BamEventKind, BamFieldDesc, BamHostCtx, BamLoadCtx,
+    BamObserverCtxFn, BamObserverCtxMutFn, BamObserverDesc, BamObserverFn, BamObserverMutFn,
     BamQueryDesc, BamRequiredComponent, BamRequiredInitFn, BamSystem, BamSystemDesc, BamTermDesc,
     ComponentCloneFn, ComponentDesc, ComponentHookFn, ComponentUuid, FfiEntity, FfiResult,
     MAX_QUERIES_PER_SYSTEM, read_descriptor,
@@ -72,6 +77,9 @@ pub struct GuestObserverBinding {
     pub mut_callback: Option<GuestFnPtr<BamObserverMutFn>>,
     /// Optional [`BamSystemCtx`](bamabi_sys::BamSystemCtx)-aware foreign C-ABI callback (`BamObserverCtxFn`).
     pub ctx_callback: Option<GuestFnPtr<BamObserverCtxFn>>,
+    /// Optional [`BamSystemCtx`](bamabi_sys::BamSystemCtx)-aware mutable foreign C-ABI callback
+    /// (`BamObserverCtxMutFn`).
+    pub ctx_mut_callback: Option<GuestFnPtr<BamObserverCtxMutFn>>,
     /// Validated query/resource clauses backing `ctx_callback`.
     pub query_specs: Vec<BamQuerySpecOwned>,
     /// Whether propagation control is enabled (`BAM_OBSERVER_FLAG_PROPAGATE`).
@@ -803,10 +811,15 @@ pub struct LoadContext {
     pub mod_id: Option<ModId>,
     /// Optional manifest module name used to prefix unqualified guest component names.
     pub manifest_name: Option<Arc<str>>,
+    /// Reload generation assigned to the mod currently executing `bamabi_init`.
+    pub mod_generation: u64,
+    known_mod_generations: HashMap<Arc<str>, u64>,
     pre_snapshot: Arc<RegistrySnapshot>,
     staged_drop_bindings: Arc<Mutex<Vec<StagedDropBinding>>>,
+    pub(crate) staged_migrations: Option<Arc<Mutex<Vec<StagedColumnMigrationUndo>>>>,
     fresh_dynamic_comp_ids: Vec<ComponentId>,
     fresh_rel_bindings: Vec<(ComponentId, ComponentId)>,
+    system_filter: Option<HashSet<Arc<str>>>,
     in_init: bool,
 }
 
@@ -847,10 +860,14 @@ impl LoadContext {
             standalone_world: None,
             mod_id,
             manifest_name,
+            mod_generation: 0,
+            known_mod_generations: HashMap::default(),
             pre_snapshot,
             staged_drop_bindings: Arc::new(Mutex::new(Vec::new())),
+            staged_migrations: None,
             fresh_dynamic_comp_ids: Vec::new(),
             fresh_rel_bindings: Vec::new(),
+            system_filter: None,
             in_init: true,
         };
         if !ctx.world_ptr.is_null() {
@@ -894,6 +911,51 @@ impl LoadContext {
         self
     }
 
+    /// Shares the transaction's [`StagedColumnMigrationUndo`] log so `LoadTransaction::drop` and
+    /// `rollback_unscheduled_mod_in_world` can revert in-place `migrate_component_column` swaps
+    /// if initialization or cascade staging subsequently fails.
+    pub(crate) fn with_staged_migrations(
+        mut self,
+        staged: Arc<Mutex<Vec<StagedColumnMigrationUndo>>>,
+    ) -> Self {
+        self.staged_migrations = Some(staged);
+        self
+    }
+
+    /// Sets the reload generation assigned to the mod currently executing `bamabi_init`.
+    #[inline]
+    pub(crate) fn with_mod_generation(mut self, generation: u64) -> Self {
+        self.mod_generation = generation;
+        self
+    }
+
+    /// Attaches a snapshot of all known mod generations accessible while `ModHost` is temporarily
+    /// extracted from `World` via `resource_scope` during `bamabi_init`.
+    #[inline]
+    pub(crate) fn with_known_mod_generations(
+        mut self,
+        generations: HashMap<Arc<str>, u64>,
+    ) -> Self {
+        self.known_mod_generations = generations;
+        self
+    }
+
+    /// Resolves the active reload generation for `mod_name` during `bamabi_init`, consulting this
+    /// `LoadContext`'s active generation and generation snapshot before falling back to `ModHost`.
+    #[inline]
+    pub(crate) fn mod_generation_for(&self, world: Option<&World>, mod_name: &str) -> u64 {
+        if self.manifest_name.as_deref() == Some(mod_name) {
+            return self.mod_generation;
+        }
+        if let Some(&gen_val) = self.known_mod_generations.get(mod_name) {
+            return gen_val;
+        }
+        world
+            .and_then(|w| w.get_resource::<ModHost>())
+            .map(|h| h.mod_generation(mod_name))
+            .unwrap_or(0)
+    }
+
     /// Creates an active standalone [`LoadContext`] for unit testing without an external `World`.
     pub fn new(registry: ModRegistry) -> Self {
         Self::with_world_and_mod_id(
@@ -919,9 +981,17 @@ impl LoadContext {
     pub fn rollback(&mut self) {
         self.finish_init();
         let bindings = core::mem::take(&mut *lock_unpoison(&self.staged_drop_bindings));
+        let migrations = self
+            .staged_migrations
+            .take()
+            .map(|log| core::mem::take(&mut *lock_unpoison(&log)))
+            .unwrap_or_default();
         let fresh_comp_ids = core::mem::take(&mut self.fresh_dynamic_comp_ids);
         let fresh_rels = core::mem::take(&mut self.fresh_rel_bindings);
         let active_guard = Arc::clone(&self.is_active);
+        if !migrations.is_empty() && !self.world_ptr.is_null() {
+            rollback_staged_column_migrations(self.world_mut(), migrations);
+        }
         if let Some(mut drop_guard) = self.world_mut().get_resource_mut::<WorldDropGuard>() {
             drop_guard.rollback_staged_bindings(&bindings);
         }
@@ -961,6 +1031,35 @@ impl LoadContext {
         }
     }
 
+    pub(crate) fn registry_and_world_mut(&mut self) -> (&mut ModRegistry, &mut World) {
+        let world = if !self.world_ptr.is_null() {
+            // SAFETY: `self.world_ptr` comes from an exclusively borrowed `&mut World` held for the
+            // duration of `bamabi_init` with no aliasing references.
+            unsafe { &mut *self.world_ptr }
+        } else {
+            self.standalone_world
+                .get_or_insert_with(|| Box::new(World::new()))
+        };
+        (&mut self.registry, world)
+    }
+
+    /// Configures an optional system allowlist checked during system registration.
+    pub fn with_system_filter(
+        mut self,
+        allowed: impl IntoIterator<Item = impl Into<Arc<str>>>,
+    ) -> Self {
+        self.system_filter = Some(allowed.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Returns `true` if `name` is permitted by the configured system registration filter.
+    #[inline]
+    pub fn allows_system(&self, name: &str) -> bool {
+        self.system_filter
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(name))
+    }
+
     pub(crate) fn record_fresh_dynamic_comp_id(&mut self, comp_id: ComponentId) {
         self.fresh_dynamic_comp_ids.push(comp_id);
     }
@@ -974,6 +1073,11 @@ impl Drop for LoadContext {
     }
 }
 
+/// Validates that `load_ctx` points to an active [`LoadContext`] currently inside `bamabi_init`.
+///
+/// # Safety
+/// - If `load_ctx` is non-null, it must point to a readable, aligned [`LoadContext`] (or
+///   sufficiently sized valid handle allocation).
 #[inline]
 pub(crate) unsafe fn validate_active_load_ctx<'a>(
     load_ctx: *mut BamLoadCtx,
@@ -1016,6 +1120,9 @@ pub unsafe extern "C" fn host_resolve_component(
 ) -> FfiResult {
     if out_component.is_null() {
         return FfiResult::NULL_POINTER;
+    }
+    if !out_component.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
     }
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
     let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
@@ -1285,6 +1392,9 @@ pub unsafe extern "C" fn host_register_component(
 ) -> FfiResult {
     if out_component.is_null() {
         return FfiResult::NULL_POINTER;
+    }
+    if !out_component.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
     }
     // SAFETY: Validates active `LoadContext` header and `in_init` state.
     let ctx = match unsafe { validate_active_load_ctx(load_ctx) } {
@@ -1963,6 +2073,52 @@ unsafe fn parse_and_validate_query_descs(
     Ok(query_specs)
 }
 
+/// Parses and validates a read-only `run_if_query` descriptor against `snapshot`.
+///
+/// # Safety
+/// - `query_ptr` must point to a readable [`BamQueryDesc`] whose `terms` array (if
+///   `term_count > 0`) contains `term_count` readable [`BamTermDesc`] records.
+pub(crate) unsafe fn parse_and_validate_run_if_query(
+    query_ptr: *const BamQueryDesc,
+    snapshot: &RegistrySnapshot,
+) -> Result<BamQuerySpecOwned, (FfiResult, String)> {
+    // SAFETY: Caller guarantees `query_ptr` points to a readable `BamQueryDesc`.
+    let q_desc = unsafe { read_descriptor::<BamQueryDesc>(query_ptr.cast::<c_void>()) }
+        .map_err(|err| (err, format!("invalid `run_if_query` ({err})")))?;
+    let q_val = q_desc.validate();
+    if q_val.is_err() {
+        return Err((q_val, format!("`run_if_query` validation failed ({q_val})")));
+    }
+    if (q_desc.flags & BAM_QUERY_FLAG_PARAM_SET) != 0 || q_desc.param_set_group != 0 {
+        return Err((
+            FfiResult::INVALID_ARGUMENT,
+            "`run_if_query` cannot belong to a param_set_group".to_string(),
+        ));
+    }
+    let mut terms = Vec::with_capacity(q_desc.term_count);
+    for t_idx in 0..q_desc.term_count {
+        // SAFETY: `q_desc.validate()` verified `!q_desc.terms.is_null()` when `term_count > 0`.
+        let term: BamTermDesc = unsafe { core::ptr::read_unaligned(q_desc.terms.add(t_idx)) };
+        if term.mode.is_mutable() {
+            return Err((
+                FfiResult::PERMISSION_DENIED,
+                format!(
+                    "`run_if_query` term {t_idx} must be read-only (got {:?})",
+                    term.mode
+                ),
+            ));
+        }
+        terms.push(term);
+    }
+    let spec = BamQuerySpecOwned {
+        flags: q_desc.flags,
+        param_set_group: 0,
+        terms,
+    };
+    validate_system_queries_against_snapshot(snapshot, core::slice::from_ref(&spec))?;
+    Ok(spec)
+}
+
 /// Registers a unified [`BamSystemDesc`] inside `load_ctx`, returning its 1-based [`BamSystem`] handle.
 ///
 /// # Safety
@@ -2009,6 +2165,12 @@ pub(crate) unsafe fn register_system_inner(
             .set_last_error("BamSystemDesc `name` must not be empty");
         return Err(FfiResult::INVALID_ARGUMENT);
     }
+    if !ctx.allows_system(sys_name) {
+        ctx.host_ctx.set_last_error(format!(
+            "system '{sys_name}' is not permitted by LoadContext system filter"
+        ));
+        return Err(FfiResult::PERMISSION_DENIED);
+    }
 
     // Parse `queries[0..desc.query_count]`.
     // SAFETY: `desc.validate()` verified `!desc.queries.is_null()` when `desc.query_count > 0`.
@@ -2031,56 +2193,15 @@ pub(crate) unsafe fn register_system_inner(
     let run_if_ctx = if let Some(run_if_ctx_fn) = desc.run_if_ctx {
         let cond_spec = if !desc.run_if_query.is_null() {
             // SAFETY: `desc.run_if_query` is non-null and caller guarantees readable `BamQueryDesc`.
-            let q_desc = match unsafe {
-                read_descriptor::<BamQueryDesc>(desc.run_if_query.cast::<c_void>())
+            match unsafe {
+                parse_and_validate_run_if_query(desc.run_if_query, ctx.registry.snapshot())
             } {
-                Ok(q) => q,
-                Err(err) => {
-                    ctx.host_ctx
-                        .set_last_error(format!("invalid BamSystemDesc `run_if_query` ({err})"));
+                Ok(spec) => spec,
+                Err((err, msg)) => {
+                    ctx.host_ctx.set_last_error(msg);
                     return Err(err);
                 }
-            };
-            let q_val = q_desc.validate();
-            if q_val.is_err() {
-                ctx.host_ctx.set_last_error(format!(
-                    "BamSystemDesc `run_if_query` validation failed ({q_val})"
-                ));
-                return Err(q_val);
             }
-            if (q_desc.flags & BAM_QUERY_FLAG_PARAM_SET) != 0 || q_desc.param_set_group != 0 {
-                ctx.host_ctx.set_last_error(
-                    "BamSystemDesc `run_if_query` cannot belong to a param_set_group",
-                );
-                return Err(FfiResult::INVALID_ARGUMENT);
-            }
-            let mut terms = Vec::with_capacity(q_desc.term_count);
-            for t_idx in 0..q_desc.term_count {
-                // SAFETY: `q_desc.validate()` verified `!q_desc.terms.is_null()` when `term_count > 0`.
-                let term: BamTermDesc =
-                    unsafe { core::ptr::read_unaligned(q_desc.terms.add(t_idx)) };
-                if term.mode.is_mutable() {
-                    ctx.host_ctx.set_last_error(format!(
-                        "BamSystemDesc `run_if_query` term {t_idx} must be read-only (got {:?})",
-                        term.mode
-                    ));
-                    return Err(FfiResult::PERMISSION_DENIED);
-                }
-                terms.push(term);
-            }
-            let spec = BamQuerySpecOwned {
-                flags: q_desc.flags,
-                param_set_group: 0,
-                terms,
-            };
-            if let Err((status, msg)) = validate_system_queries_against_snapshot(
-                ctx.registry.snapshot(),
-                core::slice::from_ref(&spec),
-            ) {
-                ctx.host_ctx.set_last_error(msg);
-                return Err(status);
-            }
-            spec
         } else {
             BamQuerySpecOwned::default()
         };
@@ -2219,10 +2340,15 @@ pub(crate) unsafe fn build_observer_binding_from_desc(
         Arc::from(s)
     };
 
-    if desc.callback.is_none() && desc.mut_callback.is_none() && desc.ctx_callback.is_none() {
+    if desc.callback.is_none()
+        && desc.mut_callback.is_none()
+        && desc.ctx_callback.is_none()
+        && desc.ctx_mut_callback.is_none()
+    {
         return Err((
             FfiResult::NULL_POINTER,
-            "BamObserverDesc requires `callback`, `mut_callback`, or `ctx_callback`".to_string(),
+            "BamObserverDesc requires `callback`, `mut_callback`, `ctx_callback`, or `ctx_mut_callback`"
+                .to_string(),
         ));
     }
     if desc.query_count > MAX_QUERIES_PER_SYSTEM {
@@ -2240,10 +2366,11 @@ pub(crate) unsafe fn build_observer_binding_from_desc(
             "BamObserverDesc `queries` is null with non-zero `query_count`".to_string(),
         ));
     }
-    if desc.query_count > 0 && desc.ctx_callback.is_none() {
+    if desc.query_count > 0 && desc.ctx_callback.is_none() && desc.ctx_mut_callback.is_none() {
         return Err((
             FfiResult::INVALID_ARGUMENT,
-            "BamObserverDesc `queries` requires non-null `ctx_callback`".to_string(),
+            "BamObserverDesc `queries` requires non-null `ctx_callback` or `ctx_mut_callback`"
+                .to_string(),
         ));
     }
     // SAFETY: Verified non-null `desc.queries` when `desc.query_count > 0`.
@@ -2439,6 +2566,7 @@ pub(crate) unsafe fn build_observer_binding_from_desc(
         callback: desc.callback.map(GuestFnPtr),
         mut_callback: desc.mut_callback.map(GuestFnPtr),
         ctx_callback: desc.ctx_callback.map(GuestFnPtr),
+        ctx_mut_callback: desc.ctx_mut_callback.map(GuestFnPtr),
         query_specs,
         is_propagating: desc.is_propagating(),
         propagate_relationship,
@@ -2504,6 +2632,407 @@ pub unsafe extern "C" fn host_register_observer(
     };
 
     ctx.registered_observers.push(binding);
+    FfiResult::OK
+}
+
+struct ParsedNonComponentDesc {
+    desc: ComponentDesc,
+    layout: Layout,
+    canonical_name: String,
+    schema_fingerprint: u64,
+    fields: Arc<[BamFieldDesc]>,
+    owned_field_strings: Option<OwnedFieldStrings>,
+}
+
+/// Parses and validates a [`ComponentDesc`] for `host_register_resource` or `host_register_message`.
+///
+/// # Safety
+/// - `desc_ptr` must point to a readable [`ComponentDesc`] or be null.
+unsafe fn parse_dynamic_non_component_desc(
+    ctx: &mut LoadContext,
+    desc_ptr: *const ComponentDesc,
+    kind_label: &str,
+) -> Result<ParsedNonComponentDesc, FfiResult> {
+    // SAFETY: `read_descriptor` validates null, alignment, and `struct_size >= MIN_V0_2_SIZE`.
+    let desc = match unsafe { read_descriptor::<ComponentDesc>(desc_ptr.cast::<c_void>()) } {
+        Ok(d) => d,
+        Err(err) => {
+            ctx.host_ctx
+                .set_last_error(format!("invalid {kind_label} ComponentDesc header ({err})"));
+            return Err(err);
+        }
+    };
+
+    let val_status = desc.validate();
+    if val_status.is_err() {
+        ctx.host_ctx.set_last_error(format!(
+            "{kind_label} ComponentDesc validation failed ({val_status})"
+        ));
+        return Err(val_status);
+    }
+
+    let Some(layout) = desc.layout() else {
+        ctx.host_ctx.set_last_error(format!(
+            "{kind_label} ComponentDesc size/align violates C struct layout invariants"
+        ));
+        return Err(FfiResult::INVALID_ARGUMENT);
+    };
+
+    // SAFETY: `desc.validate()` verified `!desc.name.is_null()`.
+    let Ok(name_str) = (unsafe { CStr::from_ptr(desc.name) }).to_str() else {
+        ctx.host_ctx.set_last_error(format!(
+            "{kind_label} ComponentDesc `name` is not valid UTF-8"
+        ));
+        return Err(FfiResult::INVALID_UTF8);
+    };
+    if name_str.is_empty() {
+        ctx.host_ctx.set_last_error(format!(
+            "{kind_label} ComponentDesc `name` must not be empty"
+        ));
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    if name_str.starts_with(BAM_REL_BIND_PREFIX) || name_str.starts_with(BAM_REL_BIND_SELF_PREFIX) {
+        ctx.host_ctx.set_last_error(format!(
+            "{kind_label} ComponentDesc `name` '{name_str}' cannot use relationship binding prefix"
+        ));
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    if desc.required_component_count > 0
+        || (desc.covers_slot(
+            core::mem::offset_of!(ComponentDesc, required_init_desc_count),
+            core::mem::size_of::<usize>(),
+        ) && desc.required_init_desc_count > 0)
+        || desc.has_hooks()
+        || desc.clone_fn.is_some()
+    {
+        ctx.host_ctx.set_last_error(format!(
+            "{kind_label} '{name_str}' does not support required components, lifecycle hooks, or clone_fn"
+        ));
+        return Err(FfiResult::UNSUPPORTED);
+    }
+
+    let canonical_name = if !name_str.contains("::") && ctx.registry.get_by_name(name_str).is_none()
+    {
+        if let Some(ref ns) = ctx.manifest_name {
+            format!("{ns}::{name_str}")
+        } else {
+            name_str.to_owned()
+        }
+    } else {
+        name_str.to_owned()
+    };
+
+    // SAFETY: `desc.validate()` verified `!desc.fields.is_null()` when `desc.field_count > 0`.
+    let (schema_fingerprint, fields, owned_field_strings) =
+        match unsafe { extract_owned_dynamic_fields(&desc) } {
+            Ok(v) => v,
+            Err((err, msg)) => {
+                ctx.host_ctx.set_last_error(msg);
+                return Err(err);
+            }
+        };
+
+    Ok(ParsedNonComponentDesc {
+        desc,
+        layout,
+        canonical_name,
+        schema_fingerprint,
+        fields,
+        owned_field_strings,
+    })
+}
+
+/// Registers a dynamic singleton resource described by `desc_ptr` inside `load_ctx` and writes
+/// its 1-based [`BamComponent`] handle (`BAM_STORAGE_FLAG_RESOURCE`) into `*out_component`.
+///
+/// # Safety
+/// - `load_ctx` must point to the active [`LoadContext`] cast to [`BamLoadCtx`], or null.
+/// - `desc_ptr` must point to a readable [`ComponentDesc`], or null.
+/// - `out_component` must point to writable [`BamComponent`] storage, or null.
+pub unsafe extern "C" fn host_register_resource(
+    load_ctx: *mut BamLoadCtx,
+    desc_ptr: *const ComponentDesc,
+    out_component: *mut BamComponent,
+) -> FfiResult {
+    if out_component.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if !out_component.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    // SAFETY: Validates active `LoadContext` header and `in_init` state.
+    let ctx = match unsafe { validate_active_load_ctx(load_ctx) } {
+        Ok(c) => c,
+        Err(err) => return err,
+    };
+    ctx.host_ctx.clear_last_error();
+
+    // SAFETY: `desc_ptr` validity is upheld by the FFI caller.
+    let parsed = match unsafe { parse_dynamic_non_component_desc(ctx, desc_ptr, "Resource") } {
+        Ok(p) => p,
+        Err(err) => return err,
+    };
+    let name_ref = parsed.canonical_name.as_str();
+    let storage_flags =
+        component_flags_to_storage_flags(parsed.desc.flags) | BAM_STORAGE_FLAG_RESOURCE;
+    let existing_entry = ctx.registry.get_by_name(name_ref).cloned();
+    let existing_comp_id = existing_entry.as_ref().map(|e| e.component_id);
+
+    if let Err(collision) = ctx.registry.check_registration_collision(
+        name_ref,
+        parsed.desc.uuid,
+        parsed.desc.size,
+        parsed.desc.align,
+        storage_flags,
+        existing_comp_id,
+    ) {
+        ctx.host_ctx.set_last_error(collision.to_string());
+        return FfiResult::TYPE_MISMATCH;
+    }
+    if let Some(ref existing) = existing_entry
+        && existing.is_dynamic
+        && existing.schema_fingerprint != 0
+        && parsed.schema_fingerprint != 0
+        && existing.schema_fingerprint != parsed.schema_fingerprint
+    {
+        ctx.host_ctx.set_last_error(format!(
+            "Resource ComponentDesc '{name_ref}' schema_fingerprint mismatch (existing=0x{:016x}, new=0x{:016x})",
+            existing.schema_fingerprint, parsed.schema_fingerprint
+        ));
+        return FfiResult::TYPE_MISMATCH;
+    }
+    if let Err(drop_mismatch) = ctx
+        .registry
+        .check_dynamic_drop_compatibility(name_ref, parsed.desc.drop_fn.is_some())
+    {
+        ctx.host_ctx.set_last_error(drop_mismatch.to_string());
+        return FfiResult::TYPE_MISMATCH;
+    }
+
+    let is_active = Arc::clone(&ctx.is_active);
+    let owner = ctx.mod_id;
+    let staged_log = Arc::clone(&ctx.staged_drop_bindings);
+
+    let (comp_id, drop_slot, was_fresh_id): (ComponentId, Option<usize>, bool) = {
+        let world = ctx.world_mut();
+        world.init_resource::<WorldDropGuard>();
+
+        let (slot_opt, trampoline_opt) = if let Some(drop_fn) = parsed.desc.drop_fn {
+            let bound = world
+                .get_resource_mut::<WorldDropGuard>()
+                .and_then(|mut g| {
+                    g.bind_or_update(parsed.desc.uuid, drop_fn, Arc::clone(&is_active))
+                });
+            let Some((slot, tramp, staged_binding)) = bound else {
+                ctx.host_ctx.set_last_error(format!(
+                    "exhausted MAX_DROP_TRAMPOLINES ({MAX_DROP_TRAMPOLINES}) foreign destructor slots"
+                ));
+                return FfiResult::CAPACITY_EXCEEDED;
+            };
+            lock_unpoison(&staged_log).push(staged_binding);
+            (Some(slot), Some(tramp))
+        } else {
+            (None, None)
+        };
+
+        let reusable_comp_id = existing_entry.as_ref().and_then(|entry| {
+            if !entry.is_dynamic || entry.drop_slot == slot_opt {
+                Some(entry.component_id)
+            } else {
+                None
+            }
+        });
+
+        if let Some(existing_id) = reusable_comp_id {
+            (existing_id, slot_opt, false)
+        } else {
+            // SAFETY: `parsed.layout` was verified by `ComponentDesc::layout()`; `trampoline_opt`
+            // satisfies Bevy's `OwningPtr` drop contract.
+            let bevy_desc = unsafe {
+                ComponentDescriptor::new_with_layout(
+                    format!("bam::dynamic_res::{name_ref}"),
+                    StorageType::Table,
+                    parsed.layout,
+                    trampoline_opt,
+                    !parsed.desc.is_immutable(),
+                    parsed.desc.is_summary_tick(),
+                    ComponentCloneBehavior::Ignore,
+                    None,
+                )
+            };
+            let new_id = world.register_component_with_descriptor(bevy_desc);
+            if let Some(slot) = slot_opt
+                && let Some(hooks) = world.register_component_hooks_by_id(new_id)
+            {
+                hooks.on_insert(on_insert_hook_for_slot(slot));
+            }
+            (new_id, slot_opt, true)
+        }
+    };
+    if was_fresh_id {
+        ctx.fresh_dynamic_comp_ids.push(comp_id);
+    }
+
+    let handle = match ctx
+        .registry
+        .register_resource_from_desc(DynamicResourceReg {
+            comp_id,
+            desc: &parsed.desc,
+            name: name_ref,
+            owner,
+            drop_slot,
+            schema_fingerprint: parsed.schema_fingerprint,
+            fields: parsed.fields,
+            owned_field_strings: parsed.owned_field_strings,
+        }) {
+        Ok(h) => h,
+        Err(err) => {
+            ctx.host_ctx.set_last_error(err.to_string());
+            return FfiResult::TYPE_MISMATCH;
+        }
+    };
+
+    if !ctx.world_ptr.is_null() {
+        let world = ctx.world_mut();
+        if world.resource_entities().get(comp_id).is_none() {
+            world.spawn(bevy_ecs::resource::IsResource::new(comp_id));
+        }
+        if let Some(slot) = drop_slot {
+            let mut map = world.get_resource_or_insert_with::<DynamicComponentHookMap>(
+                DynamicComponentHookMap::default,
+            );
+            map.set_drop_slot(comp_id, slot);
+        }
+    }
+
+    ctx.host_ctx.set_snapshot(ctx.registry.snapshot_arc());
+    if !ctx.world_ptr.is_null() {
+        let updated_reg = ctx.registry.clone();
+        ctx.world_mut().insert_resource(updated_reg);
+    }
+    if !ctx.registered_components.contains(&handle) {
+        ctx.registered_components.push(handle);
+    }
+
+    // SAFETY: `out_component` was verified non-null and caller guarantees writable storage.
+    unsafe {
+        *out_component = handle;
+    }
+    FfiResult::OK
+}
+
+/// Registers a dynamic buffered message channel described by `desc_ptr` inside `load_ctx` and
+/// writes its 1-based [`BamComponent`] handle (`BAM_STORAGE_FLAG_MESSAGE`) into `*out_component`.
+///
+/// # Safety
+/// - `load_ctx` must point to the active [`LoadContext`] cast to [`BamLoadCtx`], or null.
+/// - `desc_ptr` must point to a readable [`ComponentDesc`], or null.
+/// - `out_component` must point to writable [`BamComponent`] storage, or null.
+pub unsafe extern "C" fn host_register_message(
+    load_ctx: *mut BamLoadCtx,
+    desc_ptr: *const ComponentDesc,
+    out_component: *mut BamComponent,
+) -> FfiResult {
+    if out_component.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if !out_component.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    // SAFETY: Validates active `LoadContext` header and `in_init` state.
+    let ctx = match unsafe { validate_active_load_ctx(load_ctx) } {
+        Ok(c) => c,
+        Err(err) => return err,
+    };
+    ctx.host_ctx.clear_last_error();
+
+    // SAFETY: `desc_ptr` validity is upheld by the FFI caller.
+    let parsed = match unsafe { parse_dynamic_non_component_desc(ctx, desc_ptr, "Message") } {
+        Ok(p) => p,
+        Err(err) => return err,
+    };
+    let name_ref = parsed.canonical_name.as_str();
+    let storage_flags =
+        component_flags_to_storage_flags(parsed.desc.flags) | BAM_STORAGE_FLAG_MESSAGE;
+    let existing_entry = ctx.registry.get_by_name(name_ref).cloned();
+    let existing_comp_id = existing_entry.as_ref().map(|e| e.component_id);
+
+    if let Err(collision) = ctx.registry.check_registration_collision(
+        name_ref,
+        parsed.desc.uuid,
+        parsed.desc.size,
+        parsed.desc.align,
+        storage_flags,
+        existing_comp_id,
+    ) {
+        ctx.host_ctx.set_last_error(collision.to_string());
+        return FfiResult::TYPE_MISMATCH;
+    }
+    if let Some(ref existing) = existing_entry
+        && existing.is_dynamic
+        && existing.schema_fingerprint != 0
+        && parsed.schema_fingerprint != 0
+        && existing.schema_fingerprint != parsed.schema_fingerprint
+    {
+        ctx.host_ctx.set_last_error(format!(
+            "Message ComponentDesc '{name_ref}' schema_fingerprint mismatch (existing=0x{:016x}, new=0x{:016x})",
+            existing.schema_fingerprint, parsed.schema_fingerprint
+        ));
+        return FfiResult::TYPE_MISMATCH;
+    }
+
+    let is_active = Arc::clone(&ctx.is_active);
+    let owner = ctx.mod_id;
+    let handle = {
+        let (registry, world) = ctx.registry_and_world_mut();
+        match registry.register_message_from_desc(
+            world,
+            DynamicMessageReg {
+                desc: &parsed.desc,
+                name: name_ref,
+                owner,
+                is_active,
+                schema_fingerprint: parsed.schema_fingerprint,
+                fields: parsed.fields,
+                owned_field_strings: parsed.owned_field_strings,
+            },
+        ) {
+            Ok(h) => h,
+            Err(err) => {
+                ctx.host_ctx.set_last_error(err.to_string());
+                return FfiResult::TYPE_MISMATCH;
+            }
+        }
+    };
+
+    ctx.host_ctx.set_snapshot(ctx.registry.snapshot_arc());
+    if !ctx.world_ptr.is_null() {
+        if let Some(entry) = ctx.registry.get_by_handle(handle) {
+            let comp_id = entry.component_id;
+            let world = ctx.world_mut();
+            if world.resource_entities().get(comp_id).is_none() {
+                let msg_entity = world
+                    .iter_entities()
+                    .find(|entity_ref| entity_ref.contains_id(comp_id))
+                    .map(|entity_ref| entity_ref.id());
+                if let Some(ent) = msg_entity
+                    && let Ok(mut ent_mut) = world.get_entity_mut(ent)
+                {
+                    ent_mut.insert(bevy_ecs::resource::IsResource::new(comp_id));
+                }
+            }
+        }
+        let updated_reg = ctx.registry.clone();
+        ctx.world_mut().insert_resource(updated_reg);
+    }
+    if !ctx.registered_components.contains(&handle) {
+        ctx.registered_components.push(handle);
+    }
+
+    // SAFETY: `out_component` was verified non-null and caller guarantees writable storage.
+    unsafe {
+        *out_component = handle;
+    }
     FfiResult::OK
 }
 

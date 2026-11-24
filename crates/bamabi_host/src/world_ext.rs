@@ -3,7 +3,7 @@
 
 #[cfg(feature = "diagnostics")]
 use crate::diagnostics::{ensure_diagnostics_resources, register_mod_diagnostics_in_world};
-use crate::events::{LoadedModInfo, ModLoaded, ModSystemFaulted, ModUnloaded};
+use crate::events::{LoadedModInfo, ModLoadFailed, ModLoaded, ModSystemFaulted, ModUnloaded};
 pub use crate::mod_dag::{DirectoryLoadReport, ModDagError, ModDependencyGraph, ModTomlManifest};
 use crate::mod_dag::{discover_mod_manifests, resolve_dependency_dag};
 use crate::schedule_sets::{
@@ -11,10 +11,18 @@ use crate::schedule_sets::{
     prevalidate_mod_schedules_and_ordering, run_late_startup_systems_in_world,
     schedule_mod_systems_in_world,
 };
+#[cfg(feature = "signature-verification")]
+use bamabi_host_sys::ModTrustPolicy;
 pub use bamabi_host_sys::loader::ModScoped;
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+use bamabi_host_sys::loader::prepare_bampack_in_world;
+#[cfg(feature = "dynamic-loader")]
+use bamabi_host_sys::loader::prepare_dynamic_mod_in_world;
 use bamabi_host_sys::loader::{
-    ReloadColumnSnapshot, cleanup_orphaned_mod_scoped_entities, ensure_symbol_tables_in_world,
-    excise_and_unload_mod_for_reload_in_world, migrate_mod_scoped_entities,
+    InMemoryModEntrypoints, InMemoryObjectLoader, PreparedModImage, ReloadColumnSnapshot,
+    cleanup_orphaned_mod_scoped_entities, ensure_symbol_tables_in_world,
+    excise_and_unload_mod_for_reload_in_world, load_prepared_mod_in_world,
+    migrate_mod_scoped_entities, prepare_entrypoints_in_world,
     restore_mod_dynamic_columns_after_reload, snapshot_mod_dynamic_columns_for_reload,
 };
 use bamabi_host_sys::registry::catalog::ensure_relation_graph_in_world;
@@ -26,8 +34,8 @@ use bamabi_host_sys::{
     ensure_dynamic_hook_map_in_world, excise_and_unload_mod_in_world, load_mod_in_world,
     restore_mod_state_in_world, rollback_unscheduled_mod_in_world, save_mod_state_in_world,
 };
-#[cfg(feature = "signature-verification")]
-use bamabi_host_sys::{ModTrustPolicy, default_signature_path_for, preverify_mod_on_disk};
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+use bamabi_host_sys::{default_signature_path_for, preverify_mod_on_disk};
 use bamabi_sys::{
     AbiPod, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
     BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK,
@@ -159,9 +167,25 @@ pub(crate) fn ensure_world_mod_resources(world: &mut World) {
     #[cfg(feature = "diagnostics")]
     ensure_diagnostics_resources(world);
     world.init_resource::<Messages<ModLoaded>>();
+    world.init_resource::<Messages<ModLoadFailed>>();
     world.init_resource::<Messages<ModUnloaded>>();
     world.init_resource::<Messages<ModSystemFaulted>>();
     ensure_hierarchy_registered(world);
+}
+
+fn emit_mod_load_failed(
+    world: &mut World,
+    path: &Path,
+    reload_target: Option<ModId>,
+    err: &ModLoadError,
+) {
+    if let Some(mut msgs) = world.get_resource_mut::<Messages<ModLoadFailed>>() {
+        msgs.write(ModLoadFailed {
+            path: path.to_path_buf(),
+            reload_target,
+            error: err.to_string(),
+        });
+    }
 }
 
 fn with_world_registry<R>(world: &mut World, f: impl FnOnce(&mut ModRegistry) -> R) -> R {
@@ -263,6 +287,92 @@ fn rollback_and_cleanup_reload(
     }
 }
 
+fn finalize_initial_prepared_load(
+    world: &mut World,
+    prepared: PreparedModImage,
+    path: &Path,
+    options: LoadOptions,
+) -> Result<ModId, ModLoadError> {
+    let path_buf = path.to_path_buf();
+    let (mod_id, systems) = match load_prepared_mod_in_world(world, prepared, &options, None) {
+        Ok(res) => res,
+        Err(err) => {
+            emit_mod_load_failed(world, &path_buf, None, &err);
+            return Err(err);
+        }
+    };
+
+    let (mod_name, mod_version) = world
+        .get_resource::<ModHost>()
+        .and_then(|h| h.get_mod(mod_id))
+        .map(|m| (m.name().to_string(), m.version().to_string()))
+        .unwrap_or_else(|| ("unnamed_mod".to_string(), "0.0.0".to_string()));
+
+    if options.strict
+        && let Some(registry) = world.get_resource::<ModRegistry>()
+    {
+        for sys in &systems {
+            if let Err(missing) = sys.validate_against_registry(registry) {
+                let sys_name = sys.system_name().to_string();
+                rollback_and_cleanup_reload(world, mod_id, systems, None);
+                let err = ModLoadError::MissingComponents {
+                    path: path_buf.clone(),
+                    system_name: sys_name,
+                    missing,
+                };
+                emit_mod_load_failed(world, &path_buf, None, &err);
+                return Err(err);
+            }
+        }
+    }
+
+    if let Err(err) = prevalidate_mod_schedules_and_ordering(
+        world,
+        mod_id,
+        &path_buf,
+        &mod_name,
+        options.strict,
+        &systems,
+    ) {
+        rollback_and_cleanup_reload(world, mod_id, systems, None);
+        emit_mod_load_failed(world, &path_buf, None, &err);
+        return Err(err);
+    }
+
+    let system_count = systems.len();
+    let late_startup = schedule_mod_systems_in_world(world, mod_id, &mod_name, systems);
+
+    finalize_mod_load_in_world(
+        world,
+        mod_id,
+        mod_name.clone(),
+        mod_version,
+        path_buf.clone(),
+        system_count,
+    );
+    let (dag_name, sidecar_deps) = path_buf
+        .parent()
+        .map(|dir| dir.join("mod.toml"))
+        .filter(|p| p.is_file())
+        .and_then(|toml_path| ModTomlManifest::from_file(&toml_path).ok())
+        .map(|manifest| {
+            let deps = manifest
+                .dependencies
+                .keys()
+                .chain(manifest.optional_dependencies.keys())
+                .cloned()
+                .collect::<Vec<String>>();
+            (manifest.name, deps)
+        })
+        .unwrap_or_else(|| (mod_name.clone(), Vec::new()));
+    if let Some(mut dag) = world.get_resource_mut::<ModDependencyGraph>() {
+        dag.register_loaded_mod(mod_id, dag_name, path_buf, options, sidecar_deps);
+    }
+    run_late_startup_systems_in_world(world, &mod_name, late_startup);
+
+    Ok(mod_id)
+}
+
 fn load_mod_with_optional_state_and_migration(
     world: &mut World,
     path: &Path,
@@ -280,6 +390,7 @@ fn load_mod_with_optional_state_and_migration(
             if let Some(old_id) = orphan_old_id {
                 cleanup_orphaned_mod_scoped_entities(world, old_id);
             }
+            emit_mod_load_failed(world, &path_buf, orphan_old_id, &err);
             return Err(err);
         }
     };
@@ -297,11 +408,13 @@ fn load_mod_with_optional_state_and_migration(
             if let Err(missing) = sys.validate_against_registry(registry) {
                 let sys_name = sys.system_name().to_string();
                 rollback_and_cleanup_reload(world, mod_id, systems, orphan_old_id);
-                return Err(ModLoadError::MissingComponents {
-                    path: path_buf,
+                let err = ModLoadError::MissingComponents {
+                    path: path_buf.clone(),
                     system_name: sys_name,
                     missing,
-                });
+                };
+                emit_mod_load_failed(world, &path_buf, orphan_old_id, &err);
+                return Err(err);
             }
         }
     }
@@ -315,6 +428,7 @@ fn load_mod_with_optional_state_and_migration(
         &systems,
     ) {
         rollback_and_cleanup_reload(world, mod_id, systems, orphan_old_id);
+        emit_mod_load_failed(world, &path_buf, orphan_old_id, &err);
         return Err(err);
     }
 
@@ -322,12 +436,14 @@ fn load_mod_with_optional_state_and_migration(
         && let Err(err) = restore_mod_state_in_world(world, mod_id, blob)
     {
         rollback_and_cleanup_reload(world, mod_id, systems, orphan_old_id);
+        emit_mod_load_failed(world, &path_buf, orphan_old_id, &err);
         return Err(err);
     }
 
     if let Some((old_id, col_snapshot)) = reload_migration {
         if let Err(err) = restore_mod_dynamic_columns_after_reload(world, mod_id, col_snapshot) {
             rollback_and_cleanup_reload(world, mod_id, systems, Some(old_id));
+            emit_mod_load_failed(world, &path_buf, Some(old_id), &err);
             return Err(err);
         }
         migrate_mod_scoped_entities(world, old_id, mod_id);
@@ -391,10 +507,12 @@ fn unload_single_mod_in_world(
 
 struct CascadeReloadEntry {
     old_id: ModId,
+    old_gen: u64,
     name: String,
     target_path: PathBuf,
     options: LoadOptions,
     dependencies: Vec<String>,
+    prepared: Option<PreparedModImage>,
 }
 
 fn resolve_cascade_ids(world: &World, id: ModId) -> Result<Vec<ModId>, ModLoadError> {
@@ -441,19 +559,79 @@ fn ensure_cascade_schedules_not_leased(
     Ok(())
 }
 
-fn reload_mod_cascade(
+fn prepare_reload_image_for_target(
+    world: &World,
+    tid: ModId,
+    is_root: bool,
+    target_path: &Path,
+    target_opts: &LoadOptions,
+    override_entrypoints: &mut Option<InMemoryModEntrypoints>,
+    force_bampack: bool,
+) -> Result<PreparedModImage, ModLoadError> {
+    if is_root && let Some(ep) = override_entrypoints.take() {
+        return prepare_entrypoints_in_world(target_path, ep);
+    }
+
+    let is_bampack = force_bampack
+        || target_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("bampack"));
+    if is_bampack {
+        #[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+        {
+            return prepare_bampack_in_world(world, target_path, target_opts);
+        }
+        #[cfg(not(all(feature = "dynamic-loader", feature = "signature-verification")))]
+        {
+            let _ = (world, target_opts, tid);
+            return Err(ModLoadError::DynamicLoaderDisabled {
+                path: target_path.to_path_buf(),
+            });
+        }
+    }
+
+    #[cfg(feature = "dynamic-loader")]
+    {
+        #[cfg(feature = "signature-verification")]
+        preverify_reload_target(world, tid, Some(target_path), target_opts)?;
+        #[cfg(not(feature = "signature-verification"))]
+        let _ = tid;
+        prepare_dynamic_mod_in_world(world, target_path, target_opts)
+    }
+    #[cfg(not(feature = "dynamic-loader"))]
+    {
+        let _ = (world, target_opts, tid);
+        Err(ModLoadError::DynamicLoaderDisabled {
+            path: target_path.to_path_buf(),
+        })
+    }
+}
+
+fn reload_mod_cascade_with(
     world: &mut World,
     id: ModId,
     override_path: Option<&Path>,
+    mut override_entrypoints: Option<InMemoryModEntrypoints>,
+    force_bampack: bool,
     options: LoadOptions,
 ) -> Result<ModId, ModLoadError> {
     ensure_world_mod_resources(world);
+    let root_source_hint = override_path.map(Path::to_path_buf).unwrap_or_else(|| {
+        world
+            .get_resource::<ModHost>()
+            .and_then(|h| h.get_mod(id))
+            .map(|m| m.source_path().to_path_buf())
+            .unwrap_or_default()
+    });
     let forward_ids = resolve_cascade_ids(world, id)?;
     ensure_cascade_schedules_not_leased(world, id, &forward_ids)?;
 
+    // Phase 1: Stage and validate ALL replacement images before saving state, removing columns,
+    // or unloading any active mod.
     let mut plan = Vec::with_capacity(forward_ids.len());
     for tid in forward_ids {
-        let (loaded_name, current_path) = {
+        let (loaded_name, current_path, old_gen) = {
             let Some(loaded) = world
                 .get_resource::<ModHost>()
                 .and_then(|host| host.get_mod(tid))
@@ -463,6 +641,7 @@ fn reload_mod_cascade(
             (
                 loaded.name().to_string(),
                 loaded.source_path().to_path_buf(),
+                loaded.generation(),
             )
         };
         let (dag_name, recorded_opts, dependencies) = world
@@ -482,74 +661,233 @@ fn reload_mod_cascade(
             recorded_opts.with_shadow_copy(true)
         };
 
-        #[cfg(feature = "signature-verification")]
-        {
-            let override_arg = (tid == id).then_some(target_path.as_path());
-            preverify_reload_target(world, tid, override_arg, &target_opts)?;
-        }
+        let prepared = match prepare_reload_image_for_target(
+            world,
+            tid,
+            tid == id,
+            &target_path,
+            &target_opts,
+            &mut override_entrypoints,
+            tid == id && force_bampack,
+        ) {
+            Ok(img) => img,
+            Err(err) => {
+                emit_mod_load_failed(world, &target_path, Some(id), &err);
+                return Err(err);
+            }
+        };
 
         plan.push(CascadeReloadEntry {
             old_id: tid,
+            old_gen,
             name: dag_name,
             target_path,
             options: target_opts,
             dependencies,
+            prepared: Some(prepared),
         });
     }
 
-    // Save state in reverse topological order (`C -> B -> A`) BEFORE unloading any mod so a
-    // `save_state` failure leaves the running dependency subgraph untouched.
+    // Phase 2: Save state in reverse topological order (`C -> B -> A`) BEFORE column snapshot.
     let mut saved_states: Vec<Option<Vec<u8>>> = vec![None; plan.len()];
     for idx in (0..plan.len()).rev() {
-        let (_path, blob) = save_mod_state_in_world(world, plan[idx].old_id)?;
-        saved_states[idx] = blob;
-    }
-
-    // Snapshot live dynamic component columns & unload in reverse topological order (`C -> B -> A`),
-    // preserving `ModScoped(old_id)` entities across the reload.
-    let mut column_snapshots: Vec<Option<ReloadColumnSnapshot>> = vec![None; plan.len()];
-    for idx in (0..plan.len()).rev() {
-        let col_snap = snapshot_mod_dynamic_columns_for_reload(world, plan[idx].old_id)?;
-        column_snapshots[idx] = Some(col_snap);
-        unload_single_mod_in_world(world, plan[idx].old_id, true)?;
-    }
-
-    // Reload in forward topological order (`A -> B -> C`), restoring state and migrating
-    // dynamic columns + `ModScoped` ownership onto each reloaded `ModId`.
-    let mut new_root_id: Option<ModId> = None;
-    let mut plan_iter = plan.into_iter().enumerate();
-    while let Some((idx, item)) = plan_iter.next() {
-        let col_snap = column_snapshots[idx].take().unwrap_or_default();
-        let new_id = match load_mod_with_optional_state_and_migration(
-            world,
-            &item.target_path,
-            item.options.clone(),
-            saved_states[idx].as_deref(),
-            Some((item.old_id, col_snap)),
-        ) {
-            Ok(id) => id,
+        let (_path, blob) = match save_mod_state_in_world(world, plan[idx].old_id) {
+            Ok(res) => res,
             Err(err) => {
-                for (_, remaining) in plan_iter {
-                    cleanup_orphaned_mod_scoped_entities(world, remaining.old_id);
-                }
+                emit_mod_load_failed(world, &root_source_hint, Some(id), &err);
                 return Err(err);
             }
         };
+        saved_states[idx] = blob;
+    }
+
+    // Phase 3: Snapshot non-POD / schema-evolving dynamic component columns while old mods stay
+    // mapped and active, retaining the pre-snapshot `RegistrySnapshot` for full rollback.
+    let pre_mig_reg_snap = world
+        .get_resource::<ModRegistry>()
+        .map(ModRegistry::snapshot_arc);
+    let mut column_snapshots: Vec<Option<ReloadColumnSnapshot>> = vec![None; plan.len()];
+    for idx in (0..plan.len()).rev() {
+        match snapshot_mod_dynamic_columns_for_reload(world, plan[idx].old_id) {
+            Ok(col_snap) => column_snapshots[idx] = Some(col_snap),
+            Err(err) => {
+                if let Some(snap) = pre_mig_reg_snap
+                    && let Some(mut reg) = world.get_resource_mut::<ModRegistry>()
+                {
+                    reg.restore_snapshot(snap);
+                }
+                for restore_idx in (idx + 1)..plan.len() {
+                    if let Some(col_snap) = column_snapshots[restore_idx].take() {
+                        let _ = restore_mod_dynamic_columns_after_reload(
+                            world,
+                            plan[restore_idx].old_id,
+                            col_snap,
+                        );
+                    }
+                }
+                emit_mod_load_failed(world, &plan[idx].target_path, Some(id), &err);
+                return Err(err);
+            }
+        }
+    }
+
+    // Phase 4: Stage & run `bamabi_init`, strict validation, ordering check, `restore_state`,
+    // and dynamic column migration on every replacement BEFORE unloading any active mod or
+    // touching `ModScoped` entities.
+    struct StagedReplacement {
+        new_id: ModId,
+        mod_name: String,
+        mod_version: String,
+        systems: Vec<GuestSystem>,
+    }
+    let mut staged: Vec<StagedReplacement> = Vec::with_capacity(plan.len());
+
+    let stage_result: Result<(), Box<(PathBuf, ModLoadError)>> = (|| {
+        for (idx, item) in plan.iter_mut().enumerate() {
+            let Some(prepared) = item.prepared.take() else {
+                return Err(Box::new((
+                    item.target_path.clone(),
+                    ModLoadError::ModNotFound { id: item.old_id },
+                )));
+            };
+            let next_gen = item.old_gen.saturating_add(1);
+            let (new_id, systems) =
+                load_prepared_mod_in_world(world, prepared, &item.options, Some(next_gen))
+                    .map_err(|err| Box::new((item.target_path.clone(), err)))?;
+
+            let (mod_name, mod_version) = world
+                .get_resource::<ModHost>()
+                .and_then(|h| h.get_mod(new_id))
+                .map(|m| (m.name().to_string(), m.version().to_string()))
+                .unwrap_or_else(|| ("unnamed_mod".to_string(), "0.0.0".to_string()));
+
+            if item.options.strict
+                && let Some(registry) = world.get_resource::<ModRegistry>()
+            {
+                for sys in &systems {
+                    if let Err(missing) = sys.validate_against_registry(registry) {
+                        let sys_name = sys.system_name().to_string();
+                        drop(systems);
+                        rollback_unscheduled_mod_in_world(world, new_id);
+                        return Err(Box::new((
+                            item.target_path.clone(),
+                            ModLoadError::MissingComponents {
+                                path: item.target_path.clone(),
+                                system_name: sys_name,
+                                missing,
+                            },
+                        )));
+                    }
+                }
+            }
+
+            if let Err(err) = prevalidate_mod_schedules_and_ordering(
+                world,
+                new_id,
+                &item.target_path,
+                &mod_name,
+                item.options.strict,
+                &systems,
+            ) {
+                drop(systems);
+                rollback_unscheduled_mod_in_world(world, new_id);
+                return Err(Box::new((item.target_path.clone(), err)));
+            }
+
+            if let Some(blob) = saved_states[idx].as_deref()
+                && let Err(err) = restore_mod_state_in_world(world, new_id, blob)
+            {
+                drop(systems);
+                rollback_unscheduled_mod_in_world(world, new_id);
+                return Err(Box::new((item.target_path.clone(), err)));
+            }
+
+            if let Some(col_snap) = column_snapshots[idx].clone()
+                && let Err(err) = restore_mod_dynamic_columns_after_reload(world, new_id, col_snap)
+            {
+                drop(systems);
+                rollback_unscheduled_mod_in_world(world, new_id);
+                return Err(Box::new((item.target_path.clone(), err)));
+            }
+
+            staged.push(StagedReplacement {
+                new_id,
+                mod_name,
+                mod_version,
+                systems,
+            });
+        }
+        Ok(())
+    })();
+
+    if let Err(boxed) = stage_result {
+        let (fail_path, err) = *boxed;
+        for s in staged.into_iter().rev() {
+            drop(s.systems);
+            rollback_unscheduled_mod_in_world(world, s.new_id);
+        }
+        if let Some(snap) = pre_mig_reg_snap
+            && let Some(mut reg) = world.get_resource_mut::<ModRegistry>()
+        {
+            reg.restore_snapshot(snap);
+        }
+        for (idx, item) in plan.iter().enumerate() {
+            if let Some(col_snap) = column_snapshots[idx].take()
+                && !col_snap.columns.is_empty()
+            {
+                let _ = restore_mod_dynamic_columns_after_reload(world, item.old_id, col_snap);
+            }
+        }
+        emit_mod_load_failed(world, &fail_path, Some(id), &err);
+        return Err(err);
+    }
+
+    // Phase 5: Commit! Migrate `ModScoped` ownership, unload old mods in reverse order (`C -> B -> A`),
+    // and schedule + finalize all verified replacements in forward order (`A -> B -> C`).
+    for (item, s) in plan.iter().zip(staged.iter()) {
+        migrate_mod_scoped_entities(world, item.old_id, s.new_id);
+    }
+    for idx in (0..plan.len()).rev() {
+        unload_single_mod_in_world(world, plan[idx].old_id, true)?;
+    }
+
+    let mut new_root_id: Option<ModId> = None;
+    for (item, s) in plan.into_iter().zip(staged) {
+        let system_count = s.systems.len();
+        let late_startup = schedule_mod_systems_in_world(world, s.new_id, &s.mod_name, s.systems);
+        finalize_mod_load_in_world(
+            world,
+            s.new_id,
+            s.mod_name.clone(),
+            s.mod_version,
+            item.target_path.clone(),
+            system_count,
+        );
         if let Some(mut dag) = world.get_resource_mut::<ModDependencyGraph>() {
             dag.register_loaded_mod(
-                new_id,
+                s.new_id,
                 item.name,
                 item.target_path,
                 item.options,
                 item.dependencies,
             );
         }
+        run_late_startup_systems_in_world(world, &s.mod_name, late_startup);
         if item.old_id == id {
-            new_root_id = Some(new_id);
+            new_root_id = Some(s.new_id);
         }
     }
 
     new_root_id.ok_or(ModLoadError::ModNotFound { id })
+}
+
+fn reload_mod_cascade(
+    world: &mut World,
+    id: ModId,
+    override_path: Option<&Path>,
+    options: LoadOptions,
+) -> Result<ModId, ModLoadError> {
+    reload_mod_cascade_with(world, id, override_path, None, false, options)
 }
 
 /// Exclusive `&mut World` extension trait for exposing Bevy ECS types and managing native C-ABI
@@ -677,6 +1015,77 @@ pub trait ModWorldExt {
         dir: P,
         options: LoadOptions,
     ) -> Result<DirectoryLoadReport, ModDagError>;
+
+    /// Loads a static or JIT-compiled mod directly from in-memory [`InMemoryModEntrypoints`]
+    /// without `dlopen` using [`LoadOptions::default()`].
+    fn load_mod_from_entrypoints<P: AsRef<Path>>(
+        &mut self,
+        virtual_path: P,
+        entrypoints: InMemoryModEntrypoints,
+    ) -> Result<ModId, ModLoadError>;
+
+    /// Loads a static or JIT-compiled mod directly from in-memory [`InMemoryModEntrypoints`]
+    /// with explicit [`LoadOptions`].
+    fn load_mod_from_entrypoints_with<P: AsRef<Path>>(
+        &mut self,
+        virtual_path: P,
+        entrypoints: InMemoryModEntrypoints,
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError>;
+
+    /// Atomically hot-reloads `id` from replacement [`InMemoryModEntrypoints`], preserving
+    /// `ModScoped` entities and the previous active mod if initialization fails.
+    fn reload_mod_from_entrypoints<P: AsRef<Path>>(
+        &mut self,
+        id: ModId,
+        virtual_path: P,
+        entrypoints: InMemoryModEntrypoints,
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError>;
+
+    /// Materializes [`InMemoryModEntrypoints`] from raw object/bytecode bytes via an
+    /// [`InMemoryObjectLoader`] (`cranelift-object-loader` / JIT seam) and loads it.
+    fn load_mod_from_object_loader<L: InMemoryObjectLoader + ?Sized>(
+        &mut self,
+        loader: &L,
+        label: &str,
+        object_bytes: &[u8],
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError>;
+
+    /// Atomically hot-reloads `id` from raw object/bytecode bytes via an
+    /// [`InMemoryObjectLoader`].
+    fn reload_mod_from_object_loader<L: InMemoryObjectLoader + ?Sized>(
+        &mut self,
+        id: ModId,
+        loader: &L,
+        label: &str,
+        object_bytes: &[u8],
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError>;
+
+    /// Verifies (when `ModTrustPolicy` is enforced) and loads a `.bampack` archive mod using
+    /// [`LoadOptions::default()`].
+    #[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+    fn load_bampack<P: AsRef<Path>>(&mut self, path: P) -> Result<ModId, ModLoadError>;
+
+    /// Verifies (when `ModTrustPolicy` is enforced) and loads a `.bampack` archive mod with
+    /// explicit [`LoadOptions`].
+    #[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+    fn load_bampack_with<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError>;
+
+    /// Atomically hot-reloads `id` from a replacement `.bampack` archive path.
+    #[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+    fn reload_bampack<P: AsRef<Path>>(
+        &mut self,
+        id: ModId,
+        path: P,
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError>;
 }
 
 impl ModWorldExt for World {
@@ -1037,9 +1446,124 @@ impl ModWorldExt for World {
             errors,
         })
     }
+
+    fn load_mod_from_entrypoints<P: AsRef<Path>>(
+        &mut self,
+        virtual_path: P,
+        entrypoints: InMemoryModEntrypoints,
+    ) -> Result<ModId, ModLoadError> {
+        self.load_mod_from_entrypoints_with(virtual_path, entrypoints, LoadOptions::default())
+    }
+
+    fn load_mod_from_entrypoints_with<P: AsRef<Path>>(
+        &mut self,
+        virtual_path: P,
+        entrypoints: InMemoryModEntrypoints,
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError> {
+        ensure_world_mod_resources(self);
+        let path_ref = virtual_path.as_ref();
+        let prepared = match prepare_entrypoints_in_world(path_ref, entrypoints) {
+            Ok(img) => img,
+            Err(err) => {
+                emit_mod_load_failed(self, path_ref, None, &err);
+                return Err(err);
+            }
+        };
+        finalize_initial_prepared_load(self, prepared, path_ref, options)
+    }
+
+    fn reload_mod_from_entrypoints<P: AsRef<Path>>(
+        &mut self,
+        id: ModId,
+        virtual_path: P,
+        entrypoints: InMemoryModEntrypoints,
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError> {
+        reload_mod_cascade_with(
+            self,
+            id,
+            Some(virtual_path.as_ref()),
+            Some(entrypoints),
+            false,
+            options,
+        )
+    }
+
+    fn load_mod_from_object_loader<L: InMemoryObjectLoader + ?Sized>(
+        &mut self,
+        loader: &L,
+        label: &str,
+        object_bytes: &[u8],
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError> {
+        ensure_world_mod_resources(self);
+        let virtual_path = Path::new(label);
+        let entrypoints = match loader.load_object_bytes(label, object_bytes) {
+            Ok(ep) => ep,
+            Err(err) => {
+                emit_mod_load_failed(self, virtual_path, None, &err);
+                return Err(err);
+            }
+        };
+        self.load_mod_from_entrypoints_with(virtual_path, entrypoints, options)
+    }
+
+    fn reload_mod_from_object_loader<L: InMemoryObjectLoader + ?Sized>(
+        &mut self,
+        id: ModId,
+        loader: &L,
+        label: &str,
+        object_bytes: &[u8],
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError> {
+        ensure_world_mod_resources(self);
+        let virtual_path = Path::new(label);
+        let entrypoints = match loader.load_object_bytes(label, object_bytes) {
+            Ok(ep) => ep,
+            Err(err) => {
+                emit_mod_load_failed(self, virtual_path, Some(id), &err);
+                return Err(err);
+            }
+        };
+        self.reload_mod_from_entrypoints(id, virtual_path, entrypoints, options)
+    }
+
+    #[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+    fn load_bampack<P: AsRef<Path>>(&mut self, path: P) -> Result<ModId, ModLoadError> {
+        self.load_bampack_with(path, LoadOptions::default())
+    }
+
+    #[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+    fn load_bampack_with<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError> {
+        ensure_world_mod_resources(self);
+        let path_ref = path.as_ref();
+        let prepared = match prepare_bampack_in_world(self, path_ref, &options) {
+            Ok(img) => img,
+            Err(err) => {
+                emit_mod_load_failed(self, path_ref, None, &err);
+                return Err(err);
+            }
+        };
+        finalize_initial_prepared_load(self, prepared, path_ref, options)
+    }
+
+    #[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+    fn reload_bampack<P: AsRef<Path>>(
+        &mut self,
+        id: ModId,
+        path: P,
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError> {
+        reload_mod_cascade_with(self, id, Some(path.as_ref()), None, true, options)
+    }
 }
 
-#[cfg(feature = "signature-verification")]
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
 fn preverify_reload_target(
     world: &World,
     id: ModId,

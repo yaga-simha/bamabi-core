@@ -26,12 +26,12 @@ use bevy_platform::collections::HashSet;
 
 use crate::{
     ffi::{
-        commands::{HostCommands, HostCommandsStorage},
+        commands::{CommandArenaConfig, HostCommands, HostCommandsStorage},
         register::{GuestObserverBinding, build_observer_binding_from_desc},
     },
     handle_header::{
-        AlignedBuf, decode_live_entity, decode_optional_entity, ffi_try, init_opt_out_ptr,
-        validate_commands_mut,
+        AlignedBuf, HostContext, decode_live_entity, decode_optional_entity, ffi_try,
+        init_opt_out_ptr, next_non_zero_generation, validate_commands_mut,
     },
     loader::{LoadedModInfo, ModHost, ModId},
     registry::{EntityEventTriggerFn, ModRegistry, TriggerEventFn},
@@ -59,6 +59,7 @@ pub(crate) struct ModObserverState {
     pub(crate) binding: Arc<GuestObserverBinding>,
     pub(crate) enabled: Arc<AtomicBool>,
     ctx_state: Option<Arc<Mutex<ObserverCtxState>>>,
+    cmd_storage_pool: Arc<Mutex<Vec<HostCommandsStorage>>>,
 }
 
 impl ModObserverState {
@@ -67,11 +68,12 @@ impl ModObserverState {
             binding: Arc::new(binding),
             enabled: Arc::new(AtomicBool::new(true)),
             ctx_state: None,
+            cmd_storage_pool: Arc::new(Mutex::new(Vec::with_capacity(1))),
         }
     }
 
     pub(crate) fn new_in_world(world: &mut World, binding: GuestObserverBinding) -> Self {
-        if binding.ctx_callback.is_none() {
+        if binding.ctx_callback.is_none() && binding.ctx_mut_callback.is_none() {
             return Self::new(binding);
         }
 
@@ -123,6 +125,7 @@ impl ModObserverState {
                         last_run,
                         last_error_buf: String::new(),
                     }))),
+                    cmd_storage_pool: Arc::new(Mutex::new(Vec::with_capacity(1))),
                 }
             }
             Err(err) => {
@@ -186,6 +189,7 @@ impl ModObserverState {
                     binding: Arc::new(binding),
                     enabled: Arc::new(AtomicBool::new(false)),
                     ctx_state: None,
+                    cmd_storage_pool: Arc::new(Mutex::new(Vec::new())),
                 }
             }
         }
@@ -195,8 +199,9 @@ impl ModObserverState {
 /// Per-`World` transient state for an active trigger dispatch (`cmd_trigger`, `cmd_trigger_ex`, or
 /// lifecycle trigger), conveying the current target entity, mutable propagation flag, and explicit
 /// watched component IDs across `guest_observer_runner`.
-#[derive(Resource, Clone, Debug)]
+#[derive(Resource, Clone, Debug, Default)]
 struct DynamicTriggerState {
+    active: bool,
     current_target: Option<Entity>,
     propagate: bool,
     watched_ids: Vec<ComponentId>,
@@ -204,14 +209,44 @@ struct DynamicTriggerState {
 
 struct DynamicTriggerGuard<'w> {
     world: &'w mut World,
-    previous: Option<DynamicTriggerState>,
+    prev_active: bool,
+    prev_target: Option<Entity>,
+    prev_propagate: bool,
+    prev_watched_ids: Vec<ComponentId>,
 }
 
 impl<'w> DynamicTriggerGuard<'w> {
-    fn enter(world: &'w mut World, state: DynamicTriggerState) -> Self {
-        let previous = world.remove_resource::<DynamicTriggerState>();
-        world.insert_resource(state);
-        Self { world, previous }
+    fn enter(
+        world: &'w mut World,
+        current_target: Option<Entity>,
+        propagate: bool,
+        watched_ids: &[ComponentId],
+    ) -> Self {
+        world.init_resource::<DynamicTriggerState>();
+        let mut prev_active = false;
+        let mut prev_target = None;
+        let mut prev_propagate = false;
+        let mut prev_watched_ids = Vec::new();
+        if let Some(mut state) = world.get_resource_mut::<DynamicTriggerState>() {
+            prev_active = state.active;
+            if prev_active {
+                prev_target = state.current_target;
+                prev_propagate = state.propagate;
+                prev_watched_ids = core::mem::take(&mut state.watched_ids);
+            }
+            state.active = true;
+            state.current_target = current_target;
+            state.propagate = propagate;
+            state.watched_ids.clear();
+            state.watched_ids.extend_from_slice(watched_ids);
+        }
+        Self {
+            world,
+            prev_active,
+            prev_target,
+            prev_propagate,
+            prev_watched_ids,
+        }
     }
 
     fn world_mut(&mut self) -> &mut World {
@@ -221,16 +256,23 @@ impl<'w> DynamicTriggerGuard<'w> {
     fn propagate(&self) -> bool {
         self.world
             .get_resource::<DynamicTriggerState>()
-            .is_some_and(|s| s.propagate)
+            .is_some_and(|s| s.active && s.propagate)
     }
 }
 
 impl Drop for DynamicTriggerGuard<'_> {
     fn drop(&mut self) {
-        if let Some(prev) = self.previous.take() {
-            self.world.insert_resource(prev);
-        } else {
-            self.world.remove_resource::<DynamicTriggerState>();
+        if let Some(mut state) = self.world.get_resource_mut::<DynamicTriggerState>() {
+            state.active = self.prev_active;
+            if self.prev_active {
+                state.current_target = self.prev_target;
+                state.propagate = self.prev_propagate;
+                state.watched_ids = core::mem::take(&mut self.prev_watched_ids);
+            } else {
+                state.current_target = None;
+                state.propagate = false;
+                state.watched_ids.clear();
+            }
         }
     }
 }
@@ -244,14 +286,7 @@ pub(crate) fn with_dynamic_trigger_state<R>(
     watched_ids: &[ComponentId],
     f: impl FnOnce(&mut World) -> R,
 ) -> R {
-    let mut guard = DynamicTriggerGuard::enter(
-        world,
-        DynamicTriggerState {
-            current_target,
-            propagate,
-            watched_ids: watched_ids.to_vec(),
-        },
-    );
+    let mut guard = DynamicTriggerGuard::enter(world, current_target, propagate, watched_ids);
     f(guard.world_mut())
 }
 
@@ -273,7 +308,7 @@ fn observer_read_data_ptr(
 
 /// Dynamic [`ObserverRunner`](bevy_ecs::observer::ObserverRunner) dispatching Bevy `Event`,
 /// `EntityEvent`, `Ready`, or lifecycle events into a registered guest [`BamObserverFn`],
-/// [`BamObserverMutFn`], or [`BamObserverCtxFn`].
+/// [`BamObserverMutFn`], [`BamObserverCtxFn`], or [`BamObserverCtxMutFn`].
 ///
 /// # Safety
 /// - `world` must be the [`DeferredWorld`] owning `observer`.
@@ -285,12 +320,13 @@ pub(crate) unsafe fn guest_observer_runner(
     event_ptr: PtrMut,
     _trigger_ptr: PtrMut,
 ) {
-    let Some((binding, enabled, ctx_state)) =
+    let Some((binding, enabled, ctx_state, cmd_storage_pool)) =
         world.get::<ModObserverState>(observer).map(|state| {
             (
                 Arc::clone(&state.binding),
                 Arc::clone(&state.enabled),
                 state.ctx_state.clone(),
+                Arc::clone(&state.cmd_storage_pool),
             )
         })
     else {
@@ -300,16 +336,19 @@ pub(crate) unsafe fn guest_observer_runner(
         return;
     }
 
-    let trigger_info = world.get_resource::<DynamicTriggerState>().map(|s| {
-        let watched = if !binding.event_kind.is_component_lifecycle()
-            && !binding.watched_components.is_empty()
-        {
-            s.watched_ids.clone()
-        } else {
-            Vec::new()
-        };
-        (s.current_target, s.propagate, watched)
-    });
+    let trigger_info = world
+        .get_resource::<DynamicTriggerState>()
+        .filter(|s| s.active)
+        .map(|s| {
+            let watched = if !binding.event_kind.is_component_lifecycle()
+                && !binding.watched_components.is_empty()
+            {
+                s.watched_ids.clone()
+            } else {
+                Vec::new()
+            };
+            (s.current_target, s.propagate, watched)
+        });
 
     let target_ffi = if binding.event_kind.is_component_lifecycle() {
         let entity = match binding.event_kind {
@@ -379,11 +418,27 @@ pub(crate) unsafe fn guest_observer_runner(
         .map_or(binding.is_propagating, |(_, p, _)| *p);
     let mut propagate_ffi = FfiBool::from_bool(initial_propagate);
 
-    let mut storage = HostCommandsStorage::new();
+    let mut storage = cmd_storage_pool
+        .try_lock()
+        .ok()
+        .and_then(|mut pool| pool.pop())
+        .unwrap_or_else(HostCommandsStorage::new);
+    let max_retained_slabs = world
+        .get_resource::<CommandArenaConfig>()
+        .map_or(2, |cfg| cfg.max_retained_slabs);
     let snap = binding.registry.latest_snapshot_arc();
     let mut status = FfiResult::OK;
     let mut wire_entity = target_ffi;
     let mut last_error: Option<String> = None;
+
+    let mut_data_ptr: *mut u8 =
+        if binding.event_kind.is_component_lifecycle() || binding.event_size == 0 {
+            core::ptr::null_mut()
+        } else if binding.synthesizes_ffi_entity_payload {
+            (&raw mut wire_entity).cast::<u8>()
+        } else {
+            event_ptr.as_ptr()
+        };
 
     if let Some(GuestFnPtr(mut_cb)) = binding.mut_callback {
         let cell = world.as_unsafe_world_cell();
@@ -391,14 +446,6 @@ pub(crate) unsafe fn guest_observer_runner(
         let mut host_cmds = HostCommands::new(&mut storage, allocator, &snap)
             .with_mod_context(binding.mod_id, Some(Arc::clone(&binding.is_active)))
             .with_registry(&binding.registry);
-        let mut_data_ptr: *mut u8 =
-            if binding.event_kind.is_component_lifecycle() || binding.event_size == 0 {
-                core::ptr::null_mut()
-            } else if binding.synthesizes_ffi_entity_payload {
-                (&raw mut wire_entity).cast::<u8>()
-            } else {
-                event_ptr.as_ptr()
-            };
         // SAFETY: `binding.is_active` is verified true, `mut_data_ptr` is null or valid writable
         // storage for this event, `propagate_ffi` is stack-scoped, and `host_cmds` is poisoned before exit.
         status = unsafe {
@@ -413,6 +460,7 @@ pub(crate) unsafe fn guest_observer_runner(
     }
 
     if let Some(mut trigger_state) = world.get_resource_mut::<DynamicTriggerState>()
+        && trigger_state.active
         && binding.mut_callback.is_some()
     {
         trigger_state.propagate = propagate_ffi.get();
@@ -441,7 +489,7 @@ pub(crate) unsafe fn guest_observer_runner(
     }
 
     if status == FfiResult::OK
-        && let Some(GuestFnPtr(ctx_cb)) = binding.ctx_callback
+        && (binding.ctx_mut_callback.is_some() || binding.ctx_callback.is_some())
     {
         let (mod_ns_arc, generation) = binding
             .mod_id
@@ -464,77 +512,130 @@ pub(crate) unsafe fn guest_observer_runner(
                     let err_buf = core::mem::take(&mut state.last_error_buf);
                     let last_run = state.last_run;
 
-                    let cell = world.as_unsafe_world_cell();
-                    let allocator = cell.entity_allocator();
-                    let change_tick = cell.increment_change_tick();
-                    for group in &mut state.query_groups {
-                        group.update_archetypes(cell);
-                    }
-
-                    // SAFETY: `cell` grants observer access and `query_groups` was validated at init.
-                    let (count, mut host_iters, query_views) = unsafe {
-                        build_query_slot_iters(cell, &mut state.query_groups, last_run, change_tick)
-                    };
-                    let mut iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES] =
-                        [core::ptr::null_mut(); MAX_SYSTEM_QUERIES];
-                    for i in 0..count {
-                        if let Some(ref mut it) = host_iters[i] {
-                            iter_ptrs[i] = it.as_ffi_ptr();
+                    let (cb_status, reported_fault, reclaimed_err, ctx_mut_ran) = {
+                        let cell = world.as_unsafe_world_cell();
+                        let allocator = cell.entity_allocator();
+                        let change_tick = cell.increment_change_tick();
+                        for group in &mut state.query_groups {
+                            group.update_archetypes(cell);
                         }
-                    }
 
-                    let data_ptr = observer_read_data_ptr(&binding, &wire_entity, event_read_ptr);
-                    let (cb_status, reported_fault, reclaimed_err) = {
+                        // SAFETY: `cell` grants observer access and `query_groups` was validated at init.
+                        let (count, mut host_iters, query_views) = unsafe {
+                            build_query_slot_iters(
+                                cell,
+                                &mut state.query_groups,
+                                last_run,
+                                change_tick,
+                            )
+                        };
+                        let mut iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES] =
+                            [core::ptr::null_mut(); MAX_SYSTEM_QUERIES];
+                        for i in 0..count {
+                            if let Some(ref mut it) = host_iters[i] {
+                                iter_ptrs[i] = it.as_ffi_ptr();
+                            }
+                        }
+
                         let mut host_cmds = HostCommands::new(&mut storage, allocator, &snap)
                             .with_mod_context(binding.mod_id, Some(Arc::clone(&binding.is_active)))
                             .with_registry(&binding.registry);
                         let cmds_ptr = host_cmds.as_ffi_ptr();
-                        let mut sys_ctx = HostSystemCtx::new(
-                            Arc::clone(&snap),
-                            mod_ns_arc.clone(),
-                            err_buf,
-                            iter_ptrs,
-                            count,
+                        let host_ctx = HostContext::with_error_buffer(Arc::clone(&snap), err_buf)
+                            .with_namespace(mod_ns_arc.clone());
+                        let mut sys_ctx = HostSystemCtx::new_reused_full(
+                            host_ctx,
+                            next_non_zero_generation(),
+                            &iter_ptrs[..count],
+                            &query_views[..count],
                             cmds_ptr,
-                        )
-                        .with_world_and_queries(
-                            cell,
-                            query_views,
-                            last_run,
-                            change_tick,
+                            (cell, last_run, change_tick),
+                            (&[], Vec::new(), Vec::new()),
                         );
                         let host_ctx_ptr = sys_ctx.host_ctx_ffi_ptr();
                         let sys_ctx_ptr = sys_ctx.as_ffi_ptr();
-                        let fault_guard = ActiveGuestFaultGuard::enter(
-                            host_ctx_ptr,
-                            binding.mod_id,
-                            mod_ns_arc,
-                            generation,
-                            Arc::clone(&binding.name),
-                        );
-                        // SAFETY: `binding.is_active` is true, `data_ptr` satisfies event layout,
-                        // and `sys_ctx` / `host_cmds` / `host_iters` headers are poisoned before exit.
-                        let res = unsafe {
-                            ctx_cb(
-                                target_ffi,
-                                data_ptr,
-                                sys_ctx_ptr,
-                                binding.user_data.as_ptr(),
-                            )
-                        };
-                        let reported = fault_guard.finish();
+
+                        let mut res = FfiResult::OK;
+                        let mut reported: Option<String> = None;
+                        let mut ran_ctx_mut = false;
+
+                        if let Some(GuestFnPtr(ctx_mut_cb)) = binding.ctx_mut_callback {
+                            ran_ctx_mut = true;
+                            // SAFETY: `host_ctx_ptr` points to `sys_ctx.host_ctx`, `mod_ns_arc` and
+                            // `binding.name` outlive `fault_guard`, and `fault_guard` finishes below.
+                            let fault_guard = unsafe {
+                                ActiveGuestFaultGuard::enter(
+                                    host_ctx_ptr,
+                                    binding.mod_id,
+                                    mod_ns_arc.as_deref(),
+                                    generation,
+                                    &binding.name,
+                                )
+                            };
+                            // SAFETY: `binding.is_active` is true, `mut_data_ptr` satisfies event layout,
+                            // `propagate_ffi` is stack-scoped, and `sys_ctx` / `host_cmds` / `host_iters` are poisoned before exit.
+                            res = unsafe {
+                                ctx_mut_cb(
+                                    target_ffi,
+                                    mut_data_ptr,
+                                    &mut propagate_ffi,
+                                    sys_ctx_ptr,
+                                    binding.user_data.as_ptr(),
+                                )
+                            };
+                            reported = fault_guard.finish();
+                        }
+
+                        if res == FfiResult::OK
+                            && reported.is_none()
+                            && let Some(GuestFnPtr(ctx_cb)) = binding.ctx_callback
+                        {
+                            let data_ptr =
+                                observer_read_data_ptr(&binding, &wire_entity, event_read_ptr);
+                            // SAFETY: `host_ctx_ptr` points to `sys_ctx.host_ctx`, `mod_ns_arc` and
+                            // `binding.name` outlive `fault_guard`, and `fault_guard` finishes below.
+                            let fault_guard = unsafe {
+                                ActiveGuestFaultGuard::enter(
+                                    host_ctx_ptr,
+                                    binding.mod_id,
+                                    mod_ns_arc.as_deref(),
+                                    generation,
+                                    &binding.name,
+                                )
+                            };
+                            // SAFETY: `binding.is_active` is true, `data_ptr` satisfies event layout,
+                            // and `sys_ctx` / `host_cmds` / `host_iters` headers are poisoned before exit.
+                            res = unsafe {
+                                ctx_cb(
+                                    target_ffi,
+                                    data_ptr,
+                                    sys_ctx_ptr,
+                                    binding.user_data.as_ptr(),
+                                )
+                            };
+                            reported = fault_guard.finish();
+                        }
+
                         let reclaimed = sys_ctx.reclaim_error_buffer();
-                        (res, reported, reclaimed)
+                        drop(host_iters);
+                        (res, reported, reclaimed, ran_ctx_mut)
                     };
-                    drop(host_iters);
                     state.last_error_buf = reclaimed_err;
+
+                    if ctx_mut_ran
+                        && let Some(mut trigger_state) =
+                            world.get_resource_mut::<DynamicTriggerState>()
+                        && trigger_state.active
+                    {
+                        trigger_state.propagate = propagate_ffi.get();
+                    }
 
                     if cb_status == FfiResult::PANIC_CAUGHT || cb_status.is_err() {
                         status = cb_status;
                     } else if reported_fault.is_some() {
                         status = FfiResult::INTERNAL_ERROR;
                     } else {
-                        state.last_run = change_tick;
+                        state.last_run = world.change_tick();
                     }
 
                     if status != FfiResult::OK {
@@ -563,14 +664,36 @@ pub(crate) unsafe fn guest_observer_runner(
 
     if status == FfiResult::OK {
         if !storage.is_empty() {
+            let pool = Arc::clone(&cmd_storage_pool);
             world.commands().queue(move |w: &mut World| {
+                let cap = w
+                    .get_resource::<CommandArenaConfig>()
+                    .map_or(2, |cfg| cfg.max_retained_slabs);
                 storage.apply_to_world(w, &snap);
+                storage.clear_with_retained_slabs(cap);
+                if let Ok(mut guard) = pool.lock()
+                    && guard.len() < 2
+                {
+                    guard.push(storage);
+                }
             });
+        } else {
+            storage.clear_with_retained_slabs(max_retained_slabs);
+            if let Ok(mut guard) = cmd_storage_pool.try_lock()
+                && guard.len() < 2
+            {
+                guard.push(storage);
+            }
         }
         return;
     }
 
-    storage.clear();
+    storage.clear_with_retained_slabs(max_retained_slabs);
+    if let Ok(mut guard) = cmd_storage_pool.try_lock()
+        && guard.len() < 2
+    {
+        guard.push(storage);
+    }
     let policy = world
         .get_resource::<ModErrorPolicyConfig>()
         .map_or(ModErrorPolicy::default(), |c| c.0);
@@ -712,14 +835,7 @@ struct CustomTriggerDispatch<'a> {
 
 impl CustomTriggerDispatch<'_> {
     fn dispatch_at(&mut self, world: &mut World, target: Option<Entity>, propagate: bool) -> bool {
-        let mut guard = DynamicTriggerGuard::enter(
-            world,
-            DynamicTriggerState {
-                current_target: target,
-                propagate,
-                watched_ids: self.watched_ids.to_vec(),
-            },
-        );
+        let mut guard = DynamicTriggerGuard::enter(world, target, propagate, self.watched_ids);
         let w = guard.world_mut();
         if let Some(et_fn) = self.entity_trigger_fn {
             if let Some(t) = target
@@ -807,14 +923,7 @@ fn dispatch_lifecycle_at_target(
     watched_ids: &[ComponentId],
     propagate: bool,
 ) -> bool {
-    let mut guard = DynamicTriggerGuard::enter(
-        world,
-        DynamicTriggerState {
-            current_target: Some(target),
-            propagate,
-            watched_ids: watched_ids.to_vec(),
-        },
-    );
+    let mut guard = DynamicTriggerGuard::enter(world, Some(target), propagate, watched_ids);
     let w = guard.world_mut();
     match kind {
         BamEventKind::ADD => {

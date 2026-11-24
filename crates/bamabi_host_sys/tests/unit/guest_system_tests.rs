@@ -374,7 +374,7 @@ fn guest_system_ffi_guards_random_access_policies_and_summary_or_groups() {
         2,
         core::ptr::null_mut(),
     );
-    ctx_no_world.query_views = views_no_world;
+    ctx_no_world.query_views = &views_no_world;
 
     // SAFETY: Valid `HostSystemCtx` and intentionally misaligned/null pointers checked upfront.
     unsafe {
@@ -575,7 +575,7 @@ fn guest_system_ffi_guards_random_access_policies_and_summary_or_groups() {
         3,
         core::ptr::null_mut(),
     );
-    ctx_no_world_wr.query_views = views_world;
+    ctx_no_world_wr.query_views = &views_world;
     // SAFETY: Valid `HostSystemCtx` without `world` returns null cleanly (`437`).
     unsafe {
         assert!(
@@ -594,7 +594,7 @@ fn guest_system_ffi_guards_random_access_policies_and_summary_or_groups() {
     )
     .with_world_and_queries(
         world.as_unsafe_world_cell_readonly(),
-        views_world,
+        &views_world,
         Tick::new(0),
         Tick::new(10),
     );
@@ -631,7 +631,7 @@ fn guest_system_ffi_guards_random_access_policies_and_summary_or_groups() {
     )
     .with_world_and_queries(
         world.as_unsafe_world_cell(),
-        views_world,
+        &views_world,
         Tick::new(0),
         Tick::new(10),
     );
@@ -926,4 +926,119 @@ fn run_if_ctx_preserves_changed_ticks_when_skipped_supports_read_under_write_and
     sys16.initialize(&mut world);
     sys16.run((), &mut world).unwrap();
     assert_eq!(hits.load(Ordering::Relaxed), MAX_QUERIES_PER_SYSTEM);
+}
+
+#[test]
+fn host_iter_and_sys_ctx_compact_size_and_standalone_fallback() {
+    use crate::ffi::iter::{
+        HostIter, QueryPlan, QueryTermMeta, host_iter_column_mutable, host_iter_column_readonly,
+        host_iter_column_ticks, host_iter_next_chunk,
+    };
+    use bamabi_sys::ComponentUuid;
+
+    assert!(core::mem::size_of::<HostIter<'_>>() <= 256);
+    assert!(core::mem::size_of::<HostSystemCtx<'_>>() <= 256);
+
+    let mut world = World::new();
+    let val_id = world.register_component::<SummaryVal>();
+    let e = world.spawn(SummaryVal(42.0)).id();
+    let tid = world.entity(e).location().table_id;
+    let tables_slice = [tid];
+
+    // Standalone `HostIter::new_dense` with empty `dense_data_indices` & `has_indices`
+    // does not allocate `owned_scratch`.
+    let empty_plan = QueryPlan::from_terms(vec![]);
+    let mut empty_iter = HostIter::new_dense(
+        &world.storages().tables,
+        &tables_slice,
+        &empty_plan,
+        Tick::new(0),
+        Tick::new(1),
+    );
+    let mut len = 0usize;
+    // SAFETY: Valid `HostIter` and writable `len`.
+    assert!(unsafe { host_iter_next_chunk(empty_iter.as_ffi_ptr(), &raw mut len) }.get());
+    assert_eq!(len, 1);
+
+    // Standalone `HostIter::new_dense` with `WRITE` term lazily populates `owned_scratch`
+    // without requiring `.with_scratch(...)`.
+    let write_plan = QueryPlan::from_terms(vec![QueryTermMeta {
+        component: BamComponent::from_raw(1),
+        component_id: val_id,
+        mode: AccessMode::WRITE,
+        flags: 0,
+        uuid: ComponentUuid::from_canonical_name("SummaryVal"),
+        size: core::mem::size_of::<SummaryVal>(),
+        align: core::mem::align_of::<SummaryVal>(),
+        storage_flags: 0,
+        msg_read_batch_fn: None,
+        msg_send_fn: None,
+        msg_write_batch_fn: None,
+    }]);
+    let mut stand_iter = HostIter::new_dense(
+        &world.storages().tables,
+        &tables_slice,
+        &write_plan,
+        Tick::new(0),
+        Tick::new(2),
+    );
+    let mut chunk_len = 0usize;
+    // SAFETY: Valid `HostIter` and writable `chunk_len`.
+    assert!(unsafe { host_iter_next_chunk(stand_iter.as_ffi_ptr(), &raw mut chunk_len) }.get());
+    assert_eq!(chunk_len, 1);
+    // SAFETY: Valid active `HostIter` with `WRITE` term at index 0.
+    unsafe {
+        let ro = host_iter_column_readonly(stand_iter.as_ffi_ptr().cast_const(), 0);
+        assert!(!ro.is_null());
+        assert_eq!(core::ptr::read_unaligned(ro.cast::<SummaryVal>()).0, 42.0);
+        let rw = host_iter_column_mutable(stand_iter.as_ffi_ptr(), 0);
+        assert!(!rw.is_null());
+        core::ptr::write_unaligned(rw.cast::<SummaryVal>(), SummaryVal(99.0));
+        let mut added = core::ptr::null();
+        let mut changed = core::ptr::null();
+        let mut last_run = 0u32;
+        let mut this_run = 0u32;
+        assert_eq!(
+            host_iter_column_ticks(
+                stand_iter.as_ffi_ptr().cast_const(),
+                0,
+                &raw mut added,
+                &raw mut changed,
+                &raw mut last_run,
+                &raw mut this_run,
+            ),
+            FfiResult::OK
+        );
+        assert!(!added.is_null());
+        assert!(!changed.is_null());
+        assert_eq!(*changed, 2);
+        assert_eq!(last_run, 0);
+        assert_eq!(this_run, 2);
+    }
+
+    // Legacy `HostSystemCtx::new` stores `iter_ptrs` in `owned_iter_ptrs` without self-borrowing.
+    let mut iter_ptrs = [core::ptr::null_mut(); MAX_SYSTEM_QUERIES];
+    iter_ptrs[0] = stand_iter.as_ffi_ptr();
+    let reg = ModRegistry::new();
+    let mut ctx = HostSystemCtx::new(
+        reg.snapshot_arc(),
+        None,
+        String::new(),
+        iter_ptrs,
+        1,
+        core::ptr::null_mut(),
+    );
+    let mut out_iter = core::ptr::null_mut();
+    // SAFETY: Valid `HostSystemCtx` and writable `out_iter`.
+    unsafe {
+        assert_eq!(
+            host_sys_query(ctx.as_ffi_ptr(), 0, &raw mut out_iter),
+            FfiResult::OK
+        );
+        assert_eq!(out_iter, stand_iter.as_ffi_ptr());
+        assert_eq!(
+            host_sys_query(ctx.as_ffi_ptr(), 1, &raw mut out_iter),
+            FfiResult::OUT_OF_RANGE
+        );
+    }
 }

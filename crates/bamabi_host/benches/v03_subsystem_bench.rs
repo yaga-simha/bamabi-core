@@ -1,6 +1,6 @@
-//! ABI `0.3.0` Subsystem Benchmark Suite.
+//! ABI `0.4.0` Subsystem Benchmark Suite.
 //!
-//! Exercises the new ABI `0.3.0` host slots through `bamabi_host_sys` using the same
+//! Exercises the ABI `0.3.0` / `0.4.0` host slots through `bamabi_host_sys` using the same
 //! zero-dependency harness conventions as `chunk_throughput.rs` (`--bench`, `--test`, `--quick`,
 //! and substring filter arguments supported):
 //!
@@ -525,8 +525,9 @@ fn bench_intern_symbol(cfg: &BenchConfig) {
             let mut out = BamSymbol::INVALID;
             let start = Instant::now();
             for s in &strings {
+                let s_view = StrView::from_str(s);
                 // SAFETY: `host_ptr`, `StrView`, and `out` are valid for this call.
-                let rc = unsafe { intern_fn(host_ptr, StrView::from_str(s), &raw mut out) };
+                let rc = unsafe { intern_fn(host_ptr, &raw const s_view, &raw mut out) };
                 debug_assert_eq!(rc, FfiResult::OK);
             }
             let elapsed = start.elapsed();
@@ -557,8 +558,9 @@ fn bench_intern_symbol(cfg: &BenchConfig) {
 
         let mut out = BamSymbol::INVALID;
         for s in &strings {
+            let s_view = StrView::from_str(s);
             // SAFETY: Valid `host_ptr`, `StrView`, and `out`.
-            let rc = unsafe { intern_fn(host_ptr, StrView::from_str(s), &raw mut out) };
+            let rc = unsafe { intern_fn(host_ptr, &raw const s_view, &raw mut out) };
             assert_eq!(rc, FfiResult::OK);
         }
 
@@ -567,9 +569,9 @@ fn bench_intern_symbol(cfg: &BenchConfig) {
                 let mut acc = 0u64;
                 let start = Instant::now();
                 for i in 0..lookup_count {
-                    let s = &strings[i % unique_count];
+                    let s_view = StrView::from_str(&strings[i % unique_count]);
                     // SAFETY: Valid `host_ptr`, `StrView`, and `out`.
-                    let rc = unsafe { intern_fn(host_ptr, StrView::from_str(s), &raw mut out) };
+                    let rc = unsafe { intern_fn(host_ptr, &raw const s_view, &raw mut out) };
                     debug_assert_eq!(rc, FfiResult::OK);
                     acc = acc.wrapping_add(u64::from(out.to_raw()));
                 }
@@ -1724,7 +1726,7 @@ fn main() {
 
     println!("================================================================================");
     println!(
-        " bamabi ABI 0.3.0 Subsystem Benchmark Suite [mode={}]",
+        " bamabi ABI 0.4.0 Subsystem Benchmark Suite [mode={}]",
         if cfg.test_mode {
             "smoke-test"
         } else if cfg.quick_mode {
@@ -1760,5 +1762,5 @@ fn main() {
         bench_schedule_set_rewire(&cfg);
     }
 
-    println!("\nABI 0.3.0 subsystem benchmark suite completed cleanly.");
+    println!("\nABI 0.4.0 subsystem benchmark suite completed cleanly.");
 }

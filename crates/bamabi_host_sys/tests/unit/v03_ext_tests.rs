@@ -40,21 +40,20 @@ fn diagnostics_uuid_and_layout_introspection_work() {
     unsafe {
         // 1. `log_diagnostic` must emit without overwriting `last_error`.
         host_ctx.set_last_error("prior error");
-        let ok_res = host_log_diagnostic(
-            host_ctx.as_ffi_ptr(),
-            BAM_LOG_INFO,
-            StrView::from_str("hello from guest"),
-        );
+        let hello_view = StrView::from_str("hello from guest");
+        let bad_level_view = StrView::from_str("bad level");
+        let boom_view = StrView::from_str("boom fault");
+        let ok_res = host_log_diagnostic(host_ctx.as_ffi_ptr(), BAM_LOG_INFO, &hello_view);
         assert_eq!(ok_res, FfiResult::OK);
         assert_eq!(host_ctx.last_error_message(), "prior error");
         assert_eq!(
-            host_log_diagnostic(host_ctx.as_ffi_ptr(), 99, StrView::from_str("bad level")),
+            host_log_diagnostic(host_ctx.as_ffi_ptr(), 99, &bad_level_view),
             FfiResult::INVALID_ARGUMENT
         );
 
         // 2. `report_guest_fault` records into `last_error`.
         assert_eq!(
-            host_report_guest_fault(host_ctx.as_ffi_ptr(), StrView::from_str("boom fault")),
+            host_report_guest_fault(host_ctx.as_ffi_ptr(), &boom_view),
             FfiResult::OK
         );
         assert_eq!(host_ctx.last_error_message(), "boom fault");
@@ -412,22 +411,25 @@ fn reserved_v03_slots_validate_arguments_before_returning_unsupported() {
             FfiResult::NULL_POINTER
         );
 
+        let empty_view = StrView::from_str("");
+        let hp_view = StrView::from_str("hp");
+        let hero_view = StrView::from_str("hero");
         assert_eq!(
-            host_intern_symbol(host_ptr, StrView::from_str(""), &raw mut sym),
+            host_intern_symbol(host_ptr, &empty_view, &raw mut sym),
             FfiResult::INVALID_ARGUMENT
         );
         assert_eq!(
-            host_intern_symbol(host_ptr, StrView::from_str("hp"), &raw mut sym),
+            host_intern_symbol(host_ptr, &hp_view, &raw mut sym),
             FfiResult::OK
         );
         assert_eq!(sym, BamSymbol::from_raw(0));
 
         assert_eq!(
-            host_bind_named_object(host_ptr, StrView::from_str("hero"), FfiEntity::NULL),
+            host_bind_named_object(host_ptr, &hero_view, FfiEntity::NULL),
             FfiResult::INVALID_ENTITY
         );
         assert_eq!(
-            host_bind_named_object(host_ptr, StrView::from_str("hero"), live_ent),
+            host_bind_named_object(host_ptr, &hero_view, live_ent),
             FfiResult::OK
         );
 
@@ -542,6 +544,9 @@ fn v03_all_null_invalid_handle_struct_size_and_schedule_set_guards() {
     // 1. `log_diagnostic` (all 5 levels + guards) and `report_guest_fault` (with ActiveGuestFaultGuard).
     // SAFETY: Valid/null/poisoned handles tested safely by FFI magic validation.
     unsafe {
+        let diag_view = StrView::from_str("diag level");
+        let x_view = StrView::from_str("x");
+        let inside_view = StrView::from_str("inside system");
         for lvl in [
             BAM_LOG_TRACE,
             BAM_LOG_DEBUG,
@@ -550,49 +555,45 @@ fn v03_all_null_invalid_handle_struct_size_and_schedule_set_guards() {
             BAM_LOG_ERROR,
         ] {
             assert_eq!(
-                host_log_diagnostic(
-                    unbound_ctx.as_ffi_ptr(),
-                    lvl,
-                    StrView::from_str("diag level")
-                ),
+                host_log_diagnostic(unbound_ctx.as_ffi_ptr(), lvl, &diag_view),
                 FfiResult::OK
             );
         }
         assert_eq!(
-            host_log_diagnostic(null(), BAM_LOG_INFO, StrView::from_str("x")),
+            host_log_diagnostic(null(), BAM_LOG_INFO, &x_view),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            host_log_diagnostic(poisoned_ctx_ptr, BAM_LOG_INFO, StrView::from_str("x")),
+            host_log_diagnostic(poisoned_ctx_ptr, BAM_LOG_INFO, &x_view),
             FfiResult::INVALID_STATE
         );
         assert_eq!(
-            host_log_diagnostic(unbound_ctx.as_ffi_ptr(), BAM_LOG_INFO, bad_utf8_view),
+            host_log_diagnostic(unbound_ctx.as_ffi_ptr(), BAM_LOG_INFO, &bad_utf8_view),
             FfiResult::INVALID_UTF8
         );
 
         assert_eq!(
-            host_report_guest_fault(null(), StrView::from_str("x")),
+            host_report_guest_fault(null(), &x_view),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            host_report_guest_fault(poisoned_ctx_ptr, StrView::from_str("x")),
+            host_report_guest_fault(poisoned_ctx_ptr, &x_view),
             FfiResult::INVALID_STATE
         );
         assert_eq!(
-            host_report_guest_fault(unbound_ctx.as_ffi_ptr(), bad_utf8_view),
+            host_report_guest_fault(unbound_ctx.as_ffi_ptr(), &bad_utf8_view),
             FfiResult::INVALID_UTF8
         );
 
         let guard = ActiveGuestFaultGuard::enter(
             unbound_ctx.as_ffi_ptr(),
             Some(ModId(1)),
-            Some(Arc::from("fault_ns")),
+            Some("fault_ns"),
             2,
-            Arc::from("fault_sys"),
+            "fault_sys",
         );
         assert_eq!(
-            host_report_guest_fault(unbound_ctx.as_ffi_ptr(), StrView::from_str("inside system")),
+            host_report_guest_fault(unbound_ctx.as_ffi_ptr(), &inside_view),
             FfiResult::OK
         );
         assert_eq!(guard.finish().as_deref(), Some("inside system"));
@@ -643,44 +644,37 @@ fn v03_all_null_invalid_handle_struct_size_and_schedule_set_guards() {
 
         // 3. `intern_symbol` and `bind_named_object` unbound-world & null guards.
         let mut sym = BamSymbol::INVALID;
+        let hp_view = StrView::from_str("hp");
+        let hero_view = StrView::from_str("hero");
+        let empty_view = StrView::from_str("");
+        let bad_bits_view = StrView::from_str("bad_bits");
+        let ph_view = StrView::from_str("placeholder");
         assert_eq!(
-            host_intern_symbol(
-                unbound_ctx.as_ffi_ptr(),
-                StrView::from_str("hp"),
-                null_mut()
-            ),
+            host_intern_symbol(unbound_ctx.as_ffi_ptr(), &hp_view, null_mut()),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            host_intern_symbol(null(), StrView::from_str("hp"), &raw mut sym),
+            host_intern_symbol(null(), &hp_view, &raw mut sym),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            host_intern_symbol(
-                unbound_ctx.as_ffi_ptr(),
-                StrView::from_str("hp"),
-                &raw mut sym
-            ),
+            host_intern_symbol(unbound_ctx.as_ffi_ptr(), &hp_view, &raw mut sym),
             FfiResult::INVALID_STATE
         );
 
         assert_eq!(
-            host_bind_named_object(null(), StrView::from_str("hero"), FfiEntity::NULL),
+            host_bind_named_object(null(), &hero_view, FfiEntity::NULL),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            host_bind_named_object(
-                unbound_ctx.as_ffi_ptr(),
-                StrView::from_str(""),
-                FfiEntity::NULL
-            ),
+            host_bind_named_object(unbound_ctx.as_ffi_ptr(), &empty_view, FfiEntity::NULL),
             FfiResult::INVALID_ARGUMENT
         );
         let live_e = world.spawn_empty().id();
         assert_eq!(
             host_bind_named_object(
                 unbound_ctx.as_ffi_ptr(),
-                StrView::from_str("hero"),
+                &hero_view,
                 FfiEntity::from_bits(live_e.to_bits())
             ),
             FfiResult::INVALID_STATE
@@ -688,7 +682,7 @@ fn v03_all_null_invalid_handle_struct_size_and_schedule_set_guards() {
         assert_eq!(
             host_bind_named_object(
                 unbound_ctx.as_ffi_ptr(),
-                StrView::from_str("bad_bits"),
+                &bad_bits_view,
                 FfiEntity::from_bits(1u64 << 32)
             ),
             FfiResult::INVALID_ENTITY
@@ -696,7 +690,7 @@ fn v03_all_null_invalid_handle_struct_size_and_schedule_set_guards() {
         assert_eq!(
             host_bind_named_object(
                 unbound_ctx.as_ffi_ptr(),
-                StrView::from_str("placeholder"),
+                &ph_view,
                 FfiEntity::from_bits(Entity::PLACEHOLDER.to_bits())
             ),
             FfiResult::INVALID_ENTITY
@@ -867,7 +861,7 @@ fn v03_all_null_invalid_handle_struct_size_and_schedule_set_guards() {
             host_configure_schedule_set(standalone.as_ffi_ptr(), &bad_utf8_set, &raw mut set_out),
             FfiResult::INVALID_UTF8
         );
-        let bad_syntax_set = BamScheduleSetDesc::new(c"a::b::c".as_ptr());
+        let bad_syntax_set = BamScheduleSetDesc::new(c"a::::b".as_ptr());
         assert_eq!(
             host_configure_schedule_set(standalone.as_ffi_ptr(), &bad_syntax_set, &raw mut set_out),
             FfiResult::INVALID_ARGUMENT

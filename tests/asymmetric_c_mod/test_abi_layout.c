@@ -56,7 +56,7 @@ int main(void) {
     BamComponent out_comp = BAM_COMPONENT_INVALID;
     int dummy_target = 42;
 
-    printf("[C99 ABI v0.3 Layout Verification]\n");
+    printf("[C99 ABI v0.4 Layout Verification]\n");
 
     assert(BAM_COMPONENT_DESC_MIN_V0_2_SIZE == 64u);
 #if UINTPTR_MAX == 0xffffffffffffffffULL
@@ -85,12 +85,12 @@ int main(void) {
 
     assert(BAM_HOST_API_MIN_V0_2_SIZE == 224u);
 #if UINTPTR_MAX == 0xffffffffffffffffULL
-    assert(sizeof(BamHostApi) == 592u);
+    assert(sizeof(BamHostApi) == 728u);
 #else
-    assert(sizeof(BamHostApi) == 300u);
+    assert(sizeof(BamHostApi) == 368u);
 #endif
     assert(BAM_ALIGNOF(BamHostApi) == sizeof(void*));
-    assert(BAM_HOST_API_SLOT_COUNT == 73u);
+    assert(BAM_HOST_API_SLOT_COUNT == 90u);
 
     memset(&desc, 0, sizeof(desc));
     desc.struct_size = (uint32_t)sizeof(BamComponentDesc);
@@ -135,6 +135,6 @@ int main(void) {
     bad_desc.align = 7u;
     assert(api.register_component(mock_load_ctx, &bad_desc, &out_comp) == BAM_RESULT_INVALID_ARGUMENT);
 
-    printf("[SUCCESS] All C99 ABI v0.3 layout and dispatch tests passed!\n");
+    printf("[SUCCESS] All C99 ABI v0.4 layout and dispatch tests passed!\n");
     return 0;
 }

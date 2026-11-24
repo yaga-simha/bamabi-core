@@ -1032,61 +1032,41 @@ fn symbol_interner_monotonic_dedup_utf8_reload_stability_and_multithreaded() {
         let mut out1 = BamSymbol::INVALID;
         let mut out_dup = BamSymbol::INVALID;
 
+        let attack_view = StrView::from_str("action::attack");
+        let defend_view = StrView::from_str("action::defend");
         assert_eq!(
             // SAFETY: Valid `host_ctx_ptr`, UTF-8 `StrView`, and out pointers.
-            unsafe {
-                intern_slot(
-                    host_ctx_ptr,
-                    StrView::from_str("action::attack"),
-                    &raw mut out0,
-                )
-            },
+            unsafe { intern_slot(host_ctx_ptr, &raw const attack_view, &raw mut out0) },
             FfiResult::OK
         );
         assert_eq!(
             // SAFETY: Valid pointers.
-            unsafe {
-                intern_slot(
-                    host_ctx_ptr,
-                    StrView::from_str("action::defend"),
-                    &raw mut out1,
-                )
-            },
+            unsafe { intern_slot(host_ctx_ptr, &raw const defend_view, &raw mut out1) },
             FfiResult::OK
         );
         assert_eq!(
             // SAFETY: Valid pointers.
-            unsafe {
-                host_intern_symbol(
-                    host_ctx_ptr,
-                    StrView::from_str("action::attack"),
-                    &raw mut out_dup,
-                )
-            },
+            unsafe { host_intern_symbol(host_ctx_ptr, &raw const attack_view, &raw mut out_dup) },
             FfiResult::OK
         );
 
         // Invalid UTF-8 rejected with INVALID_UTF8.
         let bad_utf8: [u8; 2] = [0xFF, 0xFE];
+        let bad_view = StrView::from_slice(&bad_utf8);
         let mut out_bad = BamSymbol::INVALID;
         assert_eq!(
             // SAFETY: `bad_utf8` is a valid 2-byte slice with non-UTF-8 content.
-            unsafe {
-                host_intern_symbol(
-                    host_ctx_ptr,
-                    StrView::from_slice(&bad_utf8),
-                    &raw mut out_bad,
-                )
-            },
+            unsafe { host_intern_symbol(host_ctx_ptr, &raw const bad_view, &raw mut out_bad) },
             FfiResult::INVALID_UTF8
         );
         assert_eq!(out_bad, BamSymbol::INVALID);
 
         // Empty string is rejected with INVALID_ARGUMENT per ABI 0.3.0 symbol contract.
+        let empty_view = StrView::empty();
         let mut out_empty = BamSymbol::INVALID;
         assert_eq!(
             // SAFETY: Empty `StrView` is valid.
-            unsafe { host_intern_symbol(host_ctx_ptr, StrView::empty(), &raw mut out_empty) },
+            unsafe { host_intern_symbol(host_ctx_ptr, &raw const empty_view, &raw mut out_empty) },
             FfiResult::INVALID_ARGUMENT
         );
         assert_eq!(out_empty, BamSymbol::INVALID);
@@ -1125,26 +1105,16 @@ fn symbol_interner_monotonic_dedup_utf8_reload_stability_and_multithreaded() {
 
         let mut out_again = BamSymbol::INVALID;
         let mut out_new = BamSymbol::INVALID;
+        let attack_view = StrView::from_str("action::attack");
+        let parry_view = StrView::from_str("action::parry");
         assert_eq!(
             // SAFETY: Valid pointers.
-            unsafe {
-                host_intern_symbol(
-                    host_ctx_ptr,
-                    StrView::from_str("action::attack"),
-                    &raw mut out_again,
-                )
-            },
+            unsafe { host_intern_symbol(host_ctx_ptr, &raw const attack_view, &raw mut out_again) },
             FfiResult::OK
         );
         assert_eq!(
             // SAFETY: Valid pointers.
-            unsafe {
-                host_intern_symbol(
-                    host_ctx_ptr,
-                    StrView::from_str("action::parry"),
-                    &raw mut out_new,
-                )
-            },
+            unsafe { host_intern_symbol(host_ctx_ptr, &raw const parry_view, &raw mut out_new) },
             FfiResult::OK
         );
         assert_eq!(out_again, s_attack);
@@ -1162,23 +1132,21 @@ fn symbol_interner_monotonic_dedup_utf8_reload_stability_and_multithreaded() {
                 let mut ids = Vec::with_capacity(128);
                 for i in 0..64usize {
                     let s = format!("shared::sym_{}", i % 16);
+                    let s_view = StrView::from_str(&s);
                     let mut out = BamSymbol::INVALID;
                     // SAFETY: `ctx` and `s` are valid for the call.
                     let rc = unsafe {
-                        host_intern_symbol(ctx.as_ffi_ptr(), StrView::from_str(&s), &raw mut out)
+                        host_intern_symbol(ctx.as_ffi_ptr(), &raw const s_view, &raw mut out)
                     };
                     assert_eq!(rc, FfiResult::OK);
                     ids.push((s, out));
 
                     let unique = format!("thread::{tid}::{i}");
+                    let u_view = StrView::from_str(&unique);
                     let mut u_out = BamSymbol::INVALID;
                     // SAFETY: `ctx` and `unique` are valid for the call.
                     let rc2 = unsafe {
-                        host_intern_symbol(
-                            ctx.as_ffi_ptr(),
-                            StrView::from_str(&unique),
-                            &raw mut u_out,
-                        )
+                        host_intern_symbol(ctx.as_ffi_ptr(), &raw const u_view, &raw mut u_out)
                     };
                     assert_eq!(rc2, FfiResult::OK);
                     ids.push((unique, u_out));
@@ -1238,35 +1206,30 @@ fn named_objects_persistent_binding_uuid_rebind_and_reload_survival() {
         let host_ctx_ptr = unsafe { host_load_host_ctx(load_ctx.as_ffi_ptr()) };
 
         // Validation: NULL entity, empty name, invalid UTF-8.
+        let hero_name_view = StrView::from_str("prefab::hero");
+        let empty_name_view = StrView::empty();
         assert_eq!(
             // SAFETY: Valid `host_ctx_ptr`.
-            unsafe {
-                bind_slot(
-                    host_ctx_ptr,
-                    StrView::from_str("prefab::hero"),
-                    FfiEntity::NULL,
-                )
-            },
+            unsafe { bind_slot(host_ctx_ptr, &raw const hero_name_view, FfiEntity::NULL) },
             FfiResult::INVALID_ENTITY
         );
         assert_eq!(
             // SAFETY: Valid `host_ctx_ptr`.
-            unsafe { host_bind_named_object(host_ctx_ptr, StrView::empty(), hero_ffi) },
+            unsafe { host_bind_named_object(host_ctx_ptr, &raw const empty_name_view, hero_ffi) },
             FfiResult::INVALID_ARGUMENT
         );
         let bad_utf8: [u8; 2] = [0xC3, 0x28];
+        let bad_name_view = StrView::from_slice(&bad_utf8);
         assert_eq!(
             // SAFETY: Valid `host_ctx_ptr` and slice.
-            unsafe {
-                host_bind_named_object(host_ctx_ptr, StrView::from_slice(&bad_utf8), hero_ffi)
-            },
+            unsafe { host_bind_named_object(host_ctx_ptr, &raw const bad_name_view, hero_ffi) },
             FfiResult::INVALID_UTF8
         );
 
         // Bind `prefab::hero` -> `hero_entity`.
         assert_eq!(
             // SAFETY: Valid `host_ctx_ptr` and entity.
-            unsafe { bind_slot(host_ctx_ptr, StrView::from_str("prefab::hero"), hero_ffi) },
+            unsafe { bind_slot(host_ctx_ptr, &raw const hero_name_view, hero_ffi) },
             FfiResult::OK
         );
 
@@ -1329,12 +1292,11 @@ fn named_objects_persistent_binding_uuid_rebind_and_reload_survival() {
         // SAFETY: `load_ctx` is live.
         let host_ctx_ptr = unsafe { host_load_host_ctx(load_ctx.as_ffi_ptr()) };
 
+        let hero_name_view = StrView::from_str("prefab::hero");
         // Rebind `prefab::hero` -> `hero_v2_entity`!
         assert_eq!(
             // SAFETY: Valid pointers.
-            unsafe {
-                host_bind_named_object(host_ctx_ptr, StrView::from_str("prefab::hero"), hero_v2_ffi)
-            },
+            unsafe { host_bind_named_object(host_ctx_ptr, &raw const hero_name_view, hero_v2_ffi) },
             FfiResult::OK
         );
         load_ctx.finish_init();

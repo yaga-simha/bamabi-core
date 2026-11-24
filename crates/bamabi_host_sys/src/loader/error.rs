@@ -43,6 +43,7 @@ pub enum ModLoadError {
     },
 
     /// Failed to open the shared library via OS dynamic linker (`dlopen` / `LoadLibrary`).
+    #[cfg(feature = "dynamic-loader")]
     #[error("failed to load mod '{path}': {source}")]
     DlOpen {
         /// Path passed to the loader.
@@ -52,7 +53,33 @@ pub enum ModLoadError {
         source: libloading::Error,
     },
 
+    /// Dynamic shared-library loading (`dlopen`) is disabled in `static-only` builds.
+    #[error("dynamic library loading is disabled (`dynamic-loader` feature off) for '{path}'")]
+    DynamicLoaderDisabled {
+        /// Path passed to the loader.
+        path: PathBuf,
+    },
+
+    /// Failed to unpack or verify a `.bampack` archive.
+    #[error("failed to unpack bampack '{path}': {detail}")]
+    BamPack {
+        /// `.bampack` file path.
+        path: PathBuf,
+        /// Human-readable error detail.
+        detail: String,
+    },
+
+    /// In-memory object or entrypoints loader failed prior to `bamabi_init`.
+    #[error("in-memory loader failed for '{label}': {detail}")]
+    InMemoryLoadFailed {
+        /// Virtual mod path or identifier.
+        label: String,
+        /// Human-readable failure detail.
+        detail: String,
+    },
+
     /// Shared library did not export the mandatory `bamabi_manifest` symbol.
+    #[cfg(feature = "dynamic-loader")]
     #[error("mod '{path}' is missing mandatory symbol 'bamabi_manifest': {source}")]
     MissingManifest {
         /// Path of the loaded library.
@@ -87,6 +114,7 @@ pub enum ModLoadError {
     },
 
     /// Required entry point (`bamabi_init` or `bamabi_shutdown`) was not exported.
+    #[cfg(feature = "dynamic-loader")]
     #[error("mod '{path}' is missing required symbol '{symbol}': {source}")]
     MissingEntryPoint {
         /// Path of the loaded library.

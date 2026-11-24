@@ -110,6 +110,10 @@ struct WireVTableFactory<T, B>(core::marker::PhantomData<(T, B)>);
 impl<T: Send + Sync + 'static, B: HostWireBridge<T>> WireVTableFactory<T, B> {
     const UUID: ComponentUuid = ComponentUuid::from_canonical_name(B::CANONICAL_NAME);
 
+    /// # Safety
+    ///
+    /// - `ptr` must be null or point to a properly aligned, initialized `T` valid for read access.
+    /// - `out_wire` must be null or point to writable, properly aligned storage for `B::Wire`.
     unsafe extern "C" fn get_shim(ptr: *const c_void, out_wire: *mut B::Wire) -> FfiResult {
         if ptr.is_null() || out_wire.is_null() {
             return FfiResult::NULL_POINTER;
@@ -128,6 +132,10 @@ impl<T: Send + Sync + 'static, B: HostWireBridge<T>> WireVTableFactory<T, B> {
         FfiResult::OK
     }
 
+    /// # Safety
+    ///
+    /// - `ptr` must be null or point to a properly aligned, initialized `T` with exclusive mutable access.
+    /// - `in_wire` must be null or point to readable, properly aligned `B::Wire` storage.
     unsafe extern "C" fn set_shim(ptr: *mut c_void, in_wire: *const B::Wire) -> FfiResult {
         if ptr.is_null() || in_wire.is_null() {
             return FfiResult::NULL_POINTER;
@@ -164,29 +172,41 @@ struct StringVTableFactory<T, B>(core::marker::PhantomData<(T, B)>);
 impl<T: Send + Sync + 'static, B: HostStringBridge<T>> StringVTableFactory<T, B> {
     const UUID: ComponentUuid = ComponentUuid::from_canonical_name(B::CANONICAL_NAME);
 
-    unsafe extern "C" fn get_shim(ptr: *const c_void) -> StrView {
-        if ptr.is_null() {
-            return StrView::empty();
-        }
-        let host_ptr = ptr.cast::<T>();
-        if !host_ptr.is_aligned() {
-            return StrView::empty();
-        }
-        // SAFETY: Caller guarantees `ptr` points to an initialized `T` valid for the borrow window.
-        let s = B::as_str(unsafe { &*host_ptr });
-        StrView::from_str(s)
-    }
-
-    unsafe extern "C" fn set_shim(ptr: *mut c_void, view: StrView) -> FfiResult {
-        if ptr.is_null() {
+    /// # Safety
+    ///
+    /// - `ptr` must be null or point to a properly aligned, initialized `T` valid for read access.
+    /// - `out_view` must be null or point to writable, properly aligned storage for `StrView`.
+    unsafe extern "C" fn get_shim(ptr: *const c_void, out_view: *mut StrView) -> FfiResult {
+        if ptr.is_null() || out_view.is_null() {
             return FfiResult::NULL_POINTER;
         }
         let host_ptr = ptr.cast::<T>();
-        if !host_ptr.is_aligned() {
+        if !host_ptr.is_aligned() || !out_view.is_aligned() {
             return FfiResult::INVALID_ARGUMENT;
         }
-        // SAFETY: `view.try_as_str()` validates alignment, nullness, and UTF-8.
-        let text = match unsafe { view.try_as_str() } {
+        // SAFETY: Caller guarantees `ptr` points to an initialized `T` valid for the borrow window.
+        let s = B::as_str(unsafe { &*host_ptr });
+        // SAFETY: `out_view` was verified non-null and aligned for `StrView`.
+        unsafe { core::ptr::write(out_view, StrView::from_str(s)) };
+        FfiResult::OK
+    }
+
+    /// # Safety
+    ///
+    /// - `ptr` must be null or point to a properly aligned, initialized `T` with exclusive mutable access.
+    /// - `view` must be null or point to an initialized, properly aligned `StrView` whose backing bytes are valid UTF-8.
+    unsafe extern "C" fn set_shim(ptr: *mut c_void, view: *const StrView) -> FfiResult {
+        if ptr.is_null() || view.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        let host_ptr = ptr.cast::<T>();
+        if !host_ptr.is_aligned() || !view.is_aligned() {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `view` was verified non-null and aligned for `StrView`.
+        let view_val = unsafe { core::ptr::read(view) };
+        // SAFETY: `view_val.try_as_str()` validates alignment, nullness, and UTF-8.
+        let text = match unsafe { view_val.try_as_str() } {
             Ok(s) => s,
             Err(err) => return err,
         };
@@ -219,6 +239,9 @@ fn insert_default_bridged<T: Component + Default>(world: &mut World, entity: Ent
     }
 }
 
+/// # Safety
+///
+/// - When `size_of::<E>() > 0`, `data` must be null or point to readable bytes containing a valid `E`.
 unsafe fn extract_entity_only_target_impl<E: EntityEvent + Copy>(
     data: *const u8,
 ) -> Option<Entity> {
@@ -245,6 +268,9 @@ const _: () = {
 /// `RelationshipTarget` component pointer (`Children` or slice-backed target).
 pub type ExtractRelationshipTargetsFn = unsafe fn(ptr: *const u8) -> (*const FfiEntity, usize);
 
+/// # Safety
+///
+/// - `ptr` must be null or point to a properly aligned, initialized `RT` valid for shared read access.
 unsafe fn extract_relationship_targets_impl<RT>(ptr: *const u8) -> (*const FfiEntity, usize)
 where
     RT: RelationshipTarget + core::ops::Deref<Target = [Entity]>,
@@ -784,6 +810,84 @@ impl RegistrySnapshot {
         let id = rec.addr.as_ptr().addr();
         (id != 0).then_some(id)
     }
+}
+
+fn with_world_registry_mut<R>(
+    world: &mut World,
+    f: impl FnOnce(&mut ModRegistry, &mut World) -> R,
+) -> R {
+    world.init_resource::<ModRegistry>();
+    world.resource_scope::<ModRegistry, _>(|world, mut reg| f(&mut reg, world))
+}
+
+/// Convenience helper registering a [`HostWireBridge`] `Component` directly against `world`'s
+/// [`ModRegistry`].
+pub fn register_bridged_component<T: Component, B: HostWireBridge<T>>(
+    world: &mut World,
+    extra_storage_flags: u32,
+    with_default: Option<InsertDefaultFn>,
+) -> Result<BamComponent, ComponentCollisionError> {
+    with_world_registry_mut(world, |reg, w| {
+        let comp_id = w.register_component::<T>();
+        reg.register_bridged_component::<T, B>(comp_id, extra_storage_flags, with_default)
+    })
+}
+
+/// Convenience helper registering a [`HostWireBridge`] singleton `Resource` directly against
+/// `world`'s [`ModRegistry`].
+pub fn register_bridged_resource<R: Resource, B: HostWireBridge<R>>(
+    world: &mut World,
+) -> Result<BamComponent, ComponentCollisionError> {
+    with_world_registry_mut(world, |reg, w| {
+        let comp_id = w.register_component::<R>();
+        reg.register_bridged_resource::<R, B>(comp_id)
+    })
+}
+
+/// Convenience helper registering a [`HostStringBridge`] `Component` directly against `world`'s
+/// [`ModRegistry`].
+pub fn register_bridged_string_component<T: Component, B: HostStringBridge<T>>(
+    world: &mut World,
+    extra_storage_flags: u32,
+    with_default: Option<InsertDefaultFn>,
+) -> Result<BamComponent, ComponentCollisionError> {
+    with_world_registry_mut(world, |reg, w| {
+        let comp_id = w.register_component::<T>();
+        reg.register_bridged_string_component::<T, B>(comp_id, extra_storage_flags, with_default)
+    })
+}
+
+/// Convenience helper registering an [`EntityEvent`] implementing `From<Entity>` directly against
+/// `world`'s [`ModRegistry`].
+pub fn register_bridged_entity_event<E>(
+    world: &mut World,
+    canonical_name: &str,
+    alias: Option<&str>,
+) -> Result<BamComponent, ComponentCollisionError>
+where
+    E: EntityEvent + Event + From<Entity> + Copy,
+    for<'a> E::Trigger<'a>: Default,
+{
+    with_world_registry_mut(world, |reg, w| {
+        reg.register_bridged_entity_event::<E>(w, canonical_name, alias)
+    })
+}
+
+/// Convenience helper registering an [`EntityEvent`] with a custom `EntityEventTriggerFn`
+/// directly against `world`'s [`ModRegistry`].
+pub fn register_bridged_entity_event_with<E>(
+    world: &mut World,
+    canonical_name: &str,
+    alias: Option<&str>,
+    trigger_entity_fn: EntityEventTriggerFn,
+) -> Result<BamComponent, ComponentCollisionError>
+where
+    E: EntityEvent + Event + Copy,
+    for<'a> E::Trigger<'a>: Default,
+{
+    with_world_registry_mut(world, |reg, w| {
+        reg.register_bridged_entity_event_with::<E>(w, canonical_name, alias, trigger_entity_fn)
+    })
 }
 
 #[cfg(test)]

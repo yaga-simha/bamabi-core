@@ -100,6 +100,8 @@ pub(crate) struct CachedQueryGroup {
     pub(crate) archetype_generation: ArchetypeGeneration,
     pub(crate) matched_tables: Vec<TableId>,
     pub(crate) matched_archetypes: Vec<ArchetypeId>,
+    pub(crate) table_has_masks: Vec<u32>,
+    pub(crate) arch_has_masks: Vec<u32>,
 }
 
 impl CachedQueryGroup {
@@ -117,6 +119,8 @@ impl CachedQueryGroup {
             archetype_generation: ArchetypeGeneration::initial(),
             matched_tables: Vec::new(),
             matched_archetypes: Vec::new(),
+            table_has_masks: Vec::new(),
+            arch_has_masks: Vec::new(),
         }
     }
 
@@ -135,11 +139,14 @@ impl CachedQueryGroup {
         self.archetype_generation = ArchetypeGeneration::initial();
         self.matched_tables.clear();
         self.matched_archetypes.clear();
+        self.table_has_masks.clear();
+        self.arch_has_masks.clear();
     }
 
     /// Incrementally updates `QueryState` against newly created archetypes and copies matched
     /// table/archetype IDs directly from Bevy's `FixedBitSet` cache.
     pub(crate) fn update_archetypes(&mut self, world: UnsafeWorldCell<'_>) {
+        self.sparse_scratch.ensure_terms(self.plan.terms.len());
         let new_gen = world.archetypes().generation();
         if self.archetype_generation == new_gen {
             return;
@@ -154,9 +161,44 @@ impl CachedQueryGroup {
         if self.is_dense {
             self.matched_tables.clear();
             self.matched_tables.extend(state.matched_tables());
+            self.table_has_masks.clear();
+            if !self.plan.has_indices.is_empty() {
+                // SAFETY: Shared read-only inspection of `Tables` during `update_archetypes`.
+                let tables = unsafe { &world.storages().tables };
+                self.table_has_masks.reserve(self.matched_tables.len());
+                for &tid in &self.matched_tables {
+                    let mut mask = 0u32;
+                    if let Some(table) = tables.get(tid) {
+                        for &raw_idx in &self.plan.has_indices {
+                            let idx = raw_idx as usize;
+                            if table.has_column(self.plan.terms[idx].component_id) {
+                                mask |= 1u32 << idx;
+                            }
+                        }
+                    }
+                    self.table_has_masks.push(mask);
+                }
+            }
         } else {
             self.matched_archetypes.clear();
             self.matched_archetypes.extend(state.matched_archetypes());
+            self.arch_has_masks.clear();
+            if !self.plan.has_indices.is_empty() {
+                let archetypes = world.archetypes();
+                self.arch_has_masks.reserve(self.matched_archetypes.len());
+                for &aid in &self.matched_archetypes {
+                    let mut mask = 0u32;
+                    if let Some(arch) = archetypes.get(aid) {
+                        for &raw_idx in &self.plan.has_indices {
+                            let idx = raw_idx as usize;
+                            if arch.contains(self.plan.terms[idx].component_id) {
+                                mask |= 1u32 << idx;
+                            }
+                        }
+                    }
+                    self.arch_has_masks.push(mask);
+                }
+            }
         }
     }
 }

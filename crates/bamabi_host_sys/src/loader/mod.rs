@@ -12,22 +12,30 @@ pub mod symbols;
 pub(crate) mod transaction;
 
 pub use error::{ModLoadError, is_abi_version_compatible};
+#[cfg(feature = "dynamic-loader")]
+pub use mod_host::prepare_dynamic_mod_in_world;
 pub use mod_host::{
-    LoadedMod, LoadedModInfo, ModHost, ModId, ModLoaded, ModScoped, ModUnloaded,
-    excise_and_unload_mod_for_reload_in_world, excise_and_unload_mod_in_world, load_mod_in_world,
-    record_mod_named_sets_in_world, restore_mod_state_in_world, rollback_unscheduled_mod_in_world,
-    save_mod_state_in_world, unload_all_mods_in_world,
+    BamResolveSymbolFn, InMemoryModEntrypoints, LoadedMod, LoadedModInfo, ModBacking, ModHost,
+    ModId, ModLoaded, ModScoped, ModUnloaded, PreparedModImage,
+    excise_and_unload_mod_for_reload_in_world, excise_and_unload_mod_in_world,
+    load_mod_from_entrypoints_in_world, load_mod_in_world, load_prepared_mod_in_world,
+    prepare_entrypoints_in_world, record_mod_named_sets_in_world, restore_mod_state_in_world,
+    rollback_unscheduled_mod_in_world, save_mod_state_in_world, unload_all_mods_in_world,
 };
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+pub use mod_host::{load_bampack_in_world, prepare_bampack_in_world};
 pub use schema_migration::{
     ExportedFieldRecord, ReloadColumnSnapshot, RetainedZeroCopyColumn, SnapshotComponentColumn,
     SnapshotEntityFields, cleanup_orphaned_mod_scoped_entities, migrate_mod_scoped_entities,
     restore_mod_dynamic_columns_after_reload, snapshot_mod_dynamic_columns_for_reload,
 };
+#[cfg(feature = "dynamic-loader")]
+pub use shared_lib::LoadedLibrary;
 #[cfg(feature = "signature-verification")]
 pub use shared_lib::preverify_mod_on_disk;
 pub use shared_lib::{
-    BinaryFormat, LibraryResidencyInfo, LoadOptions, canonical_mod_name_from_path,
-    inspect_library_residency, inspect_library_residency_file,
+    BinaryFormat, InMemoryObjectLoader, LibraryResidencyInfo, LoadOptions,
+    canonical_mod_name_from_path, inspect_library_residency, inspect_library_residency_file,
 };
 #[cfg(feature = "signature-verification")]
 pub use signing::{

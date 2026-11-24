@@ -1775,7 +1775,7 @@ fn sys_entity_children_guards_empty_targets_and_dynamic_missing_map() {
         )
         .with_world_and_queries(
             world.as_unsafe_world_cell_readonly(),
-            views,
+            &views,
             Tick::new(0),
             Tick::new(1),
         );
@@ -1808,7 +1808,7 @@ fn sys_entity_children_guards_empty_targets_and_dynamic_missing_map() {
         )
         .with_world_and_queries(
             world.as_unsafe_world_cell_readonly(),
-            views,
+            &views,
             Tick::new(0),
             Tick::new(1),
         );
@@ -1984,7 +1984,7 @@ fn sys_entity_children_guards_empty_targets_and_dynamic_missing_map() {
     )
     .with_world_and_queries(
         world.as_unsafe_world_cell_readonly(),
-        views,
+        &views,
         Tick::new(0),
         Tick::new(1),
     );

@@ -1,12 +1,14 @@
 //! Bevy [`Plugin`] types for initializing the native C-ABI modding host (`ABI 0.3.0`).
 
-pub use crate::app_ext::ModAppExt;
+#[cfg(feature = "dynamic-loader")]
+pub use crate::app_ext::ModLoaderAppExt;
+pub use crate::app_ext::{ModAppExt, ModRegistryAppExt};
 pub use crate::budgets::{
     ModBudgetBreach, ModBudgetBreachKind, ModBudgetExt, ModBudgetLimits, ModBudgetPolicy,
     ModBudgetSnapshot, ModBudgetTelemetry,
 };
 pub use crate::commands_ext::ModCommandsExt;
-pub use crate::events::{LoadedModInfo, ModLoaded, ModUnloaded};
+pub use crate::events::{LoadedModInfo, ModLoadFailed, ModLoaded, ModUnloaded};
 pub use crate::schedule_sets::{ModNamedSystemSet, ModScheduleMap, ModVisibleSets};
 pub use crate::world_ext::ModWorldExt;
 
@@ -175,6 +177,7 @@ impl Plugin for ConfiguredAbiModPlugin {
         // `ensure_world_mod_resources` initializes bare `World` resources.
         ensure_app_message::<ModBudgetBreach>(app);
         ensure_app_message::<ModLoaded>(app);
+        ensure_app_message::<ModLoadFailed>(app);
         ensure_app_message::<ModUnloaded>(app);
         ensure_app_message::<ModSystemFaulted>(app);
         ensure_startup_tracker(app);

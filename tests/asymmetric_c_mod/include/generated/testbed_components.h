@@ -954,8 +954,8 @@ typedef struct NameTag NameTag;
 
 typedef struct NameTagVTable {
     BamVTableHeader header;
-    BamStrView (*get_label)(const void* ptr);
-    BamResult  (*set_label)(void* ptr, BamStrView view);
+    BamResult (*get_label)(const void* ptr, BamStrView* out_view);
+    BamResult (*set_label)(void* ptr, const BamStrView* view);
 } NameTagVTable;
 BAM_STATIC_ASSERT(offsetof(NameTagVTable, header) == 0u, nametagvtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
@@ -1208,7 +1208,11 @@ public:
     const void* raw() const noexcept { return ptr_; }
     const NameTagVTable* vtable() const noexcept { return vt_; }
     BamStrView get_label() const noexcept {
-        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) ? vt_->get_label(ptr_) : BamStrView{nullptr, 0u};
+        BamStrView out{nullptr, 0u};
+        if (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) {
+            vt_->get_label(ptr_, &out);
+        }
+        return out;
     }
 private:
     const void* ptr_{nullptr};
@@ -1225,10 +1229,14 @@ public:
     const NameTagVTable* vtable() const noexcept { return vt_; }
     NameTagConstView as_const() const noexcept { return NameTagConstView(ptr_, vt_); }
     BamStrView get_label() const noexcept {
-        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) ? vt_->get_label(ptr_) : BamStrView{nullptr, 0u};
+        BamStrView out{nullptr, 0u};
+        if (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) {
+            vt_->get_label(ptr_, &out);
+        }
+        return out;
     }
     BamResult set_label(BamStrView view) noexcept {
-        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_label != nullptr) ? vt_->set_label(ptr_, view) : BAM_RESULT_NULL_POINTER;
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_label != nullptr) ? vt_->set_label(ptr_, &view) : BAM_RESULT_NULL_POINTER;
     }
     BamResult set_label(const char* cstr) noexcept {
         const BamStrView view{reinterpret_cast<const uint8_t*>(cstr), cstr != nullptr ? strlen(cstr) : 0u};
@@ -1247,8 +1255,8 @@ typedef struct MetadataTag MetadataTag;
 
 typedef struct MetadataTagVTable {
     BamVTableHeader header;
-    BamStrView (*get_label)(const void* ptr);
-    BamResult  (*set_label)(void* ptr, BamStrView view);
+    BamResult (*get_label)(const void* ptr, BamStrView* out_view);
+    BamResult (*set_label)(void* ptr, const BamStrView* view);
 } MetadataTagVTable;
 BAM_STATIC_ASSERT(offsetof(MetadataTagVTable, header) == 0u, metadatatagvtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
@@ -1501,7 +1509,11 @@ public:
     const void* raw() const noexcept { return ptr_; }
     const MetadataTagVTable* vtable() const noexcept { return vt_; }
     BamStrView get_label() const noexcept {
-        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) ? vt_->get_label(ptr_) : BamStrView{nullptr, 0u};
+        BamStrView out{nullptr, 0u};
+        if (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) {
+            vt_->get_label(ptr_, &out);
+        }
+        return out;
     }
 private:
     const void* ptr_{nullptr};
@@ -1518,10 +1530,14 @@ public:
     const MetadataTagVTable* vtable() const noexcept { return vt_; }
     MetadataTagConstView as_const() const noexcept { return MetadataTagConstView(ptr_, vt_); }
     BamStrView get_label() const noexcept {
-        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) ? vt_->get_label(ptr_) : BamStrView{nullptr, 0u};
+        BamStrView out{nullptr, 0u};
+        if (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) {
+            vt_->get_label(ptr_, &out);
+        }
+        return out;
     }
     BamResult set_label(BamStrView view) noexcept {
-        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_label != nullptr) ? vt_->set_label(ptr_, view) : BAM_RESULT_NULL_POINTER;
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_label != nullptr) ? vt_->set_label(ptr_, &view) : BAM_RESULT_NULL_POINTER;
     }
     BamResult set_label(const char* cstr) noexcept {
         const BamStrView view{reinterpret_cast<const uint8_t*>(cstr), cstr != nullptr ? strlen(cstr) : 0u};
@@ -5495,8 +5511,8 @@ typedef struct CInteropComponentVTable {
     BamResult (*set_health)(void* ptr, int32_t val);
     const void* (*ptr_pos)(const void* ptr);
     void*       (*ptr_mut_pos)(void* ptr);
-    BamStrView (*get_label)(const void* ptr);
-    BamResult  (*set_label)(void* ptr, BamStrView view);
+    BamResult (*get_label)(const void* ptr, BamStrView* out_view);
+    BamResult (*set_label)(void* ptr, const BamStrView* view);
 } CInteropComponentVTable;
 BAM_STATIC_ASSERT(offsetof(CInteropComponentVTable, header) == 0u, cinteropcomponentvtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
@@ -5755,7 +5771,11 @@ public:
         return (ptr_ != nullptr && vt_ != nullptr && vt_->ptr_pos != nullptr) ? vt_->ptr_pos(ptr_) : nullptr;
     }
     BamStrView get_label() const noexcept {
-        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) ? vt_->get_label(ptr_) : BamStrView{nullptr, 0u};
+        BamStrView out{nullptr, 0u};
+        if (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) {
+            vt_->get_label(ptr_, &out);
+        }
+        return out;
     }
 private:
     const void* ptr_{nullptr};
@@ -5784,10 +5804,14 @@ public:
         return (ptr_ != nullptr && vt_ != nullptr && vt_->ptr_mut_pos != nullptr) ? vt_->ptr_mut_pos(ptr_) : nullptr;
     }
     BamStrView get_label() const noexcept {
-        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) ? vt_->get_label(ptr_) : BamStrView{nullptr, 0u};
+        BamStrView out{nullptr, 0u};
+        if (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) {
+            vt_->get_label(ptr_, &out);
+        }
+        return out;
     }
     BamResult set_label(BamStrView view) noexcept {
-        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_label != nullptr) ? vt_->set_label(ptr_, view) : BAM_RESULT_NULL_POINTER;
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_label != nullptr) ? vt_->set_label(ptr_, &view) : BAM_RESULT_NULL_POINTER;
     }
     BamResult set_label(const char* cstr) noexcept {
         const BamStrView view{reinterpret_cast<const uint8_t*>(cstr), cstr != nullptr ? strlen(cstr) : 0u};

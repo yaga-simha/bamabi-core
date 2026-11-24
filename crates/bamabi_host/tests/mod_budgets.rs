@@ -912,6 +912,9 @@ fn telemetry_reports_matched_entities_tables_and_summary_tick_skips() {
     .with_mod_id(mod_id)
     .with_mod_namespace("summary_mod");
     app.add_systems(Update, sys);
+    app.world()
+        .resource::<ModBudgetTelemetry>()
+        .set_observing(true);
 
     // Frame 1: all 10 entities newly added -> 2 matched tables, 0 skipped, 10 matched entities.
     app.update();
@@ -1109,4 +1112,249 @@ fn budget_limits_zero_window_and_breaches_clamp_to_one() {
         .with_max_consecutive_breaches(0);
     assert_eq!(lim.effective_window_size(), 1);
     assert_eq!(lim.effective_max_consecutive_breaches(), 1);
+}
+
+#[test]
+fn budget_runtime_fast_path_skips_overhead_when_unlimited_and_not_observing() {
+    use bamabi_host::ModBudgetSnapshot;
+    use bamabi_host_sys::ModBudgetRuntime;
+    use bamabi_sys::{
+        SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC, ScheduleId,
+        TELEMETRY_FLAG_BUDGET_BREACHED, TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE, fnv1a_64_hash_system,
+    };
+
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+
+    // Unlimited default policy + observing == false -> `is_active_or_observing()` is false!
+    assert!(
+        !app.world()
+            .resource::<ModBudgetRuntime>()
+            .is_active_or_observing()
+    );
+    assert!(!app.world().resource::<ModBudgetTelemetry>().is_observing());
+
+    // Enabling telemetry observation flips `active_or_observing` on; disabling flips it off.
+    app.world()
+        .resource::<ModBudgetTelemetry>()
+        .set_observing(true);
+    assert!(app.world().resource::<ModBudgetTelemetry>().is_observing());
+    assert!(
+        app.world()
+            .resource::<ModBudgetRuntime>()
+            .is_active_or_observing()
+    );
+    app.world()
+        .resource::<ModBudgetTelemetry>()
+        .set_observing(false);
+    assert!(
+        !app.world()
+            .resource::<ModBudgetRuntime>()
+            .is_active_or_observing()
+    );
+
+    // Enabling a finite policy limit also activates runtime tracking.
+    app.world_mut()
+        .resource_mut::<ModBudgetPolicy>()
+        .max_spawns_per_frame = Some(10);
+    app.update();
+    assert!(
+        app.world()
+            .resource::<ModBudgetRuntime>()
+            .is_active_or_observing()
+    );
+
+    // Verify `ModBudgetSnapshot::to_telemetry_digest64` packs all fields cleanly.
+    let mut snap = ModBudgetSnapshot {
+        mod_id: Some(ModId(7)),
+        mod_name: "alpha_mod".to_owned(),
+        system_name: "tick_sys".to_owned(),
+        p50_us: 12,
+        p99_us: 23,
+        last_duration_us: 15,
+        matched_entities: 64,
+        matched_tables: 3,
+        skipped_summary_tick_tables: 1,
+        chunks_yielded: 4,
+        commands_queued: 5,
+        arena_bytes_peak: 1024,
+        spawns_last_frame: 2,
+        breach_count: 5,
+        consecutive_p99_breaches: 2,
+        quarantined: false,
+    };
+    let digest = snap.to_telemetry_digest64("alpha_mod", "tick_sys", ScheduleId::UPDATE, 0x0001);
+    assert_eq!(digest.magic, SYSTEM_TELEMETRY_MAGIC);
+    assert_eq!(digest.version, SYSTEM_TELEMETRY_DIGEST_VERSION);
+    assert_eq!(digest.mod_id, 7);
+    assert_eq!(
+        digest.system_hash,
+        fnv1a_64_hash_system("alpha_mod", "tick_sys")
+    );
+    assert_eq!(
+        digest.flags,
+        0x0001 | TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE | TELEMETRY_FLAG_BUDGET_BREACHED
+    );
+    assert_eq!(digest.matched_entities, 64);
+    assert_eq!(digest.matched_tables, 3);
+    assert_eq!(digest.skipped_summary_tick_tables, 1);
+    assert_eq!(digest.chunks, 4);
+    assert_eq!(digest.p50_us, 12);
+    assert_eq!(digest.p99_us, 23);
+    assert_eq!(digest.commands_queued, 5);
+    snap.skipped_summary_tick_tables = 0;
+    let digest_no_skip = snap.to_telemetry_digest64("", "", ScheduleId::UPDATE, 0);
+    assert_eq!(
+        digest_no_skip.system_hash,
+        fnv1a_64_hash_system("alpha_mod", "tick_sys")
+    );
+}
+
+#[test]
+fn par_for_each_chunk_ex_enforces_cumulative_max_arena_bytes_across_workers() {
+    use bamabi_sys::{AccessMode, BamParOptions, BamTermDesc, FfiEntity};
+
+    #[repr(C)]
+    struct ParQuotaState {
+        extra_h: BamComponent,
+        cmd_oks: AtomicUsize,
+        cmd_errs: AtomicUsize,
+    }
+
+    unsafe extern "C" fn par_worker_insert(
+        iter: *mut BamIter,
+        commands: *mut BamCommands,
+        _part_idx: usize,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        // SAFETY: `user_data` points to `ParQuotaState` for this synchronous parallel invocation.
+        let state = unsafe { &*(user_data.cast::<ParQuotaState>()) };
+        let mut chunk_len = 0usize;
+        // SAFETY: `iter` is active for this partition.
+        while unsafe { (HOST_API.iter_next_chunk.unwrap())(iter, &raw mut chunk_len) }.get() {
+            // SAFETY: `iter` holds an active chunk of `chunk_len` entities.
+            let ents_ptr = unsafe { (HOST_API.iter_entities.unwrap())(iter) };
+            for i in 0..chunk_len {
+                // SAFETY: `i < chunk_len`.
+                let ent: FfiEntity = unsafe { *ents_ptr.add(i) };
+                let tag = ExtraTag { id: i as u32 };
+                // SAFETY: `commands` is active for this partition and `tag` is 4 bytes.
+                let rc = unsafe {
+                    (HOST_API.cmd_insert.unwrap())(
+                        commands,
+                        ent,
+                        state.extra_h,
+                        (&raw const tag).cast::<u8>(),
+                        core::mem::size_of::<ExtraTag>(),
+                    )
+                };
+                if rc.is_ok() {
+                    state.cmd_oks.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    assert_eq!(rc, FfiResult::CAPACITY_EXCEEDED);
+                    state.cmd_errs.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn par_driver_sys(
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        // SAFETY: `sys_ctx` is active and declares query 0.
+        let st = unsafe { (HOST_API.sys_query.unwrap())(sys_ctx, 0, &raw mut iter) };
+        if st.is_err() {
+            return st;
+        }
+        let opts = BamParOptions::new()
+            .with_chunk_size(2)
+            .with_max_partitions(4);
+        // SAFETY: `iter`, `par_worker_insert`, `user_data`, and `opts` are valid.
+        unsafe {
+            (HOST_API.par_for_each_chunk_ex.unwrap())(
+                iter,
+                Some(par_worker_insert),
+                user_data,
+                &raw const opts,
+            )
+        }
+    }
+
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.set_mod_budget_policy(ModBudgetPolicy::from_limits(
+        ModBudgetLimits::unlimited().with_max_arena_bytes_per_system(Some(40)),
+    ));
+
+    let pos_h = app
+        .register_mod_component::<SummaryPos>(ComponentOptions::new().with_raw_insert())
+        .unwrap();
+    let extra_h = app
+        .register_mod_component::<ExtraTag>(ComponentOptions::new().with_raw_insert())
+        .unwrap();
+
+    for i in 0..20 {
+        app.world_mut().spawn(SummaryPos {
+            x: i as f32,
+            y: 0.0,
+        });
+    }
+
+    let state = Box::new(ParQuotaState {
+        extra_h,
+        cmd_oks: AtomicUsize::new(0),
+        cmd_errs: AtomicUsize::new(0),
+    });
+
+    let reg = app.world().resource::<ModRegistry>().clone();
+    let mod_id = ModId(505);
+    let sys = GuestSystem::new(
+        "par_quota_sys",
+        vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+            pos_h,
+            AccessMode::READ,
+        )])],
+        par_driver_sys,
+        (&*state as *const ParQuotaState)
+            .cast_mut()
+            .cast::<c_void>(),
+        reg,
+    )
+    .with_mod_id(mod_id)
+    .with_mod_namespace("par_quota_mod");
+    app.add_systems(Update, sys);
+    app.update();
+
+    let oks = state.cmd_oks.load(Ordering::Relaxed);
+    let errs = state.cmd_errs.load(Ordering::Relaxed);
+    assert_eq!(oks + errs, 20);
+    assert!(
+        oks <= 10,
+        "cumulative 4B inserts across workers cannot exceed 40B cap (oks={oks})"
+    );
+    assert!(errs > 0, "overflowing worker inserts must be rejected");
+
+    let snap = app
+        .world()
+        .resource::<ModBudgetTelemetry>()
+        .system_snapshot(Some(mod_id), "par_quota_sys")
+        .expect("telemetry snapshot recorded");
+    assert!(
+        snap.arena_bytes_peak <= 40,
+        "arena_bytes_peak ({}) exceeded 40B limit",
+        snap.arena_bytes_peak
+    );
+    assert!(snap.breach_count > 0, "breach_count must be > 0");
+
+    let breaches = app.world().resource::<Messages<ModBudgetBreach>>();
+    assert!(!breaches.is_empty());
+    let mut cursor = breaches.get_cursor();
+    assert!(
+        cursor
+            .read(breaches)
+            .any(|b| b.mod_id == Some(mod_id) && b.kind == ModBudgetBreachKind::ArenaBytesExceeded)
+    );
 }

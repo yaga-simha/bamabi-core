@@ -41,7 +41,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const DEFAULT_SMOKE_SOAK_CYCLES: usize = 250;
-const FULL_SOAK_CYCLES: usize = 10_000;
 const MIGRATE_STRIDE: usize = 20; // 500 live v1 <-> v2 `migrate_component_column` flips in 10,000 cycles
 const PERSISTENT_ENTITIES: usize = 16;
 
@@ -301,7 +300,7 @@ mod logic {
                     Ok(info) => info,
                     Err(e) => return e,
                 };
-                if info.schema_fingerprint == PosV2::SCHEMA_FINGERPRINT {
+                if info.schema_fingerprint == <PosV2 as ModComponent>::SCHEMA_FINGERPRINT {
                     let rc = app.migrate_component_column::<PosV2, PosV1, _>(existing, |old| {
                         Ok(PosV1 {
                             x: old.x as f32,
@@ -486,7 +485,7 @@ mod logic {
                     Ok(info) => info,
                     Err(e) => return e,
                 };
-                if info.schema_fingerprint == PosV1::SCHEMA_FINGERPRINT {
+                if info.schema_fingerprint == <PosV1 as ModComponent>::SCHEMA_FINGERPRINT {
                     let rc = app.migrate_component_column::<PosV1, PosV2, _>(existing, |old| {
                         Ok(PosV2 {
                             x: f64::from(old.x),
@@ -1019,21 +1018,26 @@ fn soak_10000_consecutive_reloads_latency_drop_pages_and_rss() {
         "every single transient DropChurn entity's foreign destructor must execute across all reloads"
     );
 
-    let gen_delta = drop_gen_end.saturating_sub(drop_gen_start);
-    assert_eq!(
-        gen_delta, total_cycles as u64,
-        "DROP_PAGES slot {drop_slot_idx} generation must advance exactly once per reload (expected {total_cycles}, got {gen_delta})"
+    // Under atomic non-destructive reload, `DropChurn`'s DROP_PAGES slot is handed off in-place
+    // via `StagedDropBinding` without recycling mid-reload (keeping `live_values` and rollback
+    // snapshots intact); final `unload_mod` below must recycle the slot and bump generation + 1.
+    assert!(
+        drop_gen_end >= drop_gen_start,
+        "DROP_PAGES slot {drop_slot_idx} generation must never regress across {total_cycles} reloads (start={drop_gen_start}, end={drop_gen_end})"
     );
-    if total_cycles >= FULL_SOAK_CYCLES {
-        assert!(
-            gen_delta > MAX_DROP_TRAMPOLINES as u64,
-            "DROP_PAGES generation churn ({gen_delta}) must exceed MAX_DROP_TRAMPOLINES ({MAX_DROP_TRAMPOLINES})"
-        );
-    }
 
-    // Final permanent unload must return every single DROP_PAGES slot to the global free list.
+    // Final permanent unload must return every single DROP_PAGES slot to the global free list
+    // and advance the recycled slot's generation.
     app.unload_mod(current_mod_id)
         .expect("final unload_mod succeeds");
+    let gen_after_unload =
+        drop_slot_generation(drop_slot_idx).expect("drop slot generation present after unload");
+    assert_eq!(
+        gen_after_unload,
+        drop_gen_end + 1,
+        "DROP_PAGES slot {drop_slot_idx} generation must advance on final unload after {total_cycles} reloads"
+    );
+    let gen_delta = gen_after_unload.saturating_sub(drop_gen_start);
     assert_eq!(
         available_drop_trampoline_slots(),
         baseline_free_drop_slots,

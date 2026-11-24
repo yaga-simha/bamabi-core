@@ -39,11 +39,13 @@ use bevy_ecs::{
     entity::Entity,
     ptr::OwningPtr,
     resource::IsResource,
+    storage::TableRow,
     world::World,
 };
 use bevy_platform::collections::HashSet;
 #[cfg(feature = "bridge-reflect")]
 use bevy_reflect::{Reflect, ReflectFromPtr};
+use nonmax::NonMaxU32;
 
 use crate::{
     ffi::register::DynamicComponentHookMap,
@@ -61,9 +63,9 @@ type BamFieldInfoFn = unsafe extern "C" fn(
 pub(crate) type BamInitDefaultFn = unsafe extern "C" fn(dst: *mut c_void) -> FfiResult;
 pub(crate) type BamExportFieldsSinkFn = unsafe extern "C" fn(
     ctx: *mut c_void,
-    field_name: StrView,
-    type_tag: StrView,
-    payload: FfiSlice<u8>,
+    field_name: *const StrView,
+    type_tag: *const StrView,
+    payload: *const FfiSlice<u8>,
 ) -> FfiResult;
 pub(crate) type BamExportFieldsFn = unsafe extern "C" fn(
     src_ptr: *const c_void,
@@ -72,9 +74,9 @@ pub(crate) type BamExportFieldsFn = unsafe extern "C" fn(
 ) -> FfiResult;
 pub(crate) type BamImportFieldFn = unsafe extern "C" fn(
     dst_ptr: *mut c_void,
-    field_name: StrView,
-    type_tag: StrView,
-    payload: FfiSlice<u8>,
+    field_name: *const StrView,
+    type_tag: *const StrView,
+    payload: *const FfiSlice<u8>,
 ) -> FfiResult;
 
 /// Metadata for a single non-skipped field reported by `"bam.v0.<name>.field_info"`.
@@ -118,32 +120,50 @@ fn resolve_witness_symbol_in_world(
     None
 }
 
+/// Callback sink invoked synchronously by `"bam.v0.<name>.export_fields"` witnesses.
+///
+/// # Safety
+///
+/// - `ctx` must point to a valid, exclusively accessible `Vec<ExportedFieldRecord>`.
+/// - `field_name`, `type_tag`, and `payload` must point to properly aligned, initialized
+///   `StrView` / `FfiSlice<u8>` descriptors whose referenced slices remain valid for this call.
 pub(crate) unsafe extern "C" fn collect_witness_export_sink(
     ctx: *mut c_void,
-    field_name: StrView,
-    type_tag: StrView,
-    payload: FfiSlice<u8>,
+    field_name: *const StrView,
+    type_tag: *const StrView,
+    payload: *const FfiSlice<u8>,
 ) -> FfiResult {
-    if ctx.is_null() {
+    if ctx.is_null() || field_name.is_null() || type_tag.is_null() || payload.is_null() {
         return FfiResult::NULL_POINTER;
     }
+    if !field_name.is_aligned() || !type_tag.is_aligned() || !payload.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    // SAFETY: `field_name`, `type_tag`, and `payload` were verified non-null and aligned above.
+    let (field_name_val, type_tag_val, payload_val) = unsafe {
+        (
+            core::ptr::read(field_name),
+            core::ptr::read(type_tag),
+            core::ptr::read(payload),
+        )
+    };
     // SAFETY: `ctx` points to a stack-local `&mut Vec<ExportedFieldRecord>` valid for this call.
     let out = unsafe { &mut *ctx.cast::<Vec<ExportedFieldRecord>>() };
-    // SAFETY: Witness guarantees `field_name` points to initialized UTF-8 bytes.
-    let Ok(name_str) = (unsafe { field_name.try_as_str() }) else {
+    // SAFETY: Witness guarantees `field_name_val` points to initialized UTF-8 bytes.
+    let Ok(name_str) = (unsafe { field_name_val.try_as_str() }) else {
         return FfiResult::INVALID_UTF8;
     };
-    // SAFETY: Witness guarantees `type_tag` points to initialized UTF-8 bytes.
-    let Ok(tag_str) = (unsafe { type_tag.try_as_str() }) else {
+    // SAFETY: Witness guarantees `type_tag_val` points to initialized UTF-8 bytes.
+    let Ok(tag_str) = (unsafe { type_tag_val.try_as_str() }) else {
         return FfiResult::INVALID_UTF8;
     };
-    let bytes = if payload.len == 0 {
+    let bytes = if payload_val.len == 0 {
         Vec::new()
-    } else if payload.ptr.is_null() {
+    } else if payload_val.ptr.is_null() {
         return FfiResult::NULL_POINTER;
     } else {
-        // SAFETY: `payload` is non-null and readable for `payload.len` bytes for this call.
-        unsafe { payload.as_slice() }.to_vec()
+        // SAFETY: `payload_val` is non-null and readable for `payload_val.len` bytes for this call.
+        unsafe { payload_val.as_slice() }.to_vec()
     };
     out.push(ExportedFieldRecord {
         field_name: name_str.to_owned(),
@@ -186,14 +206,16 @@ fn apply_fields_to_raw_ptr(
         } else {
             FfiSlice::from_slice(&field.bytes)
         };
+        let name_view = StrView::from_str(&field.field_name);
+        let tag_view = StrView::from_str(&field.type_tag);
         // SAFETY: Caller guarantees `dst_ptr` points to a valid initialized mutable value matching
-        // `import_fn`; `StrView`s and `FfiSlice` borrow valid stack/heap memory for this call.
+        // `import_fn`; stack `name_view`, `tag_view`, and `slice` borrow valid memory for this call.
         let status = unsafe {
             import_fn(
                 dst_ptr,
-                StrView::from_str(&field.field_name),
-                StrView::from_str(&field.type_tag),
-                slice,
+                &raw const name_view,
+                &raw const tag_view,
+                &raw const slice,
             )
         };
         if status.is_ok() || (ignore_not_found && status == FfiResult::NOT_FOUND) {
@@ -2953,6 +2975,222 @@ pub fn extract_resource_between_worlds(
         ent_mut.insert_by_id(target_cid, owning);
     }
     Ok(true)
+}
+
+/// Captures `(Entity, Vec<u8>)` raw POD payloads across all ECS tables (or sparse-set storage)
+/// for `component`, sorted deterministically by `Entity::to_bits()`.
+pub fn read_table_column_bytes(
+    world: &World,
+    component: BamComponent,
+) -> Result<Vec<(Entity, Vec<u8>)>, FfiResult> {
+    let registry = world
+        .get_resource::<ModRegistry>()
+        .ok_or(FfiResult::INVALID_STATE)?;
+    let entry = registry
+        .get_by_handle(component)
+        .ok_or(FfiResult::INVALID_COMPONENT)?;
+    if entry.is_resource() || entry.is_message() || entry.is_event() {
+        return Err(FfiResult::INVALID_COMPONENT);
+    }
+    if !entry.is_abi_pod || entry.drop_fn.is_some() {
+        return Err(FfiResult::TYPE_MISMATCH);
+    }
+
+    let mut rows = Vec::new();
+    if entry.is_sparse_set() {
+        if let Some(sparse_set) = world.storages().sparse_sets.get(entry.component_id) {
+            for arch in world.archetypes().iter() {
+                if arch.is_empty() || !arch.contains(entry.component_id) {
+                    continue;
+                }
+                for ae in arch.entities() {
+                    let entity = ae.id();
+                    let Some(ptr) = sparse_set.get(entity) else {
+                        continue;
+                    };
+                    let mut bytes = vec![0u8; entry.size];
+                    if entry.size > 0 {
+                        // SAFETY: `entry.is_abi_pod` guarantees `ptr` holds `entry.size`
+                        // initialized padding-free POD bytes disjoint from `bytes`.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                ptr.as_ptr(),
+                                bytes.as_mut_ptr(),
+                                entry.size,
+                            );
+                        }
+                    }
+                    rows.push((entity, bytes));
+                }
+            }
+        }
+    } else {
+        for table in world.storages().tables.iter() {
+            if table.is_empty() {
+                continue;
+            }
+            let Some(col) = table.get_column(entry.component_id) else {
+                continue;
+            };
+            let base = if entry.size == 0 {
+                NonNull::<u8>::dangling().as_ptr()
+            } else {
+                // SAFETY: `table.is_empty()` was checked false, so row `0` is in bounds of `col`'s
+                // contiguous storage allocation with full column provenance.
+                unsafe {
+                    col.get_data_unchecked(TableRow::new(NonMaxU32::ZERO))
+                        .as_ptr()
+                }
+            };
+            for (row_idx, &entity) in table.entities().iter().enumerate() {
+                let mut bytes = vec![0u8; entry.size];
+                if entry.size > 0 {
+                    // SAFETY: `row_idx < table.entity_count()` and `col` stores contiguous
+                    // initialized `entry.size`-byte elements with no padding (`entry.is_abi_pod`).
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            base.add(row_idx.saturating_mul(entry.size)),
+                            bytes.as_mut_ptr(),
+                            entry.size,
+                        );
+                    }
+                }
+                rows.push((entity, bytes));
+            }
+        }
+    }
+    rows.sort_by_key(|(e, _)| e.to_bits());
+    Ok(rows)
+}
+
+/// Computes a deterministic 64-bit FNV-1a checksum across all live POD components and POD singleton
+/// resources registered in `world`'s [`ModRegistry`].
+pub fn hash_world_pod_state(world: &World) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let feed = |h: &mut u64, bytes: &[u8]| {
+        for &b in bytes {
+            *h ^= u64::from(b);
+            *h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+
+    let Some(registry) = world.get_resource::<ModRegistry>() else {
+        return hash;
+    };
+    let snap = registry.snapshot();
+    let mut pod_entries: Vec<&RegisteredComponent> = snap
+        .entries()
+        .iter()
+        .filter(|e| e.is_abi_pod && e.drop_fn.is_none() && !e.is_message() && !e.is_event())
+        .collect();
+    pod_entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    for entry in pod_entries {
+        feed(&mut hash, entry.uuid.as_bytes());
+        feed(&mut hash, &(entry.size as u64).to_le_bytes());
+        if entry.is_resource() {
+            if let Some(ptr) = world.get_resource_by_id(entry.component_id) {
+                feed(&mut hash, &[1u8]);
+                if entry.size > 0 {
+                    // SAFETY: `entry.is_abi_pod` guarantees `entry.size` initialized POD bytes.
+                    let slice = unsafe { core::slice::from_raw_parts(ptr.as_ptr(), entry.size) };
+                    feed(&mut hash, slice);
+                }
+            }
+        } else if let Ok(mut rows) = read_table_column_bytes(world, entry.handle) {
+            rows.sort_by_key(|(ent, _)| ent.to_bits());
+            feed(&mut hash, &(rows.len() as u64).to_le_bytes());
+            for (ent, bytes) in rows {
+                feed(&mut hash, &ent.to_bits().to_le_bytes());
+                feed(&mut hash, &bytes);
+            }
+        }
+    }
+    hash
+}
+
+/// Atomically validates a bundle of `(BamComponent, &[u8])` POD payloads, spawns a fresh entity,
+/// and inserts all components onto it.
+pub fn spawn_entity_pod_bundle(
+    world: &mut World,
+    components: &[(BamComponent, &[u8])],
+) -> Result<Entity, FfiResult> {
+    struct PreparedBundleItem<'a> {
+        entry: RegisteredComponent,
+        bytes: &'a [u8],
+    }
+
+    let prepared: Vec<PreparedBundleItem<'_>> = {
+        let registry = world
+            .get_resource::<ModRegistry>()
+            .ok_or(FfiResult::INVALID_STATE)?;
+        let mut seen = Vec::with_capacity(components.len());
+        let mut items = Vec::with_capacity(components.len());
+        for &(handle, bytes) in components {
+            if seen.contains(&handle) {
+                return Err(FfiResult::INVALID_ARGUMENT);
+            }
+            seen.push(handle);
+            let entry = registry
+                .get_by_handle(handle)
+                .cloned()
+                .ok_or(FfiResult::INVALID_COMPONENT)?;
+            if entry.is_resource() || entry.is_message() || entry.is_event() {
+                return Err(FfiResult::INVALID_COMPONENT);
+            }
+            if !entry.is_abi_pod || entry.drop_fn.is_some() {
+                return Err(FfiResult::TYPE_MISMATCH);
+            }
+            if bytes.len() != entry.size {
+                return Err(FfiResult::INVALID_ARGUMENT);
+            }
+            if !entry.is_dynamic && entry.insert_raw_fn.is_none() {
+                return Err(FfiResult::PERMISSION_DENIED);
+            }
+            items.push(PreparedBundleItem { entry, bytes });
+        }
+        items
+    };
+
+    let mut aligned_bufs = Vec::with_capacity(prepared.len());
+    for item in &prepared {
+        let buf = AlignedBuf::new_zeroed(item.entry.size, item.entry.align)?;
+        if !item.bytes.is_empty() && item.entry.size > 0 {
+            // SAFETY: `item.bytes.len() == item.entry.size` was validated above and `buf` is disjoint.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    item.bytes.as_ptr(),
+                    buf.as_mut_ptr(),
+                    item.entry.size,
+                );
+            }
+        }
+        aligned_bufs.push(buf);
+    }
+
+    let entity = world.spawn_empty().id();
+    for (item, buf) in prepared.into_iter().zip(aligned_bufs) {
+        if !item.entry.is_dynamic
+            && let Some(insert_raw) = item.entry.insert_raw_fn
+        {
+            // SAFETY: `buf` holds `item.entry.size` aligned POD bytes matching `insert_raw`.
+            unsafe {
+                insert_raw(world, entity, buf.non_null().as_ptr());
+            }
+        } else {
+            let mut ent_mut = world
+                .get_entity_mut(entity)
+                .map_err(|_| FfiResult::INVALID_ENTITY)?;
+            let nn = buf.non_null();
+            // SAFETY: `nn` holds `item.entry.size` aligned POD bytes for `item.entry.component_id`.
+            let owning = unsafe { OwningPtr::new(nn) };
+            // SAFETY: `item.entry.component_id` was registered in `world` with matching layout.
+            unsafe {
+                ent_mut.insert_by_id(item.entry.component_id, owning);
+            }
+        }
+    }
+    Ok(entity)
 }
 
 #[cfg(test)]

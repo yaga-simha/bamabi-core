@@ -1,4 +1,4 @@
-//! Canonical ABI `0.3.0` Benchmark Suite.
+//! Canonical ABI `0.4.0` Benchmark Suite.
 //!
 //! Unifies the nine core `bamabi` performance scenarios into a single zero-dependency,
 //! Criterion-compatible benchmark harness (`--bench`, `--test`, `--quick`, and substring filter
@@ -2311,7 +2311,7 @@ fn main() {
 
     println!("================================================================================");
     println!(
-        " bamabi Canonical Benchmark Suite (ABI 0.3.0) [mode={}]",
+        " bamabi Canonical Benchmark Suite (ABI 0.4.0) [mode={}]",
         if cfg.test_mode {
             "smoke-test"
         } else if cfg.quick_mode {

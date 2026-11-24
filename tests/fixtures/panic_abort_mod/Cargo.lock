@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "bamabi_guest"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#23053a118f530112e729fa6252a9070cf9f169a9"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#215fc46f213d760c5f167d3f7841d69a55697ab3"
 dependencies = [
  "bamabi_guest_sys",
  "bamabi_sys",
@@ -13,20 +13,28 @@ dependencies = [
 
 [[package]]
 name = "bamabi_guest_sys"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#23053a118f530112e729fa6252a9070cf9f169a9"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#215fc46f213d760c5f167d3f7841d69a55697ab3"
 dependencies = [
  "bamabi_sys",
 ]
 
 [[package]]
+name = "bamabi_schema"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#215fc46f213d760c5f167d3f7841d69a55697ab3"
+
+[[package]]
 name = "bamabi_sys"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#23053a118f530112e729fa6252a9070cf9f169a9"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#215fc46f213d760c5f167d3f7841d69a55697ab3"
+dependencies = [
+ "bamabi_schema",
+]
 
 [[package]]
 name = "panic_abort_mod"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_guest",
 ]

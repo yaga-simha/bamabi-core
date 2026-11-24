@@ -23,6 +23,7 @@ use nonmax::NonMaxU32;
 
 use crate::{
     ffi::register::DynamicComponentHookMap,
+    ffi::relations::ModRelationGraph,
     handle_header::{
         decode_live_entity, ffi_try, init_out_ptr, validate_iter_ref, validate_sys_ctx_ref,
     },
@@ -152,6 +153,8 @@ enum RelationLayout {
     Entity4,
     /// Zero-sized `DynamicComponentHookMap` relationship target component (`parent -> [children]`).
     DynamicTarget,
+    /// Typed [`ModRelationGraph`] edge relationship (`child -> target` via `graph.first_target`).
+    ModRelation(BamComponent),
 }
 
 #[inline]
@@ -176,6 +179,12 @@ fn classify_relation_layout(
             .is_some_and(|hm| hm.is_relationship_target(relation_id));
         if is_dyn_target {
             return Some(RelationLayout::DynamicTarget);
+        }
+        // SAFETY: `ModRelationGraph` is never mutably borrowed concurrently with system execution.
+        if let Some(rel_handle) = unsafe { world.get_resource::<ModRelationGraph>() }
+            .and_then(|g| g.handle_by_component_id(relation_id))
+        {
+            return Some(RelationLayout::ModRelation(rel_handle));
         }
     }
     None
@@ -217,7 +226,7 @@ unsafe fn extract_parent_from_raw(
                 .is_index_spawned(idx)
                 .then(|| entities.resolve_from_index(idx))
         }
-        RelationLayout::DynamicTarget => None,
+        RelationLayout::DynamicTarget | RelationLayout::ModRelation(_) => None,
     }
 }
 
@@ -241,6 +250,7 @@ struct CachedRelationHierarchy {
     last_checked_tick: Tick,
     archetype_gen: ArchetypeGeneration,
     removed_cursor: MessageCursor<RemovedComponentEntity>,
+    cached_removed_len: usize,
     matched_tables: Vec<TableId>,
     matched_archetypes: Vec<ArchetypeId>,
     cached_edge_count: usize,
@@ -259,6 +269,7 @@ impl Default for CachedRelationHierarchy {
             last_checked_tick: Tick::new(0),
             archetype_gen: ArchetypeGeneration::initial(),
             removed_cursor: MessageCursor::default(),
+            cached_removed_len: 0,
             matched_tables: Vec::new(),
             matched_archetypes: Vec::new(),
             cached_edge_count: 0,
@@ -388,6 +399,9 @@ impl CachedRelationHierarchy {
             let (count, hash) =
                 self.compute_dynamic_target_fingerprint(world, relation, storage_type);
             return count != self.cached_edge_count || hash != self.cached_dynamic_hash;
+        }
+        if matches!(layout, RelationLayout::ModRelation(_)) {
+            return true;
         }
 
         // 3. Check `Changed` ticks and live entity counts across matching storages.
@@ -541,6 +555,7 @@ impl CachedRelationHierarchy {
                     self.cached_dynamic_hash = edge_hash;
                 }
             }
+            RelationLayout::ModRelation(_) => {}
             RelationLayout::ChildOf | RelationLayout::Entity8 | RelationLayout::Entity4 => {
                 match storage_type {
                     StorageType::Table => {
@@ -692,6 +707,10 @@ impl CachedRelationHierarchy {
 
         self.built = true;
         self.last_checked_tick = this_run;
+        self.cached_removed_len = world
+            .removed_components()
+            .get(relation)
+            .map_or(0, |msgs| msgs.len());
         self.rebuild_count += 1;
     }
     fn reset_empty(&mut self, this_run: Tick) -> bool {
@@ -704,6 +723,7 @@ impl CachedRelationHierarchy {
         self.strata.clear();
         self.cached_edge_count = 0;
         self.cached_dynamic_hash = 0;
+        self.cached_removed_len = 0;
         self.has_cycles = false;
         self.built = true;
         self.last_checked_tick = this_run;
@@ -762,6 +782,10 @@ impl CascadeHierarchyCache {
 
         if !entry.needs_rebuild(world, relation, storage_type, layout, this_run) {
             entry.last_checked_tick = this_run;
+            entry.cached_removed_len = world
+                .removed_components()
+                .get(relation)
+                .map_or(0, |msgs| msgs.len());
             return false;
         }
 
@@ -949,6 +973,152 @@ impl CascadeHierarchyCache {
             curr = entry.parent_map.get(&curr).copied()?;
         }
     }
+
+    fn is_fresh_for_cell(
+        &self,
+        world: UnsafeWorldCell<'_>,
+        relation: ComponentId,
+        storage_type: StorageType,
+        layout: RelationLayout,
+    ) -> bool {
+        let Some(entry) = self.by_relation.get(&relation) else {
+            return false;
+        };
+        if !entry.built || matches!(layout, RelationLayout::ModRelation(_)) {
+            return false;
+        }
+        if entry.archetype_gen != world.archetypes().generation() {
+            return false;
+        }
+        let removed_len = world
+            .removed_components()
+            .get(relation)
+            .map_or(0, |msgs| msgs.len());
+        if removed_len != entry.cached_removed_len {
+            return false;
+        }
+        if let Some(roots) = entry.strata.first()
+            && roots
+                .iter()
+                .any(|&root| !world.entities().contains_spawned(root))
+        {
+            return false;
+        }
+        // SAFETY: Read-only access to storages during active system execution.
+        let storages = unsafe { world.storages() };
+        if layout == RelationLayout::DynamicTarget {
+            // SAFETY: `DynamicComponentHookMap` is never mutably borrowed during system execution.
+            let Some(hook_map) = (unsafe { world.get_resource::<DynamicComponentHookMap>() })
+            else {
+                return entry.cached_edge_count == 0;
+            };
+            let mut count = 0usize;
+            let mut hash = 0u64;
+            match storage_type {
+                StorageType::Table => {
+                    for &tid in &entry.matched_tables {
+                        let Some(table) = storages.tables.get(tid) else {
+                            continue;
+                        };
+                        for &parent in table.entities() {
+                            let children = hook_map.relationship_targets_for(relation, parent);
+                            count += children.len();
+                            for &child in children {
+                                hash = hash.wrapping_add(mix_edge_hash(parent, child));
+                            }
+                        }
+                    }
+                }
+                StorageType::SparseSet => {
+                    let archetypes = world.archetypes();
+                    for &aid in &entry.matched_archetypes {
+                        let Some(arch) = archetypes.get(aid) else {
+                            continue;
+                        };
+                        for arch_ent in arch.entities() {
+                            let parent = arch_ent.id();
+                            let children = hook_map.relationship_targets_for(relation, parent);
+                            count += children.len();
+                            for &child in children {
+                                hash = hash.wrapping_add(mix_edge_hash(parent, child));
+                            }
+                        }
+                    }
+                }
+            }
+            return count == entry.cached_edge_count && hash == entry.cached_dynamic_hash;
+        }
+
+        let this_run = world.change_tick();
+        match storage_type {
+            StorageType::Table => {
+                let mut total_rows = 0usize;
+                for &tid in &entry.matched_tables {
+                    if let Some(table) = storages.tables.get(tid) {
+                        total_rows += table.entity_count() as usize;
+                    }
+                }
+                if total_rows != entry.cached_edge_count {
+                    return false;
+                }
+                for &tid in &entry.matched_tables {
+                    let Some(table) = storages.tables.get(tid) else {
+                        continue;
+                    };
+                    let table_len = table.entity_count() as usize;
+                    if table_len == 0 {
+                        continue;
+                    }
+                    let Some(col) = table.get_column(relation) else {
+                        continue;
+                    };
+                    if let Some(summary) = col.get_summary_tick() {
+                        if summary
+                            .get()
+                            .is_newer_than(entry.last_checked_tick, this_run)
+                        {
+                            return false;
+                        }
+                        continue;
+                    }
+                    // SAFETY: `table_len == table.entity_count() as usize`.
+                    let changed_ticks = unsafe { col.get_changed_ticks_slice(table_len) };
+                    for tick_cell in changed_ticks {
+                        // SAFETY: Shared system access guarantees no concurrent tick writes.
+                        let tick = unsafe { *tick_cell.get() };
+                        if tick.is_newer_than(entry.last_checked_tick, this_run) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            StorageType::SparseSet => {
+                let Some(ss) = storages.sparse_sets.get(relation) else {
+                    return entry.cached_edge_count == 0;
+                };
+                if ss.len() != entry.cached_edge_count {
+                    return false;
+                }
+                let archetypes = world.archetypes();
+                for &aid in &entry.matched_archetypes {
+                    let Some(arch) = archetypes.get(aid) else {
+                        continue;
+                    };
+                    for arch_ent in arch.entities() {
+                        if let Some(tick_cell) = ss.get_changed_tick(arch_ent.id()) {
+                            // SAFETY: Shared system access guarantees no concurrent tick writes.
+                            let tick = unsafe { *tick_cell.get() };
+                            if tick.is_newer_than(entry.last_checked_tick, this_run) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1018,6 +1188,13 @@ fn read_parent_from_world(
     if layout == RelationLayout::DynamicTarget {
         return resolve_dynamic_target_parent(world, rel_cid, entity);
     }
+    if let RelationLayout::ModRelation(rel_handle) = layout {
+        // SAFETY: `ModRelationGraph` is never mutably borrowed concurrently with system execution.
+        let graph = unsafe { world.get_resource::<ModRelationGraph>() }?;
+        let target = graph.first_target(rel_handle, entity)?;
+        return (target != Entity::PLACEHOLDER && world.entities().contains_spawned(target))
+            .then_some(target);
+    }
     let ent_cell = world.get_entity(entity).ok()?;
     // SAFETY: Shared read of the relation edge component during `host_iter_up_cascade`;
     // `extract_parent_from_raw` validates byte size according to `layout`.
@@ -1077,11 +1254,15 @@ pub(crate) unsafe fn iter_up_cascade_impl(
 
     // Resolve `relation` (`BamComponent::INVALID` -> built-in `ChildOf`; otherwise query plan or
     // `ModRegistry` lookup for explicit `ChildOf` or custom entity-valued parent components).
-    let (rel_cid, rel_layout) = if !relation.is_valid() {
+    let (rel_cid, rel_storage, rel_layout) = if !relation.is_valid() {
         let Some(child_of_cid) = world.components().component_id::<ChildOf>() else {
             return FfiResult::NOT_FOUND;
         };
-        (child_of_cid, RelationLayout::ChildOf)
+        let storage_type = world
+            .components()
+            .get_info(child_of_cid)
+            .map_or(StorageType::Table, |i| i.storage_type());
+        (child_of_cid, storage_type, RelationLayout::ChildOf)
     } else {
         let resolved_cid = if let Some(plan_term) = host_iter
             .plan
@@ -1114,8 +1295,35 @@ pub(crate) unsafe fn iter_up_cascade_impl(
         else {
             return FfiResult::INVALID_COMPONENT;
         };
-        (resolved_cid, layout)
+        (resolved_cid, info.storage_type(), layout)
     };
+
+    // Fast path: when `CascadeHierarchyCache` is present in `World` and verified fresh for
+    // `rel_cid`, traverse cached parent edges via `O(1)` hash lookups without per-hop component
+    // storage or `DynamicTarget` table scans.
+    // SAFETY: `CascadeHierarchyCache` is never mutably borrowed concurrently with system execution.
+    let cached_hier = unsafe { world.get_resource::<CascadeHierarchyCache>() }
+        .filter(|c| c.is_fresh_for_cell(world, rel_cid, rel_storage, rel_layout));
+
+    if let Some(cache) = cached_hier {
+        if let Some(found) = cache.find_nearest_ancestor(rel_cid, bevy_entity, |ancestor| {
+            world.get_entity(ancestor).ok().is_some_and(|cell| {
+                // SAFETY: `term_index` declared access on `term.component_id` in `FilteredAccessSet`.
+                unsafe { cell.get_by_id(term.component_id) }.is_some()
+            })
+        }) && let Ok(ancestor_cell) = world.get_entity(found)
+            // SAFETY: `found` was just confirmed to hold `term.component_id` above.
+            && let Some(comp_ptr) = unsafe { ancestor_cell.get_by_id(term.component_id) }
+        {
+            // SAFETY: `out_ptr` and `out_owner` are non-null, aligned, and writable.
+            unsafe {
+                *out_ptr = comp_ptr.as_ptr().cast::<c_void>();
+                *out_owner = FfiEntity::from_bits(found.to_bits());
+            }
+            return FfiResult::OK;
+        }
+        return FfiResult::NOT_FOUND;
+    }
 
     // Brent's zero-allocation cycle-guarded upward walk starting from `entity`'s direct parent.
     let mut power = 1usize;

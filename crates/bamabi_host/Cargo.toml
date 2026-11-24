@@ -16,6 +16,10 @@ autotests = false
 workspace = true
 
 [features]
+default = ["dynamic-loader"]
+dynamic-loader = ["bamabi_host_sys/dynamic-loader"]
+static-only = ["bamabi_host_sys/static-only"]
+cranelift-object-loader = ["bamabi_host_sys/cranelift-object-loader"]
 strict-ffi-checks = ["bamabi_host_sys/strict-ffi-checks"]
 test-utils = ["bamabi_host_sys/test-utils"]
 diagnostics = ["bamabi_host_sys/diagnostics", "dep:bevy_diagnostic"]
@@ -71,6 +75,10 @@ path = "tests/schedule_shuffle_fuzz.rs"
 [[test]]
 name = "soak_10k_reloads"
 path = "tests/soak_10k_reloads.rs"
+
+[[test]]
+name = "r43_loader_dx_telemetry"
+path = "tests/r43_loader_dx_telemetry.rs"
 
 [[bench]]
 name = "chunk_throughput"

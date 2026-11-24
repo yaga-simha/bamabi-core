@@ -1,7 +1,10 @@
 //! Schedule mapping (`ModScheduleMap`), scoped named ordering sets (`ModNamedSystemSet`),
 //! and `&mut World`-native schedule configuration helpers.
 
-use bamabi_host_sys::schedule::{ModScheduleSetRegistry, install_mod_schedule_set_pass};
+use bamabi_host_sys::schedule::{
+    ModScheduleSetRegistry, install_mod_schedule_set_pass,
+    sync_mod_schedule_set_configs_to_schedule,
+};
 use bamabi_host_sys::{
     GuestSystem, ModHost, ModId, ModLoadError, ModQuarantine, record_mod_named_sets_in_world,
 };
@@ -486,6 +489,7 @@ pub(crate) fn schedule_mod_systems_in_world(
 
     let has_schedule_sets = world.contains_resource::<ModScheduleSetRegistry>();
     let mut recorded_sets = Vec::with_capacity(to_schedule.len());
+    let mut touched_schedules: Vec<(ScheduleId, InternedScheduleLabel)> = Vec::new();
     for (sched_id, interned, sys) in to_schedule {
         if world
             .get_resource::<Schedules>()
@@ -516,6 +520,27 @@ pub(crate) fn schedule_mod_systems_in_world(
                 install_mod_schedule_set_pass(schedule, sched_id);
             }
             schedules.add_systems(interned, cfg);
+            if has_schedule_sets
+                && !touched_schedules
+                    .iter()
+                    .any(|&(sid, lbl)| sid == sched_id && lbl == interned)
+            {
+                touched_schedules.push((sched_id, interned));
+            }
+        }
+    }
+
+    if has_schedule_sets {
+        for (sched_id, interned) in touched_schedules {
+            let removed = world
+                .get_resource_mut::<Schedules>()
+                .and_then(|mut s| s.remove_temporarily(interned));
+            if let Some(mut schedule) = removed {
+                sync_mod_schedule_set_configs_to_schedule(world, sched_id, &mut schedule);
+                if let Some(mut schedules) = world.get_resource_mut::<Schedules>() {
+                    schedules.reinsert(schedule);
+                }
+            }
         }
     }
 

@@ -20,20 +20,23 @@ use bamabi_sys::{
     ComponentUuid, FfiChildOf, FfiEntity, FfiResult, FfiSlice, ModComponent, RawInsertable,
     StrView,
 };
-use bevy_ecs::change_detection::Tick;
-use bevy_ecs::component::ComponentId;
+use bevy_ecs::change_detection::{MaybeLocation, Tick};
+use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, ComponentId, StorageType};
 use bevy_ecs::entity::{ContainsEntity, Entity};
 use bevy_ecs::event::{EntityEvent, Event, EventKey};
 use bevy_ecs::hierarchy::ChildOf;
 use bevy_ecs::message::{Message, MessageCursor, Messages};
 use bevy_ecs::prelude::{Component, Resource};
+use bevy_ecs::ptr::OwningPtr;
 use bevy_ecs::world::World;
 use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
 use bevy_platform::collections::HashMap;
+use core::alloc::Layout;
 use core::any::Any;
 use core::ffi::c_void;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Function signature for monomorphized raw component byte insertion into a Bevy [`World`].
@@ -178,6 +181,382 @@ fn create_msg_cursor_impl<M: Message>() -> Box<dyn Any + Send + Sync> {
     Box::new(MessageCursor::<M>::default())
 }
 
+/// Cursor tracking the next unread element index within a [`DynamicMessageBuffer`].
+#[derive(Default)]
+pub(crate) struct DynamicMessageCursor {
+    next_index: usize,
+}
+
+/// Type-erased, alignment-preserving dynamic message ring/buffer stored as a Bevy resource
+/// for guest-registered [`host_register_message`](crate::ffi::register) channels.
+pub(crate) struct DynamicMessageBuffer {
+    elem_size: usize,
+    elem_align: usize,
+    stride: usize,
+    len: usize,
+    cap: usize,
+    data: NonNull<u8>,
+    drop_fn: Option<ComponentDropFn>,
+    is_active: Arc<AtomicBool>,
+}
+
+// SAFETY: Access to `DynamicMessageBuffer` follows Bevy's ECS resource borrowing rules (`&` vs
+// `&mut`), and `is_active` is synchronized atomically.
+unsafe impl Send for DynamicMessageBuffer {}
+// SAFETY: Shared references only read immutable byte slices within `[0 .. len * stride)`.
+unsafe impl Sync for DynamicMessageBuffer {}
+
+impl DynamicMessageBuffer {
+    fn new(
+        elem_size: usize,
+        elem_align: usize,
+        drop_fn: Option<ComponentDropFn>,
+        is_active: Arc<AtomicBool>,
+    ) -> Self {
+        let align = elem_align.max(1);
+        let stride = if elem_size == 0 {
+            0
+        } else {
+            elem_size.next_multiple_of(align)
+        };
+        Self {
+            elem_size,
+            elem_align: align,
+            stride,
+            len: 0,
+            cap: 0,
+            data: NonNull::dangling(),
+            drop_fn,
+            is_active,
+        }
+    }
+
+    fn refresh_drop_binding(
+        &mut self,
+        drop_fn: Option<ComponentDropFn>,
+        is_active: Arc<AtomicBool>,
+    ) {
+        self.clear();
+        self.drop_fn = drop_fn;
+        self.is_active = is_active;
+    }
+
+    fn clear(&mut self) {
+        if let Some(df) = self.drop_fn
+            && self.is_active.load(Ordering::Acquire)
+        {
+            for idx in 0..self.len {
+                let offset = idx.saturating_mul(self.stride);
+                // SAFETY: `idx < self.len <= self.cap` and `offset` stays within the live
+                // initialized element buffer while `self.is_active` confirms `df` is loaded.
+                unsafe {
+                    df(self.data.as_ptr().add(offset).cast::<c_void>());
+                }
+            }
+        }
+        self.len = 0;
+    }
+
+    fn ensure_additional(&mut self, additional: usize) -> Result<(), FfiResult> {
+        if additional == 0 || self.stride == 0 {
+            return Ok(());
+        }
+        let needed = self
+            .len
+            .checked_add(additional)
+            .ok_or(FfiResult::CAPACITY_EXCEEDED)?;
+        if needed <= self.cap {
+            return Ok(());
+        }
+        let new_cap = needed.max(self.cap.saturating_mul(2)).max(8);
+        let new_bytes = new_cap
+            .checked_mul(self.stride)
+            .ok_or(FfiResult::CAPACITY_EXCEEDED)?;
+        if new_bytes > isize::MAX as usize {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        }
+        let new_layout = Layout::from_size_align(new_bytes, self.elem_align)
+            .map_err(|_| FfiResult::INVALID_ARGUMENT)?;
+        // SAFETY: `new_bytes > 0` (since `self.stride > 0` and `new_cap >= 8`) and `new_layout`
+        // is valid and non-zero-sized.
+        let raw_new = unsafe { std::alloc::alloc(new_layout) };
+        let Some(new_ptr) = NonNull::new(raw_new) else {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        };
+        if self.len > 0 {
+            let live_bytes = self.len.saturating_mul(self.stride);
+            // SAFETY: Both `self.data` and `new_ptr` are valid, non-overlapping allocations of at
+            // least `live_bytes`, and guest types moved via memcpy relocation match Rust move rules.
+            unsafe {
+                core::ptr::copy_nonoverlapping(self.data.as_ptr(), new_ptr.as_ptr(), live_bytes);
+            }
+        }
+        if self.cap > 0 {
+            let old_bytes = self.cap.saturating_mul(self.stride);
+            if let Ok(old_layout) = Layout::from_size_align(old_bytes, self.elem_align) {
+                // SAFETY: `self.data` was allocated with `old_layout`.
+                unsafe {
+                    std::alloc::dealloc(self.data.as_ptr(), old_layout);
+                }
+            }
+        }
+        self.data = new_ptr;
+        self.cap = new_cap;
+        Ok(())
+    }
+
+    /// # Safety
+    ///
+    /// If `self.elem_size > 0 && count > 0`, `src_ptr` must be non-null and readable for
+    /// `count * self.elem_size` tightly packed element bytes.
+    unsafe fn push_packed(&mut self, src_ptr: *const u8, count: usize) -> FfiResult {
+        if count == 0 {
+            return FfiResult::OK;
+        }
+        if self.elem_size > 0 && src_ptr.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if let Err(err) = self.ensure_additional(count) {
+            return err;
+        }
+        if self.elem_size > 0 {
+            let base_len = self.len;
+            if self.stride == self.elem_size {
+                let total_bytes = count.saturating_mul(self.elem_size);
+                // SAFETY: Capacity for `base_len + count` elements is allocated; `src_ptr` is
+                // non-null and readable for `total_bytes`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src_ptr,
+                        self.data.as_ptr().add(base_len * self.stride),
+                        total_bytes,
+                    );
+                }
+            } else {
+                for i in 0..count {
+                    // SAFETY: Caller guarantees `src_ptr` holds `count * self.elem_size` bytes, and
+                    // destination slot `(base_len + i) * self.stride` is within `self.cap`.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            src_ptr.add(i * self.elem_size),
+                            self.data.as_ptr().add((base_len + i) * self.stride),
+                            self.elem_size,
+                        );
+                    }
+                }
+            }
+        }
+        self.len = self.len.saturating_add(count);
+        FfiResult::OK
+    }
+
+    fn read_slice_cursor(&self, cursor: &mut DynamicMessageCursor) -> (*const u8, usize) {
+        if cursor.next_index >= self.len {
+            return (core::ptr::null(), 0);
+        }
+        let count = self.len - cursor.next_index;
+        let ptr = if self.stride == 0 {
+            NonNull::<u8>::dangling().as_ptr()
+        } else {
+            // SAFETY: `cursor.next_index < self.len <= self.cap`, so offset is in bounds.
+            unsafe { self.data.as_ptr().add(cursor.next_index * self.stride) }
+        };
+        cursor.next_index = self.len;
+        (ptr, count)
+    }
+}
+
+impl Drop for DynamicMessageBuffer {
+    fn drop(&mut self) {
+        self.clear();
+        if self.cap > 0 && self.stride > 0 {
+            let old_bytes = self.cap.saturating_mul(self.stride);
+            if let Ok(layout) = Layout::from_size_align(old_bytes, self.elem_align) {
+                // SAFETY: `self.data` was allocated via `std::alloc::alloc` with `layout`.
+                unsafe {
+                    std::alloc::dealloc(self.data.as_ptr(), layout);
+                }
+            }
+        }
+    }
+}
+
+/// # Safety
+///
+/// `ptr` must own a properly aligned, initialized `DynamicMessageBuffer`.
+unsafe fn drop_dynamic_message_buffer(ptr: OwningPtr<'_>) {
+    // SAFETY: Caller transfers ownership of a valid `DynamicMessageBuffer` stored in Bevy's table.
+    let _ = unsafe { ptr.read::<DynamicMessageBuffer>() };
+}
+
+fn dynamic_create_msg_cursor() -> Box<dyn Any + Send + Sync> {
+    Box::new(DynamicMessageCursor::default())
+}
+
+/// # Safety
+///
+/// - `world` must grant shared read access to `msg_res_id` (`DynamicMessageBuffer`).
+/// - `out_count` must be non-null and writable for `usize`.
+/// - If `max_count > 0`, `out_buf` must be writable for `max_count * elem_size` bytes.
+unsafe fn dynamic_msg_read_batch(
+    world: UnsafeWorldCell<'_>,
+    msg_res_id: ComponentId,
+    cursor: &mut dyn Any,
+    out_buf: *mut u8,
+    max_count: usize,
+    out_count: *mut usize,
+) -> FfiResult {
+    // SAFETY: Caller guarantees `out_count` is non-null and writable.
+    unsafe {
+        *out_count = 0;
+    }
+    let Some(typed_cursor) = cursor.downcast_mut::<DynamicMessageCursor>() else {
+        return FfiResult::TYPE_MISMATCH;
+    };
+    if max_count == 0 {
+        return FfiResult::OK;
+    }
+    // SAFETY: `MESSAGE_READ` or `MESSAGE_WRITE` on `msg_res_id` was declared in `FilteredAccessSet`.
+    let Some(res_ptr) = (unsafe { world.get_resource_by_id(msg_res_id) }) else {
+        return FfiResult::OK;
+    };
+    // SAFETY: `msg_res_id` was registered with `DynamicMessageBuffer` layout.
+    let buffer = unsafe { res_ptr.deref::<DynamicMessageBuffer>() };
+    if buffer.elem_size > 0 && out_buf.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if typed_cursor.next_index >= buffer.len {
+        return FfiResult::OK;
+    }
+    let available = buffer.len - typed_cursor.next_index;
+    let effective_max = clamp_batch_max_count(max_count, buffer.elem_size);
+    let to_copy = available.min(effective_max);
+    if buffer.elem_size > 0 && to_copy > 0 {
+        let start = typed_cursor.next_index;
+        if buffer.stride == buffer.elem_size {
+            let total_bytes = to_copy.saturating_mul(buffer.elem_size);
+            // SAFETY: `start + to_copy <= buffer.len <= buffer.cap` and `out_buf` is writable for
+            // `effective_max * buffer.elem_size >= total_bytes` bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buffer.data.as_ptr().add(start * buffer.stride),
+                    out_buf,
+                    total_bytes,
+                );
+            }
+        } else {
+            for i in 0..to_copy {
+                // SAFETY: Source and destination offsets stay within allocated bounds.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        buffer.data.as_ptr().add((start + i) * buffer.stride),
+                        out_buf.add(i * buffer.elem_size),
+                        buffer.elem_size,
+                    );
+                }
+            }
+        }
+    }
+    typed_cursor.next_index = typed_cursor.next_index.saturating_add(to_copy);
+    // SAFETY: `out_count` is non-null and writable.
+    unsafe {
+        *out_count = to_copy;
+    }
+    FfiResult::OK
+}
+
+/// # Safety
+///
+/// - `world` must grant exclusive write access to `msg_res_id` (`DynamicMessageBuffer`).
+/// - If `data_len > 0`, `data_ptr` must be readable for `data_len` bytes.
+unsafe fn dynamic_msg_send(
+    world: UnsafeWorldCell<'_>,
+    last_run: Tick,
+    this_run: Tick,
+    msg_res_id: ComponentId,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult {
+    // SAFETY: `MESSAGE_WRITE` on `msg_res_id` was declared in `FilteredAccessSet`.
+    let Some(entity) = (unsafe { world.resource_entities() }).get(msg_res_id) else {
+        return FfiResult::NOT_FOUND;
+    };
+    let Ok(entity_cell) = world.get_entity_with_ticks(entity, last_run, this_run) else {
+        return FfiResult::NOT_FOUND;
+    };
+    // SAFETY: Exclusive mutable access to `msg_res_id` is guaranteed by Bevy's scheduler.
+    let Ok(mut_untyped) = (unsafe { entity_cell.get_mut_by_id(msg_res_id) }) else {
+        return FfiResult::NOT_FOUND;
+    };
+    // SAFETY: `msg_res_id` was registered with `DynamicMessageBuffer` layout.
+    let mut buffer = unsafe { mut_untyped.with_type::<DynamicMessageBuffer>() };
+    if data_len != buffer.elem_size {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    // SAFETY: `data_ptr` is verified readable for `data_len == buffer.elem_size` bytes inside `push_packed`.
+    unsafe { buffer.push_packed(data_ptr, 1) }
+}
+
+/// # Safety
+///
+/// - `world` must grant exclusive write access to `msg_res_id` (`DynamicMessageBuffer`).
+/// - If `count > 0`, `data_ptr` must be readable for `count * elem_size` bytes.
+unsafe fn dynamic_msg_write_batch(
+    world: UnsafeWorldCell<'_>,
+    last_run: Tick,
+    this_run: Tick,
+    msg_res_id: ComponentId,
+    data_ptr: *const u8,
+    count: usize,
+) -> FfiResult {
+    if count == 0 {
+        return FfiResult::OK;
+    }
+    // SAFETY: `MESSAGE_WRITE` on `msg_res_id` was declared in `FilteredAccessSet`.
+    let Some(entity) = (unsafe { world.resource_entities() }).get(msg_res_id) else {
+        return FfiResult::NOT_FOUND;
+    };
+    let Ok(entity_cell) = world.get_entity_with_ticks(entity, last_run, this_run) else {
+        return FfiResult::NOT_FOUND;
+    };
+    // SAFETY: Exclusive mutable access to `msg_res_id` is guaranteed by Bevy's scheduler.
+    let Ok(mut_untyped) = (unsafe { entity_cell.get_mut_by_id(msg_res_id) }) else {
+        return FfiResult::NOT_FOUND;
+    };
+    // SAFETY: `msg_res_id` was registered with `DynamicMessageBuffer` layout.
+    let mut buffer = unsafe { mut_untyped.with_type::<DynamicMessageBuffer>() };
+    // SAFETY: Caller guarantees `data_ptr` holds `count * buffer.elem_size` readable bytes.
+    unsafe { buffer.push_packed(data_ptr, count) }
+}
+
+/// Zero-copy slice reader for dynamic message channels created via `register_message_from_desc`.
+///
+/// Returns `Ok((ptr, count))` borrowing contiguous elements directly from `DynamicMessageBuffer`
+/// and advances `cursor`. Returns `Err(FfiResult::UNSUPPORTED)` when `stride != elem_size`.
+///
+/// # Safety
+///
+/// - `world` must grant shared read access to `msg_res_id` (`DynamicMessageBuffer`).
+pub(crate) unsafe fn dynamic_msg_read_slice(
+    world: UnsafeWorldCell<'_>,
+    msg_res_id: ComponentId,
+    cursor: &mut dyn Any,
+) -> Result<(*const u8, usize), FfiResult> {
+    let Some(typed_cursor) = cursor.downcast_mut::<DynamicMessageCursor>() else {
+        return Err(FfiResult::TYPE_MISMATCH);
+    };
+    // SAFETY: Caller guarantees shared read access to `msg_res_id`.
+    let Some(res_ptr) = (unsafe { world.get_resource_by_id(msg_res_id) }) else {
+        return Ok((core::ptr::null(), 0));
+    };
+    // SAFETY: `msg_res_id` was registered with `DynamicMessageBuffer` layout.
+    let buffer = unsafe { res_ptr.deref::<DynamicMessageBuffer>() };
+    if buffer.stride != buffer.elem_size {
+        return Err(FfiResult::UNSUPPORTED);
+    }
+    Ok(buffer.read_slice_cursor(typed_cursor))
+}
+
 /// Clamps a batch `max_count` so `max_count * elem_size` never exceeds `isize::MAX` bytes.
 #[inline]
 pub(crate) const fn clamp_batch_max_count(max_count: usize, elem_size: usize) -> usize {
@@ -211,6 +590,12 @@ pub(crate) fn drain_cursor_bounded<T, I: Iterator<Item = T>>(
     written
 }
 
+/// # Safety
+///
+/// - `world` must grant shared read access to `msg_res_id` (`Messages<M>`).
+/// - `out_count` must be non-null and writable for `usize`.
+/// - If `max_count > 0` and `size_of::<M>() > 0`, `out_buf` must be writable for
+///   `max_count * size_of::<M>()` bytes.
 unsafe fn msg_read_batch_impl<M: Message + AbiPod>(
     world: UnsafeWorldCell<'_>,
     msg_res_id: ComponentId,
@@ -287,6 +672,10 @@ unsafe fn push_message_to_world<M: Message>(
     FfiResult::OK
 }
 
+/// # Safety
+///
+/// - `world` must grant exclusive write access to `msg_res_id` (`Messages<M>`).
+/// - If `data_len > 0`, `data_ptr` must be null or readable for `size_of::<M>()` bytes.
 unsafe fn msg_send_impl<M: Message + AbiPod>(
     world: UnsafeWorldCell<'_>,
     last_run: Tick,
@@ -312,6 +701,11 @@ unsafe fn msg_send_impl<M: Message + AbiPod>(
     unsafe { push_message_to_world(world, last_run, this_run, msg_res_id, msg) }
 }
 
+/// # Safety
+///
+/// - `world` must grant shared read access to `msg_res_id` (`Messages<M>`).
+/// - `out_count` must be non-null and writable for `usize`.
+/// - If `max_count > 0`, `out_buf` must be writable for `max_count * size_of::<*const c_void>()` bytes.
 unsafe fn msg_read_batch_non_pod_impl<M: Message>(
     world: UnsafeWorldCell<'_>,
     msg_res_id: ComponentId,
@@ -376,6 +770,10 @@ fn read_u32_framed_slice<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8
     Ok(payload)
 }
 
+/// # Safety
+///
+/// - `world` must grant exclusive write access to `msg_res_id` (`Messages<M>`).
+/// - `data_ptr` must be null or readable for `data_len` bytes (`>= 4`).
 unsafe fn msg_send_non_pod_impl<M: Message + ModComponent + Default>(
     world: UnsafeWorldCell<'_>,
     last_run: Tick,
@@ -403,9 +801,9 @@ unsafe fn msg_send_non_pod_impl<M: Message + ModComponent + Default>(
     }
     type ImportFieldFn = unsafe extern "C" fn(
         dst_ptr: *mut c_void,
-        field_name: StrView,
-        type_tag: StrView,
-        payload: FfiSlice<u8>,
+        field_name: *const StrView,
+        type_tag: *const StrView,
+        payload: *const FfiSlice<u8>,
     ) -> FfiResult;
     // SAFETY: Witness codegen exports `"bam.v0.<M>.import_field"` with `ImportFieldFn` signature.
     let import_fn: ImportFieldFn = unsafe { core::mem::transmute(sym.ptr) };
@@ -436,14 +834,17 @@ unsafe fn msg_send_non_pod_impl<M: Message + ModComponent + Default>(
             Err(err) => return err,
         };
 
-        // SAFETY: `&raw mut host_msg` points to an initialized `M`, and `StrView` / `FfiSlice`
-        // borrow valid UTF-8 / byte slices for the synchronous duration of `import_fn`.
+        let name_view = StrView::from_str(name_str);
+        let tag_view = StrView::from_str(tag_str);
+        let payload_slice = FfiSlice::from_slice(val_bytes);
+        // SAFETY: `&raw mut host_msg` points to an initialized `M`, and `name_view`, `tag_view`,
+        // and `payload_slice` borrow valid UTF-8 / byte slices on stack for the synchronous call.
         let status = unsafe {
             import_fn(
                 (&raw mut host_msg).cast::<c_void>(),
-                StrView::from_str(name_str),
-                StrView::from_str(tag_str),
-                FfiSlice::from_slice(val_bytes),
+                &raw const name_view,
+                &raw const tag_view,
+                &raw const payload_slice,
             )
         };
         if !status.is_ok() {
@@ -484,6 +885,11 @@ unsafe fn insert_raw_impl<T: Component + ModComponent>(
     }
 }
 
+/// # Safety
+///
+/// - `world` must grant exclusive write access to `msg_res_id` (`Messages<M>`).
+/// - If `count > 0` and `size_of::<M>() > 0`, `data_ptr` must be readable for
+///   `count * size_of::<M>()` bytes.
 unsafe fn msg_write_batch_impl<M: Message + AbiPod>(
     world: UnsafeWorldCell<'_>,
     last_run: Tick,
@@ -528,6 +934,9 @@ unsafe fn msg_write_batch_impl<M: Message + AbiPod>(
     FfiResult::OK
 }
 
+/// # Safety
+///
+/// - `data` must be null or readable for 8 bytes encoding an `FfiChildOf` (`FfiEntity` parent handle).
 unsafe fn insert_child_of_raw(world: &mut World, entity: Entity, data: *const u8) {
     if data.is_null() {
         return;
@@ -545,6 +954,9 @@ unsafe fn insert_child_of_raw(world: &mut World, entity: Entity, data: *const u8
     }
 }
 
+/// # Safety
+///
+/// - When `size_of::<E>() > 0`, `data` must be null or readable for `size_of::<E>()` bytes encoding a valid `E`.
 unsafe fn trigger_event_impl<E>(
     world: &mut World,
     _target: Option<Entity>,
@@ -567,6 +979,9 @@ where
     Ok(())
 }
 
+/// # Safety
+///
+/// - When `size_of::<E>() > 0`, `data` must be null or readable for `size_of::<E>()` bytes encoding a valid `E`.
 unsafe fn trigger_entity_event_impl<E>(
     world: &mut World,
     target: Option<Entity>,
@@ -589,6 +1004,9 @@ where
     Ok(())
 }
 
+/// # Safety
+///
+/// - When `size_of::<E>() > 0`, `data` must be null or readable for `size_of::<E>()` bytes encoding a valid `E`.
 unsafe fn extract_entity_event_target_impl<E: EntityEvent + Copy>(
     data: *const u8,
 ) -> Option<Entity> {
@@ -1062,6 +1480,29 @@ pub(crate) struct DynamicComponentReg<'a> {
     pub(crate) owned_field_strings: Option<OwnedFieldStrings>,
 }
 
+/// Bundled specification for registering a dynamic guest singleton resource into [`ModRegistry`].
+pub(crate) struct DynamicResourceReg<'a> {
+    pub(crate) comp_id: ComponentId,
+    pub(crate) desc: &'a ComponentDesc,
+    pub(crate) name: &'a str,
+    pub(crate) owner: Option<ModId>,
+    pub(crate) drop_slot: Option<usize>,
+    pub(crate) schema_fingerprint: u64,
+    pub(crate) fields: Arc<[BamFieldDesc]>,
+    pub(crate) owned_field_strings: Option<OwnedFieldStrings>,
+}
+
+/// Bundled specification for registering a dynamic guest buffered message channel into [`ModRegistry`].
+pub(crate) struct DynamicMessageReg<'a> {
+    pub(crate) desc: &'a ComponentDesc,
+    pub(crate) name: &'a str,
+    pub(crate) owner: Option<ModId>,
+    pub(crate) is_active: Arc<AtomicBool>,
+    pub(crate) schema_fingerprint: u64,
+    pub(crate) fields: Arc<[BamFieldDesc]>,
+    pub(crate) owned_field_strings: Option<OwnedFieldStrings>,
+}
+
 /// Bundled specification for registering a typed relationship entry into [`ModRegistry`].
 pub(crate) struct RelationRegSpec<'a> {
     pub(crate) comp_id: ComponentId,
@@ -1341,7 +1782,7 @@ impl ModRegistry {
 
     /// Restores a previously captured `Arc<RegistrySnapshot>` (used by transactional load rollback)
     /// and advances `generation`.
-    pub(crate) fn restore_snapshot(&mut self, snapshot: Arc<RegistrySnapshot>) {
+    pub fn restore_snapshot(&mut self, snapshot: Arc<RegistrySnapshot>) {
         self.snapshot = Arc::clone(&snapshot);
         let next_gen = self
             .tracker
@@ -2116,6 +2557,254 @@ impl ModRegistry {
         };
         self.publish_after_mutation();
 
+        Ok(handle)
+    }
+
+    /// Registers a guest-owned dynamic singleton resource from a [`ComponentDesc`], returning its
+    /// 1-based [`BamComponent`] handle (`BAM_STORAGE_FLAG_RESOURCE`).
+    pub(crate) fn register_resource_from_desc(
+        &mut self,
+        reg: DynamicResourceReg<'_>,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        let DynamicResourceReg {
+            comp_id,
+            desc,
+            name,
+            owner,
+            drop_slot,
+            schema_fingerprint,
+            fields,
+            owned_field_strings,
+        } = reg;
+        let storage_flags =
+            component_flags_to_storage_flags(desc.flags) | BAM_STORAGE_FLAG_RESOURCE;
+        let expected_comp_id = self
+            .snapshot
+            .get_by_name(name)
+            .filter(|entry| entry.is_dynamic)
+            .map_or(comp_id, |entry| entry.component_id);
+        self.check_registration_collision(
+            name,
+            desc.uuid,
+            desc.size,
+            desc.align,
+            storage_flags,
+            Some(expected_comp_id),
+        )?;
+        self.check_dynamic_drop_compatibility(name, desc.drop_fn.is_some())?;
+
+        let sym_addr = SymbolAddress::new(desc.vtable_ptr);
+        let handle = {
+            let snap = Arc::make_mut(&mut self.snapshot);
+            let handle = if let Some(&existing_handle) = snap.by_name.get(name) {
+                let idx = (existing_handle.0 - 1) as usize;
+                let entry = &mut snap.entries[idx];
+                if entry.is_dynamic {
+                    if entry.component_id != comp_id {
+                        let old_id = entry.component_id;
+                        entry.component_id = comp_id;
+                        snap.by_component_id.remove(&old_id);
+                        snap.by_component_id.insert(comp_id, existing_handle);
+                    }
+                    entry.schema_fingerprint = schema_fingerprint;
+                    entry.fields = Arc::clone(&fields);
+                    entry.owned_field_strings = owned_field_strings;
+                    entry.vtable_ptr = sym_addr;
+                    entry.drop_fn = desc.drop_fn;
+                    entry.drop_slot = drop_slot;
+                    entry.owner = owner;
+                }
+                existing_handle
+            } else {
+                snap.alloc_handle_and_insert(
+                    NewComponentBase {
+                        name,
+                        uuid: desc.uuid,
+                        component_id: comp_id,
+                        size: desc.size,
+                        align: desc.align,
+                        storage_flags,
+                        is_abi_pod: desc.is_pod(),
+                    },
+                    |e| {
+                        e.schema_fingerprint = schema_fingerprint;
+                        e.fields = fields;
+                        e.owned_field_strings = owned_field_strings;
+                        e.is_dynamic = true;
+                        e.vtable_ptr = sym_addr;
+                        e.drop_fn = desc.drop_fn;
+                        e.drop_slot = drop_slot;
+                        e.owner = owner;
+                    },
+                )?
+            };
+            let vtable_key: Arc<str> = Arc::from(format!("bam.v0.{name}.vtable").as_str());
+            if !sym_addr.is_null() {
+                snap.symbols.insert(
+                    vtable_key,
+                    SymbolRecord {
+                        addr: sym_addr,
+                        owner,
+                    },
+                );
+            }
+            handle
+        };
+        self.publish_after_mutation();
+        Ok(handle)
+    }
+
+    /// Registers a guest-owned dynamic buffered message stream from a [`ComponentDesc`], creating
+    /// a dedicated [`DynamicMessageBuffer`] resource in `world` and returning its [`BamComponent`].
+    pub(crate) fn register_message_from_desc(
+        &mut self,
+        world: &mut World,
+        reg: DynamicMessageReg<'_>,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        let DynamicMessageReg {
+            desc,
+            name,
+            owner,
+            is_active,
+            schema_fingerprint,
+            fields,
+            owned_field_strings,
+        } = reg;
+        let storage_flags = component_flags_to_storage_flags(desc.flags) | BAM_STORAGE_FLAG_MESSAGE;
+        let existing_id = self
+            .snapshot
+            .get_by_name(name)
+            .map(|entry| entry.component_id);
+        self.check_registration_collision(
+            name,
+            desc.uuid,
+            desc.size,
+            desc.align,
+            storage_flags,
+            existing_id,
+        )?;
+        self.check_dynamic_drop_compatibility(name, desc.drop_fn.is_some())?;
+
+        let msg_res_id = if let Some(comp_id) = existing_id {
+            if let Some(res_ent) = world.resource_entities().get(comp_id)
+                && let Ok(mut ent_mut) = world.get_entity_mut(res_ent)
+                && let Ok(untyped) = ent_mut.get_mut_by_id(comp_id)
+            {
+                // SAFETY: `comp_id` was registered in `world` using `DynamicMessageBuffer`'s layout.
+                let mut buf = unsafe { untyped.with_type::<DynamicMessageBuffer>() };
+                buf.refresh_drop_binding(desc.drop_fn, Arc::clone(&is_active));
+            } else {
+                if world.resource_entities().get(comp_id).is_none() {
+                    world.spawn(bevy_ecs::resource::IsResource::new(comp_id));
+                }
+                let mut buf = core::mem::ManuallyDrop::new(DynamicMessageBuffer::new(
+                    desc.size,
+                    desc.align,
+                    desc.drop_fn,
+                    Arc::clone(&is_active),
+                ));
+                let nn = NonNull::from(&mut *buf).cast::<u8>();
+                // SAFETY: `nn` points to an initialized, ownership-transferred `DynamicMessageBuffer`.
+                let owning = unsafe { OwningPtr::new(nn) };
+                // SAFETY: `comp_id` was registered in `world` with `Layout::new::<DynamicMessageBuffer>()`.
+                unsafe {
+                    world.insert_resource_by_id(comp_id, owning, MaybeLocation::caller());
+                }
+            }
+            comp_id
+        } else {
+            // SAFETY: `Layout::new::<DynamicMessageBuffer>()` is exact for `DynamicMessageBuffer`, and
+            // `drop_dynamic_message_buffer` consumes `OwningPtr` via `ptr.read::<DynamicMessageBuffer>()`.
+            let bevy_desc = unsafe {
+                ComponentDescriptor::new_with_layout(
+                    format!("bam::dynamic_msg::{name}"),
+                    StorageType::Table,
+                    Layout::new::<DynamicMessageBuffer>(),
+                    Some(drop_dynamic_message_buffer),
+                    true,
+                    false,
+                    ComponentCloneBehavior::Ignore,
+                    None,
+                )
+            };
+            let new_id = world.register_component_with_descriptor(bevy_desc);
+            if world.resource_entities().get(new_id).is_none() {
+                world.spawn(bevy_ecs::resource::IsResource::new(new_id));
+            }
+            let mut buf = core::mem::ManuallyDrop::new(DynamicMessageBuffer::new(
+                desc.size,
+                desc.align,
+                desc.drop_fn,
+                is_active,
+            ));
+            let nn = NonNull::from(&mut *buf).cast::<u8>();
+            // SAFETY: `nn` points to an initialized, ownership-transferred `DynamicMessageBuffer`.
+            let owning = unsafe { OwningPtr::new(nn) };
+            // SAFETY: `new_id` was just registered with `Layout::new::<DynamicMessageBuffer>()`.
+            unsafe {
+                world.insert_resource_by_id(new_id, owning, MaybeLocation::caller());
+            }
+            new_id
+        };
+
+        let sym_addr = SymbolAddress::new(desc.vtable_ptr);
+        let handle = {
+            let snap = Arc::make_mut(&mut self.snapshot);
+            let handle = if let Some(&existing_handle) = snap.by_name.get(name) {
+                let idx = (existing_handle.0 - 1) as usize;
+                let entry = &mut snap.entries[idx];
+                if entry.is_dynamic {
+                    entry.schema_fingerprint = schema_fingerprint;
+                    entry.fields = Arc::clone(&fields);
+                    entry.owned_field_strings = owned_field_strings;
+                    entry.vtable_ptr = sym_addr;
+                    entry.drop_fn = desc.drop_fn;
+                    entry.create_msg_cursor_fn = Some(dynamic_create_msg_cursor);
+                    entry.msg_read_batch_fn = Some(dynamic_msg_read_batch);
+                    entry.msg_send_fn = Some(dynamic_msg_send);
+                    entry.msg_write_batch_fn = Some(dynamic_msg_write_batch);
+                    entry.owner = owner;
+                }
+                existing_handle
+            } else {
+                snap.alloc_handle_and_insert(
+                    NewComponentBase {
+                        name,
+                        uuid: desc.uuid,
+                        component_id: msg_res_id,
+                        size: desc.size,
+                        align: desc.align,
+                        storage_flags,
+                        is_abi_pod: desc.is_pod(),
+                    },
+                    |e| {
+                        e.schema_fingerprint = schema_fingerprint;
+                        e.fields = fields;
+                        e.owned_field_strings = owned_field_strings;
+                        e.is_dynamic = true;
+                        e.vtable_ptr = sym_addr;
+                        e.drop_fn = desc.drop_fn;
+                        e.create_msg_cursor_fn = Some(dynamic_create_msg_cursor);
+                        e.msg_read_batch_fn = Some(dynamic_msg_read_batch);
+                        e.msg_send_fn = Some(dynamic_msg_send);
+                        e.msg_write_batch_fn = Some(dynamic_msg_write_batch);
+                        e.owner = owner;
+                    },
+                )?
+            };
+            let vtable_key: Arc<str> = Arc::from(format!("bam.v0.{name}.vtable").as_str());
+            if !sym_addr.is_null() {
+                snap.symbols.insert(
+                    vtable_key,
+                    SymbolRecord {
+                        addr: sym_addr,
+                        owner,
+                    },
+                );
+            }
+            handle
+        };
+        self.publish_after_mutation();
         Ok(handle)
     }
 

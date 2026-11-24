@@ -284,14 +284,16 @@ mod heterogeneous_alignment_and_isolation {
             let ptr = (&mut *tag_mut as *mut MetadataTag).cast::<c_void>();
 
             let guest_msg = format!("guest_payload_{i}");
+            let guest_view = StrView::from_str(&guest_msg);
             unsafe {
+                assert_eq!((tag_vt.set_label.unwrap())(ptr, &guest_view), FfiResult::OK);
+                // Passing a sub-slice of the component's own buffer back into `set_label` must not UB!
+                let mut self_view = StrView::empty();
                 assert_eq!(
-                    (tag_vt.set_label.unwrap())(ptr, StrView::from_str(&guest_msg)),
+                    (tag_vt.get_label.unwrap())(ptr.cast_const(), &mut self_view),
                     FfiResult::OK
                 );
-                // Passing a sub-slice of the component's own buffer back into `set_label` must not UB!
-                let self_view = (tag_vt.get_label.unwrap())(ptr.cast_const());
-                assert_eq!((tag_vt.set_label.unwrap())(ptr, self_view), FfiResult::OK);
+                assert_eq!((tag_vt.set_label.unwrap())(ptr, &self_view), FfiResult::OK);
             }
         }
 

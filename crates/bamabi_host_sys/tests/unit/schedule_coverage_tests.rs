@@ -125,6 +125,7 @@ fn schedule_map_visible_sets_mode_and_registry_edge_cases() {
             after_sets: after,
             before_weak: false,
             after_weak: false,
+            ..ScheduleSetConfig::default()
         };
 
     let a = reg.configure_set(mk_cfg("a", vec![], vec![])).unwrap();
@@ -247,6 +248,7 @@ fn rewire_pass_covers_nested_sets_generation_fallback_and_condition_conflicts() 
             after_sets: vec![],
             before_weak: false,
             after_weak: false,
+            ..ScheduleSetConfig::default()
         })
         .unwrap();
     let weak_target_h = reg
@@ -261,6 +263,7 @@ fn rewire_pass_covers_nested_sets_generation_fallback_and_condition_conflicts() 
             after_sets: vec![],
             before_weak: false,
             after_weak: false,
+            ..ScheduleSetConfig::default()
         })
         .unwrap();
     // Add a set at `generation = 0` that has `before_weak` targeting `weak_target`
@@ -276,6 +279,7 @@ fn rewire_pass_covers_nested_sets_generation_fallback_and_condition_conflicts() 
             after_sets: vec![],
             before_weak: true,
             after_weak: false,
+            ..ScheduleSetConfig::default()
         })
         .unwrap();
     reg.mount_system(
@@ -400,4 +404,420 @@ fn mount_configure_ensure_and_rewire_in_world_cover_all_edges_and_leased_branche
         leased_sys.set_schedule(ScheduleId::FIXED_UPDATE);
         mount_mod_systems_in_world(w, "edge_mod", 0, vec![leased_sys]).unwrap();
     });
+}
+
+#[test]
+fn parse_target_supports_multi_segment_paths_and_set_config_supports_parent_sets_and_run_if_ctx() {
+    use core::sync::atomic::AtomicUsize;
+
+    // 1. Multi-segment `::` targets parse without rejecting nested namespaces.
+    assert_eq!(
+        ModNamedSystemSet::parse_target("mod_a::sub::set", "mod_a"),
+        Some(ModNamedSystemSet::new("mod_a", "sub::set"))
+    );
+    assert_eq!(
+        ModNamedSystemSet::parse_target("other::group::leaf", "mod_a"),
+        Some(ModNamedSystemSet::new("other", "group::leaf"))
+    );
+    assert_eq!(ModNamedSystemSet::parse_target("a::::b", "mod_a"), None);
+    assert_eq!(ModNamedSystemSet::parse_target("::a", "mod_a"), None);
+    assert_eq!(ModNamedSystemSet::parse_target("a::", "mod_a"), None);
+    assert_eq!(ModNamedSystemSet::parse_target("", "mod_a"), None);
+
+    // 2. `ScheduleSetConfig` `parent_sets` + `run_if_ctx` + `run_if_ctx_user_data`
+    #[repr(C)]
+    struct GateState {
+        allow: AtomicBool,
+        cond_calls: AtomicUsize,
+        sys_runs: AtomicUsize,
+    }
+
+    unsafe extern "C" fn gate_run_if(_ctx: *mut BamSystemCtx, user_data: *mut c_void) -> FfiResult {
+        // SAFETY: `user_data` points to live `GateState` for the duration of this test.
+        let state = unsafe { &*user_data.cast::<GateState>() };
+        state
+            .cond_calls
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        if state.allow.load(core::sync::atomic::Ordering::SeqCst) {
+            FfiResult::OK
+        } else {
+            FfiResult::INVALID_STATE
+        }
+    }
+
+    unsafe extern "C" fn child_sys_cb(
+        _ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        // SAFETY: `user_data` points to live `GateState`.
+        let state = unsafe { &*user_data.cast::<GateState>() };
+        state
+            .sys_runs
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        FfiResult::OK
+    }
+
+    let state = GateState {
+        allow: AtomicBool::new(false),
+        cond_calls: AtomicUsize::new(0),
+        sys_runs: AtomicUsize::new(0),
+    };
+    let state_ptr = (&raw const state).cast_mut().cast::<c_void>();
+
+    let mut world = World::new();
+    world.init_resource::<crate::drop_trampoline::WorldDropGuard>();
+    world.init_resource::<crate::system::ModQuarantine>();
+    world.init_resource::<ModHost>();
+    world.init_resource::<ModScheduleMap>();
+    world.init_resource::<ModScheduleSetRegistry>();
+    world.init_resource::<Schedules>();
+    world.add_schedule(Schedule::new(Update));
+
+    let reg = ModRegistry::new();
+    world.insert_resource(reg.clone());
+
+    {
+        let mut set_reg = world.resource_mut::<ModScheduleSetRegistry>();
+        let _parent_h = set_reg
+            .configure_set(ScheduleSetConfig {
+                mod_id: None,
+                mod_name: Arc::from("r43_mod"),
+                set_name: Arc::from("parent_grp"),
+                generation: 0,
+                schedule: ScheduleId::UPDATE,
+                mode: ScheduleSetMode::Parallel,
+                ..ScheduleSetConfig::default()
+            })
+            .unwrap();
+        let child_h = set_reg
+            .configure_set(ScheduleSetConfig {
+                mod_id: None,
+                mod_name: Arc::from("r43_mod"),
+                set_name: Arc::from("gated_child"),
+                generation: 0,
+                schedule: ScheduleId::UPDATE,
+                mode: ScheduleSetMode::Parallel,
+                parent_sets: vec!["r43_mod::parent_grp".to_owned()],
+                run_if_ctx: Some(gate_run_if),
+                run_if_ctx_user_data: GuestUserData::new(state_ptr),
+                ..ScheduleSetConfig::default()
+            })
+            .unwrap();
+        set_reg
+            .mount_system(
+                child_h,
+                ScheduleId::UPDATE,
+                ModNamedSystemSet::new("r43_mod", "child_sys"),
+            )
+            .unwrap();
+    }
+
+    let child_sys = GuestSystem::new("child_sys", vec![], child_sys_cb, state_ptr, reg)
+        .with_in_sets(vec!["r43_mod::gated_child".to_owned()]);
+    mount_mod_systems_in_world(&mut world, "r43_mod", 0, vec![child_sys]).unwrap();
+
+    world.run_schedule(Update);
+    assert_eq!(
+        state.cond_calls.load(core::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(state.sys_runs.load(core::sync::atomic::Ordering::SeqCst), 0);
+
+    state
+        .allow
+        .store(true, core::sync::atomic::Ordering::SeqCst);
+    world.run_schedule(Update);
+    assert_eq!(
+        state.cond_calls.load(core::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(state.sys_runs.load(core::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn configure_set_and_try_sync_reject_parent_sets_cycles_without_poisoning_schedule() {
+    let mut reg = ModScheduleSetRegistry::new();
+    let self_err = reg
+        .configure_set(ScheduleSetConfig {
+            mod_name: Arc::from("cyc"),
+            set_name: Arc::from("a"),
+            schedule: ScheduleId::UPDATE,
+            parent_sets: vec!["cyc::a".to_owned()],
+            ..ScheduleSetConfig::default()
+        })
+        .unwrap_err();
+    assert_eq!(self_err.0, FfiResult::CYCLE_DETECTED);
+
+    let _ha = reg
+        .configure_set(ScheduleSetConfig {
+            mod_name: Arc::from("cyc"),
+            set_name: Arc::from("a"),
+            schedule: ScheduleId::UPDATE,
+            parent_sets: vec!["cyc::b".to_owned()],
+            ..ScheduleSetConfig::default()
+        })
+        .unwrap();
+    let mutual_err = reg
+        .configure_set(ScheduleSetConfig {
+            mod_name: Arc::from("cyc"),
+            set_name: Arc::from("b"),
+            schedule: ScheduleId::UPDATE,
+            parent_sets: vec!["cyc::a".to_owned()],
+            ..ScheduleSetConfig::default()
+        })
+        .unwrap_err();
+    assert_eq!(mutual_err.0, FfiResult::CYCLE_DETECTED);
+
+    // Direct mutation on `ConfiguredScheduleSet` must still be caught cleanly by
+    // `try_sync_mod_schedule_set_configs_to_schedule` without mutating `ScheduleGraph`.
+    let hb = reg
+        .configure_set(ScheduleSetConfig {
+            mod_name: Arc::from("cyc"),
+            set_name: Arc::from("b"),
+            schedule: ScheduleId::UPDATE,
+            ..ScheduleSetConfig::default()
+        })
+        .unwrap();
+    reg.get_mut(hb).unwrap().parent_sets = vec!["cyc::a".to_owned()];
+    assert!(reg.has_parent_hierarchy_cycle(ScheduleId::UPDATE));
+
+    let mut world = World::new();
+    world.insert_resource(reg);
+    let mut schedule = Schedule::new(Update);
+    assert!(
+        try_sync_mod_schedule_set_configs_to_schedule(&world, ScheduleId::UPDATE, &mut schedule)
+            .is_err()
+    );
+
+    world
+        .resource_mut::<ModScheduleSetRegistry>()
+        .get_mut(hb)
+        .unwrap()
+        .parent_sets
+        .clear();
+    rewire_mod_schedule_sets_in_schedule(&mut world, ScheduleId::UPDATE, &mut schedule)
+        .expect("ScheduleGraph must remain unpoisoned after rejected cycle");
+}
+
+#[test]
+fn prevalidate_and_try_sync_reject_cross_dependency_overlapping_groups_and_flat_cycle_without_poisoning()
+ {
+    use core::sync::atomic::AtomicUsize;
+
+    unsafe extern "C" fn always_false(_ctx: *mut BamSystemCtx, _ud: *mut c_void) -> FfiResult {
+        FfiResult::INVALID_STATE
+    }
+    unsafe extern "C" fn inc_cb(_ctx: *mut BamSystemCtx, ud: *mut c_void) -> FfiResult {
+        // SAFETY: `ud` points to live `AtomicUsize` for the duration of this test.
+        unsafe { (&*ud.cast::<AtomicUsize>()).fetch_add(1, core::sync::atomic::Ordering::SeqCst) };
+        FfiResult::OK
+    }
+
+    // 1. `CrossDependency` + `FlatDependencySort` non-poisoning in `rewire_mod_schedule_sets_in_world`
+    let hits = AtomicUsize::new(0);
+    let hits_ptr = (&raw const hits).cast_mut().cast::<c_void>();
+    let mut world = World::new();
+    world.init_resource::<crate::drop_trampoline::WorldDropGuard>();
+    world.init_resource::<crate::system::ModQuarantine>();
+    world.init_resource::<ModHost>();
+    world.init_resource::<ModScheduleMap>();
+    world.init_resource::<ModScheduleSetRegistry>();
+    world.init_resource::<Schedules>();
+    let mod_reg = ModRegistry::new();
+    world.insert_resource(mod_reg.clone());
+
+    let (set1_h, su1_h, su3_h) = {
+        let mut sreg = world.resource_mut::<ModScheduleSetRegistry>();
+        let set2 = sreg
+            .configure_set(ScheduleSetConfig {
+                mod_name: Arc::from("pv"),
+                set_name: Arc::from("set_2"),
+                schedule: ScheduleId::UPDATE,
+                ..ScheduleSetConfig::default()
+            })
+            .unwrap();
+        let set1 = sreg
+            .configure_set(ScheduleSetConfig {
+                mod_name: Arc::from("pv"),
+                set_name: Arc::from("set_1"),
+                schedule: ScheduleId::UPDATE,
+                ..ScheduleSetConfig::default()
+            })
+            .unwrap();
+        let su2 = sreg
+            .configure_set(ScheduleSetConfig {
+                mod_name: Arc::from("pv"),
+                set_name: Arc::from("su2"),
+                schedule: ScheduleId::UPDATE,
+                run_if_ctx: Some(always_false),
+                ..ScheduleSetConfig::default()
+            })
+            .unwrap();
+        let su1 = sreg
+            .configure_set(ScheduleSetConfig {
+                mod_name: Arc::from("pv"),
+                set_name: Arc::from("su1"),
+                schedule: ScheduleId::UPDATE,
+                ..ScheduleSetConfig::default()
+            })
+            .unwrap();
+        let su3 = sreg
+            .configure_set(ScheduleSetConfig {
+                mod_name: Arc::from("pv"),
+                set_name: Arc::from("su3"),
+                schedule: ScheduleId::UPDATE,
+                ..ScheduleSetConfig::default()
+            })
+            .unwrap();
+        let su4 = sreg
+            .configure_set(ScheduleSetConfig {
+                mod_name: Arc::from("pv"),
+                set_name: Arc::from("su4"),
+                schedule: ScheduleId::UPDATE,
+                ..ScheduleSetConfig::default()
+            })
+            .unwrap();
+        let _ = set2;
+        sreg.mount_system(su1, ScheduleId::UPDATE, ModNamedSystemSet::new("pv", "u1"))
+            .unwrap();
+        sreg.mount_system(su2, ScheduleId::UPDATE, ModNamedSystemSet::new("pv", "u2"))
+            .unwrap();
+        sreg.mount_system(su3, ScheduleId::UPDATE, ModNamedSystemSet::new("pv", "u3"))
+            .unwrap();
+        sreg.mount_system(su4, ScheduleId::UPDATE, ModNamedSystemSet::new("pv", "u4"))
+            .unwrap();
+        (set1, su1, su3)
+    };
+
+    let s1 = GuestSystem::new("s1", vec![], inc_cb, hits_ptr, mod_reg.clone())
+        .with_in_sets(vec!["pv::set_1".to_owned()])
+        .with_ordering(vec!["pv::set_2".to_owned()], vec![]);
+    let s2 = GuestSystem::new("s2", vec![], inc_cb, hits_ptr, mod_reg.clone())
+        .with_in_sets(vec!["pv::set_2".to_owned()]);
+    let u1 = GuestSystem::new("u1", vec![], inc_cb, hits_ptr, mod_reg.clone())
+        .with_in_sets(vec!["pv::su1".to_owned()]);
+    let u2 = GuestSystem::new("u2", vec![], inc_cb, hits_ptr, mod_reg.clone())
+        .with_in_sets(vec!["pv::su2".to_owned()]);
+    let u3 = GuestSystem::new("u3", vec![], inc_cb, hits_ptr, mod_reg.clone())
+        .with_in_sets(vec!["pv::su3".to_owned()]);
+    let u4 = GuestSystem::new("u4", vec![], inc_cb, hits_ptr, mod_reg.clone())
+        .with_in_sets(vec!["pv::su4".to_owned()])
+        .with_ordering(vec![], vec!["pv::u3".to_owned()]);
+    mount_mod_systems_in_world(&mut world, "pv", 0, vec![s1, s2, u1, u2, u3, u4]).unwrap();
+
+    world.run_schedule(Update);
+    assert_eq!(hits.load(core::sync::atomic::Ordering::SeqCst), 5);
+
+    // CrossDependency check: `set_1.parent_sets = [pv::set_2]` while `s1` is `.after(pv::set_2)`.
+    {
+        let mut staged = world.resource::<ModScheduleSetRegistry>().clone();
+        staged.get_mut(set1_h).unwrap().parent_sets = vec!["pv::set_2".to_owned()];
+        let err = prevalidate_mod_schedule_set_rewire_in_world(&world, &staged, ScheduleId::UPDATE)
+            .unwrap_err();
+        assert!(matches!(err, ScheduleBuildError::CrossDependency(_)));
+    }
+    world
+        .resource_mut::<ModScheduleSetRegistry>()
+        .get_mut(set1_h)
+        .unwrap()
+        .parent_sets = vec!["pv::set_2".to_owned()];
+    assert!(matches!(
+        rewire_mod_schedule_sets_in_world(&mut world, ScheduleId::UPDATE),
+        Err(ScheduleBuildError::CrossDependency(_))
+    ));
+    world
+        .resource_mut::<ModScheduleSetRegistry>()
+        .get_mut(set1_h)
+        .unwrap()
+        .parent_sets
+        .clear();
+    rewire_mod_schedule_sets_in_world(&mut world, ScheduleId::UPDATE).unwrap();
+
+    // FlatDependencySort check with pending `su1.in_set(su2)`: `su1.in_set(su2)` MUST NOT leak!
+    let su4_h = world
+        .resource::<ModScheduleSetRegistry>()
+        .get_by_named_set(ScheduleId::UPDATE, &ModNamedSystemSet::new("pv", "su4"))
+        .unwrap()
+        .handle;
+    {
+        let mut sreg = world.resource_mut::<ModScheduleSetRegistry>();
+        sreg.get_mut(su1_h).unwrap().parent_sets = vec!["pv::su2".to_owned()];
+        sreg.set_edges(su3_h, vec![su4_h], vec![], false, false)
+            .unwrap();
+    }
+    assert!(matches!(
+        rewire_mod_schedule_sets_in_world(&mut world, ScheduleId::UPDATE),
+        Err(ScheduleBuildError::FlatDependencySort(_))
+    ));
+    {
+        let mut sreg = world.resource_mut::<ModScheduleSetRegistry>();
+        sreg.get_mut(su1_h).unwrap().parent_sets.clear();
+        sreg.set_edges(su3_h, vec![], vec![], false, false).unwrap();
+    }
+    rewire_mod_schedule_sets_in_world(&mut world, ScheduleId::UPDATE).unwrap();
+    world.run_schedule(Update);
+    // `u1` still executes (5 systems ran: s1, s2, u1, u3, u4), proving `su1.in_set(su2)` did not leak!
+    assert_eq!(hits.load(core::sync::atomic::Ordering::SeqCst), 10);
+
+    // 2. `SetsHaveOrderButIntersect` + uncreated/unregistered schedule prevalidation branches
+    let mut ov_world = World::new();
+    ov_world.init_resource::<ModHost>();
+    ov_world.init_resource::<ModScheduleMap>();
+    ov_world.init_resource::<ModScheduleSetRegistry>();
+    ov_world.init_resource::<Schedules>();
+    let mut ov_sched = Schedule::new(Update);
+    let g_a = ModNamedSystemSet::new("ov", "a");
+    let g_b = ModNamedSystemSet::new("ov", "b");
+    let g_c = ModNamedSystemSet::new("ov", "c");
+    ov_sched.configure_sets((g_b.before(g_c), g_a));
+    let sys_shared = GuestSystem::new(
+        "shared",
+        vec![],
+        noop_guest_cb,
+        core::ptr::null_mut(),
+        mod_reg,
+    )
+    .with_in_sets(vec!["ov::a".to_owned(), "ov::c".to_owned()]);
+    ov_sched.add_systems(configure_guest_system_for_schedule(
+        &ov_world, "ov", 0, sys_shared,
+    ));
+    ov_sched.initialize(&mut ov_world).unwrap();
+
+    {
+        let mut sreg = ov_world.resource_mut::<ModScheduleSetRegistry>();
+        sreg.configure_set(ScheduleSetConfig {
+            mod_name: Arc::from("ov"),
+            set_name: Arc::from("b"),
+            schedule: ScheduleId::UPDATE,
+            ..ScheduleSetConfig::default()
+        })
+        .unwrap();
+        sreg.configure_set(ScheduleSetConfig {
+            mod_name: Arc::from("ov"),
+            set_name: Arc::from("a"),
+            schedule: ScheduleId::UPDATE,
+            parent_sets: vec!["ov::b".to_owned()],
+            ..ScheduleSetConfig::default()
+        })
+        .unwrap();
+    }
+    let Err(ov_err) =
+        rewire_mod_schedule_sets_in_schedule(&mut ov_world, ScheduleId::UPDATE, &mut ov_sched)
+    else {
+        panic!("expected SetsHaveOrderButIntersect");
+    };
+    assert!(matches!(
+        ov_err,
+        ScheduleBuildError::SetsHaveOrderButIntersect(_)
+    ));
+    *ov_world.resource_mut::<ModScheduleSetRegistry>() = ModScheduleSetRegistry::new();
+    rewire_mod_schedule_sets_in_schedule(&mut ov_world, ScheduleId::UPDATE, &mut ov_sched)
+        .expect("ScheduleGraph must remain unpoisoned after SetsHaveOrderButIntersect");
+
+    // Unregistered custom schedule + absent built-in schedule (`PostUpdate`)
+    let empty_reg = ModScheduleSetRegistry::new();
+    prevalidate_mod_schedule_set_rewire_in_world(&ov_world, &empty_reg, ScheduleId::POST_UPDATE)
+        .unwrap();
+    prevalidate_mod_schedule_set_rewire_in_world(&ov_world, &empty_reg, ScheduleId::custom(999))
+        .unwrap();
 }

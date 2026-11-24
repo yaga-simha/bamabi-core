@@ -269,47 +269,51 @@ fn v03_diagnostics_uuid_layout_system_handle_and_rollback_edge_cases() {
             BAM_LOG_WARN,
             BAM_LOG_ERROR,
         ] {
+            let msg_view = StrView::from_str("diag msg");
             assert_eq!(
-                host_log_diagnostic(host_ptr, level, StrView::from_str("diag msg")),
+                host_log_diagnostic(host_ptr, level, &msg_view),
                 FfiResult::OK
             );
         }
+        let bad_view = StrView::from_str("bad");
+        let x_view = StrView::from_str("x");
+        let panic_view = StrView::from_str("guest panic");
         assert_eq!(
-            host_log_diagnostic(host_ptr, 42, StrView::from_str("bad")),
+            host_log_diagnostic(host_ptr, 42, &bad_view),
             FfiResult::INVALID_ARGUMENT
         );
         assert_eq!(
-            host_log_diagnostic(null(), BAM_LOG_INFO, StrView::from_str("x")),
+            host_log_diagnostic(null(), BAM_LOG_INFO, &x_view),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            host_log_diagnostic(bad_host, BAM_LOG_INFO, StrView::from_str("x")),
+            host_log_diagnostic(bad_host, BAM_LOG_INFO, &x_view),
             FfiResult::INVALID_STATE
         );
         assert_eq!(
-            host_log_diagnostic(host_ptr, BAM_LOG_INFO, bad_utf8_view),
+            host_log_diagnostic(host_ptr, BAM_LOG_INFO, &bad_utf8_view),
             FfiResult::INVALID_UTF8
         );
         assert_eq!(
-            host_log_diagnostic(host_ptr, BAM_LOG_INFO, null_len_view),
+            host_log_diagnostic(host_ptr, BAM_LOG_INFO, &null_len_view),
             FfiResult::NULL_POINTER
         );
 
         // `host_report_guest_fault`
         assert_eq!(
-            host_report_guest_fault(null(), StrView::from_str("x")),
+            host_report_guest_fault(null(), &x_view),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            host_report_guest_fault(bad_host, StrView::from_str("x")),
+            host_report_guest_fault(bad_host, &x_view),
             FfiResult::INVALID_STATE
         );
         assert_eq!(
-            host_report_guest_fault(host_ptr, bad_utf8_view),
+            host_report_guest_fault(host_ptr, &bad_utf8_view),
             FfiResult::INVALID_UTF8
         );
         assert_eq!(
-            host_report_guest_fault(host_ptr, StrView::from_str("guest panic")),
+            host_report_guest_fault(host_ptr, &panic_view),
             FfiResult::OK
         );
         assert_eq!(host_ctx.last_error_message(), "guest panic");
@@ -572,63 +576,66 @@ fn v03_reserved_slots_exhaustive_validation() {
 
         // 2. `host_intern_symbol`
         let mut out_sym = BamSymbol::INVALID;
+        let sym_view = StrView::from_str("sym");
+        let empty_view = StrView::from_str("");
         assert_eq!(
-            host_intern_symbol(host_ptr, StrView::from_str("sym"), null_mut()),
+            host_intern_symbol(host_ptr, &sym_view, null_mut()),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            host_intern_symbol(null(), StrView::from_str("sym"), &raw mut out_sym),
+            host_intern_symbol(null(), &sym_view, &raw mut out_sym),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            host_intern_symbol(bad_host, StrView::from_str("sym"), &raw mut out_sym),
+            host_intern_symbol(bad_host, &sym_view, &raw mut out_sym),
             FfiResult::INVALID_STATE
         );
         assert_eq!(
-            host_intern_symbol(host_ptr, StrView::from_str(""), &raw mut out_sym),
+            host_intern_symbol(host_ptr, &empty_view, &raw mut out_sym),
             FfiResult::INVALID_ARGUMENT
         );
         assert_eq!(
-            host_intern_symbol(host_ptr, bad_utf8_view, &raw mut out_sym),
+            host_intern_symbol(host_ptr, &bad_utf8_view, &raw mut out_sym),
             FfiResult::INVALID_UTF8
         );
         assert_eq!(
-            host_intern_symbol(host_ptr, StrView::from_str("sym"), &raw mut out_sym),
+            host_intern_symbol(host_ptr, &sym_view, &raw mut out_sym),
             FfiResult::OK
         );
         assert_eq!(out_sym, BamSymbol::from_raw(0));
 
         // 3. `host_bind_named_object`
+        let hero_view = StrView::from_str("hero");
         assert_eq!(
-            host_bind_named_object(null(), StrView::from_str("hero"), live_ent),
+            host_bind_named_object(null(), &hero_view, live_ent),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            host_bind_named_object(bad_host, StrView::from_str("hero"), live_ent),
+            host_bind_named_object(bad_host, &hero_view, live_ent),
             FfiResult::INVALID_STATE
         );
         assert_eq!(
-            host_bind_named_object(host_ptr, StrView::from_str(""), live_ent),
+            host_bind_named_object(host_ptr, &empty_view, live_ent),
             FfiResult::INVALID_ARGUMENT
         );
         assert_eq!(
-            host_bind_named_object(host_ptr, bad_utf8_view, live_ent),
+            host_bind_named_object(host_ptr, &bad_utf8_view, live_ent),
             FfiResult::INVALID_UTF8
         );
         assert_eq!(
-            host_bind_named_object(host_ptr, StrView::from_str("hero"), FfiEntity::NULL),
+            host_bind_named_object(host_ptr, &hero_view, FfiEntity::NULL),
             FfiResult::INVALID_ENTITY
         );
         assert_eq!(
-            host_bind_named_object(host_ptr, StrView::from_str("hero"), bad_ent),
+            host_bind_named_object(host_ptr, &hero_view, bad_ent),
             FfiResult::INVALID_ENTITY
         );
         assert_eq!(
-            host_bind_named_object(host_ptr, StrView::from_str("hero"), ph_ent),
+            host_bind_named_object(host_ptr, &hero_view, ph_ent),
             FfiResult::INVALID_ENTITY
         );
         assert_eq!(
-            host_bind_named_object(host_ptr, StrView::from_str("hero"), live_ent),
+            host_bind_named_object(host_ptr, &hero_view, live_ent),
             FfiResult::OK
         );
 
@@ -1331,11 +1338,13 @@ fn assets_scene_exhaustive_validation() {
         let mut out_state = FfiAssetLoadState::NOT_LOADED;
 
         // `host_asset_load` guards + no-backend `UNSUPPORTED`
+        let asset_a_view = StrView::from_str("a.png");
+        let empty_asset_view = StrView::from_str("");
         assert_eq!(
             host_asset_load(
                 ctx_no_backend.as_ffi_ptr(),
                 pos_h,
-                StrView::from_str("a.png"),
+                &asset_a_view,
                 null_mut()
             ),
             FfiResult::NULL_POINTER
@@ -1344,34 +1353,24 @@ fn assets_scene_exhaustive_validation() {
             host_asset_load(
                 ctx_no_backend.as_ffi_ptr(),
                 pos_h,
-                StrView::from_str("a.png"),
+                &asset_a_view,
                 unaligned_handle_mut
             ),
             FfiResult::INVALID_ARGUMENT
         );
         assert_eq!(
-            host_asset_load(
-                null(),
-                pos_h,
-                StrView::from_str("a.png"),
-                &raw mut out_handle
-            ),
+            host_asset_load(null(), pos_h, &asset_a_view, &raw mut out_handle),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            host_asset_load(
-                bad_ctx,
-                pos_h,
-                StrView::from_str("a.png"),
-                &raw mut out_handle
-            ),
+            host_asset_load(bad_ctx, pos_h, &asset_a_view, &raw mut out_handle),
             FfiResult::INVALID_STATE
         );
         assert_eq!(
             host_asset_load(
                 ctx_no_backend.as_ffi_ptr(),
                 pos_h,
-                bad_utf8_view,
+                &bad_utf8_view,
                 &raw mut out_handle
             ),
             FfiResult::INVALID_UTF8
@@ -1380,7 +1379,7 @@ fn assets_scene_exhaustive_validation() {
             host_asset_load(
                 ctx_no_backend.as_ffi_ptr(),
                 pos_h,
-                StrView::from_str(""),
+                &empty_asset_view,
                 &raw mut out_handle
             ),
             FfiResult::INVALID_ARGUMENT
@@ -1389,7 +1388,7 @@ fn assets_scene_exhaustive_validation() {
             host_asset_load(
                 ctx_no_backend.as_ffi_ptr(),
                 pos_h,
-                StrView::from_str("a.png"),
+                &asset_a_view,
                 &raw mut out_handle
             ),
             FfiResult::UNSUPPORTED
@@ -1560,11 +1559,12 @@ fn assets_scene_exhaustive_validation() {
         let ctx_with = HostContext::new(Arc::clone(&snap_with));
 
         // Happy paths + `FfiAssetHandle::NONE` fast paths + backend `Err` paths
+        let hero_glb_view = StrView::from_str("hero.glb");
         assert_eq!(
             host_asset_load(
                 ctx_with.as_ffi_ptr(),
                 pos_h,
-                StrView::from_str("hero.glb"),
+                &hero_glb_view,
                 &raw mut out_handle
             ),
             FfiResult::OK
@@ -1594,11 +1594,12 @@ fn assets_scene_exhaustive_validation() {
         );
 
         asset_backend.set_error(Some((FfiResult::NOT_FOUND, "missing asset")));
+        let missing_view = StrView::from_str("missing");
         assert_eq!(
             host_asset_load(
                 ctx_with.as_ffi_ptr(),
                 pos_h,
-                StrView::from_str("missing"),
+                &missing_view,
                 &raw mut out_handle
             ),
             FfiResult::NOT_FOUND

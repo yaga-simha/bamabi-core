@@ -122,26 +122,22 @@ fn named_object_survives_full_excise_unload_and_symbols_persist_across_reload() 
             LoadContext::with_world_and_mod_id(reg, active_1, world_ptr, Some(mod_1));
         // SAFETY: `load_ctx` is live.
         let host_ctx = unsafe { host_load_host_ctx(load_ctx.as_ffi_ptr()) };
+        let spawn_point_view = StrView::from_str("world::spawn_point");
         assert_eq!(
             // SAFETY: Valid `host_ctx`, UTF-8 string, and entity bits.
             unsafe {
                 host_bind_named_object(
                     host_ctx,
-                    StrView::from_str("world::spawn_point"),
+                    &raw const spawn_point_view,
                     FfiEntity::from_bits(bound_ent.to_bits()),
                 )
             },
             FfiResult::OK
         );
+        let portal_view = StrView::from_str("event::portal");
         assert_eq!(
             // SAFETY: Valid `host_ctx`, UTF-8 string, and out pointer.
-            unsafe {
-                host_intern_symbol(
-                    host_ctx,
-                    StrView::from_str("event::portal"),
-                    &raw mut sym_before,
-                )
-            },
+            unsafe { host_intern_symbol(host_ctx, &raw const portal_view, &raw mut sym_before) },
             FfiResult::OK
         );
         load_ctx.finish_init();
@@ -172,15 +168,10 @@ fn named_object_survives_full_excise_unload_and_symbols_persist_across_reload() 
             LoadContext::with_world_and_mod_id(reg, active_2, world_ptr, Some(mod_2));
         // SAFETY: `load_ctx` is live.
         let host_ctx = unsafe { host_load_host_ctx(load_ctx.as_ffi_ptr()) };
+        let portal_view = StrView::from_str("event::portal");
         assert_eq!(
             // SAFETY: Valid `host_ctx`, UTF-8 string, and out pointer.
-            unsafe {
-                host_intern_symbol(
-                    host_ctx,
-                    StrView::from_str("event::portal"),
-                    &raw mut sym_after,
-                )
-            },
+            unsafe { host_intern_symbol(host_ctx, &raw const portal_view, &raw mut sym_after) },
             FfiResult::OK
         );
         load_ctx.finish_init();

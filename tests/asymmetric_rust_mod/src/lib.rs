@@ -54,8 +54,8 @@ pub struct CombatHealthVTable {
 #[derive(Clone, Copy)]
 pub struct MetadataTagVTable {
     pub header: VTableHeader,
-    pub get_label: Option<unsafe extern "C" fn(*const c_void) -> StrView>,
-    pub set_label: Option<unsafe extern "C" fn(*mut c_void, StrView) -> FfiResult>,
+    pub get_label: Option<unsafe extern "C" fn(*const c_void, *mut StrView) -> FfiResult>,
+    pub set_label: Option<unsafe extern "C" fn(*mut c_void, *const StrView) -> FfiResult>,
 }
 
 // ============================================================================
@@ -378,8 +378,12 @@ fn setup(app: &mut GuestApp<'_>) -> FfiResult {
                                 return FfiResult::NULL_POINTER;
                             };
                             let t_ptr = t_raw.cast::<c_void>();
+                            let mut view = StrView::empty();
                             // SAFETY: `t_ptr` points to a valid `MetadataTag`/`NameTag` element.
-                            let view = unsafe { get_label(t_ptr) };
+                            let get_rc = unsafe { get_label(t_ptr, &mut view) };
+                            if get_rc.is_err() {
+                                return get_rc;
+                            }
                             // SAFETY: `view` borrows the UTF-8 buffer of the host `String` prior to mutation.
                             if let Ok(label) = unsafe { view.as_str() }
                                 && !label.starts_with("Modded_")
@@ -387,8 +391,9 @@ fn setup(app: &mut GuestApp<'_>) -> FfiResult {
                                 let mut updated = String::with_capacity(label.len() + 8);
                                 updated.push_str("Modded_");
                                 updated.push_str(label);
-                                // SAFETY: `t_ptr` is valid and `StrView::from_str` borrows `updated` for the call.
-                                let rc = unsafe { set_label(t_ptr, StrView::from_str(&updated)) };
+                                let updated_view = StrView::from_str(&updated);
+                                // SAFETY: `t_ptr` is valid and `updated_view` borrows `updated` for the call.
+                                let rc = unsafe { set_label(t_ptr, &updated_view) };
                                 if rc.is_err() {
                                     return rc;
                                 }

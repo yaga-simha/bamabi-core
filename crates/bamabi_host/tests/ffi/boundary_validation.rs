@@ -396,12 +396,12 @@ mod fuzz_boundaries {
                     assert_eq!(res, FfiResult::NULL_POINTER, "step {step}");
                 }
                 10 => {
-                    // Malformed `after` / `before`: invalid UTF-8 or invalid target syntax (`""` / `"a::b::c"`)
+                    // Malformed `after` / `before`: invalid UTF-8 or invalid target syntax (`""` / `"a::::b"`)
                     let bad_set = rng.invalid_utf8_cstring();
                     let (bad_ptr, expected) = match rng.range(3) {
                         0 => (bad_set.as_ptr().cast::<c_char>(), FfiResult::INVALID_UTF8),
                         1 => (c"".as_ptr(), FfiResult::INVALID_ARGUMENT),
-                        _ => (c"a::b::c".as_ptr(), FfiResult::INVALID_ARGUMENT),
+                        _ => (c"a::::b".as_ptr(), FfiResult::INVALID_ARGUMENT),
                     };
                     let ptrs: [*const c_char; 2] = [c"valid_set".as_ptr(), bad_ptr];
                     let desc = if rng.gen_bool() {
@@ -2455,13 +2455,15 @@ mod query_limits_and_placeholder_entities {
     use crate::support::Position;
     use bamabi_host::{ComponentOptions, ModRegistry};
     use bamabi_host_sys::{
-        HostCommands, HostCommandsStorage, LoadContext, host_cmd_despawn, host_cmd_insert,
-        host_cmd_insert_default, host_cmd_remove, host_cmd_spawn, host_cmd_spawn_empty,
-        host_register_component, host_register_system,
+        GuestSystem, HostCommands, HostCommandsStorage, LoadContext, host_cmd_despawn,
+        host_cmd_insert, host_cmd_insert_default, host_cmd_remove, host_cmd_spawn,
+        host_cmd_spawn_empty, host_register_component, host_register_system, host_sys_commands,
+        host_sys_query,
     };
     use bamabi_sys::{
-        BamComponent, BamQueryDesc, BamSystemCtx, BamSystemDesc, BamTermDesc, ComponentDesc,
-        ComponentUuid, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY,
+        BamCommands, BamComponent, BamIter, BamQueryDesc, BamSystemCtx, BamSystemDesc, BamTermDesc,
+        ComponentDesc, ComponentUuid, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM,
+        MAX_TERMS_PER_QUERY,
     };
     use bevy_ecs::entity::Entity;
     use bevy_ecs::world::World;
@@ -2610,5 +2612,58 @@ mod query_limits_and_placeholder_entities {
             let ent = Entity::try_from_bits(ffi_e.to_bits()).unwrap();
             assert!(world.entity(ent).contains_id(zst_id));
         }
+    }
+
+    #[test]
+    fn sys_query_and_sys_commands_reject_unaligned_output_pointers() {
+        use bamabi_host_sys::BamQuerySpecOwned;
+        use bevy_ecs::system::System as _;
+
+        let mut world = World::new();
+        let mut reg = ModRegistry::new();
+        let pos_id = world.register_component::<Position>();
+        let pos_h = reg
+            .register_component::<Position>(pos_id, ComponentOptions::new())
+            .unwrap();
+        world.insert_resource(reg.clone());
+
+        let mut buf = [0u64; 4];
+        let base = buf.as_mut_ptr() as usize;
+        let unaligned_iter = (base + 1) as *mut *mut BamIter;
+        let unaligned_cmds = (base + 1) as *mut *mut BamCommands;
+
+        #[repr(C)]
+        struct Probe {
+            unaligned_iter: *mut *mut BamIter,
+            unaligned_cmds: *mut *mut BamCommands,
+            query_rc: FfiResult,
+            cmds_rc: FfiResult,
+        }
+        unsafe extern "C" fn probe_cb(sys_ctx: *mut BamSystemCtx, ud: *mut c_void) -> FfiResult {
+            let p = unsafe { &mut *ud.cast::<Probe>() };
+            unsafe {
+                p.query_rc = host_sys_query(sys_ctx, 0, p.unaligned_iter);
+                p.cmds_rc = host_sys_commands(sys_ctx, p.unaligned_cmds);
+            }
+            FfiResult::OK
+        }
+
+        let mut probe = Probe {
+            unaligned_iter,
+            unaligned_cmds,
+            query_rc: FfiResult::OK,
+            cmds_rc: FfiResult::OK,
+        };
+        let mut sys = GuestSystem::new(
+            "boundary_sys_align_probe",
+            vec![BamQuerySpecOwned::new(vec![BamTermDesc::read(pos_h)])],
+            probe_cb,
+            (&raw mut probe).cast::<c_void>(),
+            reg,
+        );
+        sys.initialize(&mut world);
+        sys.run((), &mut world).unwrap();
+        assert_eq!(probe.query_rc, FfiResult::INVALID_ARGUMENT);
+        assert_eq!(probe.cmds_rc, FfiResult::INVALID_ARGUMENT);
     }
 }

@@ -163,8 +163,8 @@ unsafe fn validate_asset_handle_call<'a>(
 /// non-null and alignment checks.
 ///
 /// # Errors
-/// - [`FfiResult::NULL_POINTER`]: `out_handle` or `ctx` is null (or `path.ptr` is null with `path.len > 0`).
-/// - [`FfiResult::INVALID_ARGUMENT`]: `out_handle` is misaligned or `path` is empty.
+/// - [`FfiResult::NULL_POINTER`]: `out_handle`, `ctx`, or `path` is null (or `(*path).ptr` is null with `(*path).len > 0`).
+/// - [`FfiResult::INVALID_ARGUMENT`]: `out_handle` or `path` is misaligned or `path` is empty.
 /// - [`FfiResult::INVALID_STATE`]: `ctx` header magic/generation is invalid or poisoned.
 /// - [`FfiResult::INVALID_UTF8`]: `path` is not valid UTF-8.
 /// - [`FfiResult::UNSUPPORTED`]: No [`HostAssetBackend`] is registered on [`crate::ModRegistry`].
@@ -172,21 +172,29 @@ unsafe fn validate_asset_handle_call<'a>(
 ///
 /// # Safety
 /// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
-/// - If `path.len > 0` and `!path.ptr.is_null()`, `path` must reference `path.len` readable bytes.
+/// - `path` must point to a valid, aligned [`StrView`] whose `ptr` references `len` readable bytes when `len > 0`, or null.
 /// - `out_handle` must point to writable [`FfiAssetHandle`] storage, or null.
 pub unsafe extern "C" fn host_asset_load(
     ctx: *const BamHostCtx,
     asset_type: BamComponent,
-    path: StrView,
+    path: *const StrView,
     out_handle: *mut FfiAssetHandle,
 ) -> FfiResult {
     // SAFETY: `out_handle` is validated non-null and aligned before writing `NONE`.
     ffi_try!(unsafe { init_out_ptr(out_handle, FfiAssetHandle::NONE) });
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
     let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
+    if path.is_null() {
+        host_ctx.set_last_error("asset_load: path StrView pointer is null");
+        return FfiResult::NULL_POINTER;
+    }
+    if !path.is_aligned() {
+        host_ctx.set_last_error("asset_load: path StrView pointer is misaligned");
+        return FfiResult::INVALID_ARGUMENT;
+    }
 
-    // SAFETY: Caller guarantees `path` points to initialized bytes when `path.len > 0 && !path.ptr.is_null()`.
-    let path_str = match unsafe { path.try_as_str() } {
+    // SAFETY: `path` was validated non-null and aligned above; `try_as_str` validates its interior bytes.
+    let path_str = match unsafe { (*path).try_as_str() } {
         Ok(s) => s,
         Err(err) => {
             host_ctx.set_last_error(format!("asset_load: invalid path StrView ({err})"));

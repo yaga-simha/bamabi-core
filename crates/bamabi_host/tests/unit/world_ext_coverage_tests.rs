@@ -85,32 +85,35 @@ fn mod_unload_hooks_and_world_ext_error_paths() {
         world.unload_mod(ModId(999)),
         Err(ModLoadError::ModNotFound { id: ModId(999) })
     ));
-    assert!(matches!(
-        world.reload_mod(ModId(999)),
-        Err(ModLoadError::ModNotFound { id: ModId(999) })
-    ));
-    assert!(matches!(
-        world.reload_mod_with(ModId(999), LoadOptions::default()),
-        Err(ModLoadError::ModNotFound { id: ModId(999) })
-    ));
-    assert!(matches!(
-        world.reload_mod_from(ModId(999), "missing.so", LoadOptions::default()),
-        Err(ModLoadError::ModNotFound { id: ModId(999) })
-    ));
 
     world.unload_all_mods();
 
-    assert!(
-        world
-            .load_mods_dir("/nonexistent/bamabi_world_ext_missing")
-            .is_err()
-    );
-    assert!(
-        world
-            .load_mods_dir_with(
-                "/nonexistent/bamabi_world_ext_missing",
-                LoadOptions::default()
-            )
-            .is_err()
-    );
+    #[cfg(feature = "dynamic-loader")]
+    {
+        assert!(matches!(
+            world.reload_mod(ModId(999)),
+            Err(ModLoadError::ModNotFound { id: ModId(999) })
+        ));
+        assert!(matches!(
+            world.reload_mod_with(ModId(999), LoadOptions::default()),
+            Err(ModLoadError::ModNotFound { id: ModId(999) })
+        ));
+        assert!(matches!(
+            world.reload_mod_from(ModId(999), "missing.so", LoadOptions::default()),
+            Err(ModLoadError::ModNotFound { id: ModId(999) })
+        ));
+        assert!(
+            world
+                .load_mods_dir("/nonexistent/bamabi_world_ext_missing")
+                .is_err()
+        );
+        assert!(
+            world
+                .load_mods_dir_with(
+                    "/nonexistent/bamabi_world_ext_missing",
+                    LoadOptions::default()
+                )
+                .is_err()
+        );
+    }
 }

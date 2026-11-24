@@ -61,7 +61,7 @@ pub const STRICT_FFI_CHECKS: bool = cfg!(any(debug_assertions, feature = "strict
 static NEXT_HANDLE_GENERATION: AtomicU32 = AtomicU32::new(1);
 
 #[inline]
-fn next_non_zero_generation() -> u32 {
+pub(crate) fn next_non_zero_generation() -> u32 {
     loop {
         let next_gen = NEXT_HANDLE_GENERATION.fetch_add(1, Ordering::Relaxed);
         if next_gen != 0 {
@@ -531,6 +531,22 @@ impl HostContext {
         }
     }
 
+    /// Creates a new [`HostContext`] using an explicit non-zero `generation` and reusable diagnostic buffer.
+    #[inline]
+    pub fn with_generation_error_buffer(
+        snapshot: Arc<RegistrySnapshot>,
+        mut error_buf: String,
+        generation: u32,
+    ) -> Self {
+        error_buf.clear();
+        Self {
+            header: HandleHeader::with_generation(HOST_CTX_MAGIC, generation),
+            snapshot: UnsafeCell::new(snapshot),
+            default_namespace: None,
+            last_error: RefCell::new(error_buf),
+        }
+    }
+
     /// Attaches a default module namespace (manifest name) used to qualify unqualified component names.
     #[inline]
     pub fn with_namespace(mut self, ns: Option<Arc<str>>) -> Self {
@@ -596,6 +612,20 @@ impl HostContext {
     #[inline]
     pub fn reclaim_error_buffer(&mut self) -> String {
         core::mem::take(self.last_error.get_mut())
+    }
+
+    /// Re-arms this [`HostContext`] for a new invocation using `generation` while retaining its
+    /// `snapshot`, `default_namespace`, and `last_error` allocation without cloning `Arc`s.
+    #[inline]
+    pub(crate) fn rearm_with_generation(&mut self, generation: u32) {
+        self.header = HandleHeader::with_generation(HOST_CTX_MAGIC, generation);
+        self.last_error.get_mut().clear();
+    }
+
+    /// Updates the cached `default_namespace` in place without rebuilding the context.
+    #[inline]
+    pub(crate) fn set_namespace(&mut self, ns: Option<Arc<str>>) {
+        self.default_namespace = ns;
     }
 
     /// Returns a const [`BamHostCtx`] pointer to `self`.

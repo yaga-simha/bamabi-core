@@ -15,6 +15,10 @@ categories.workspace = true
 workspace = true
 
 [features]
+default = ["dynamic-loader"]
+dynamic-loader = ["dep:libloading"]
+static-only = []
+cranelift-object-loader = []
 strict-ffi-checks = []
 test-utils = []
 diagnostics = []
@@ -30,7 +34,7 @@ bevy_app = { workspace = true }
 bevy_platform = { workspace = true }
 bevy_tasks = { workspace = true }
 bevy_reflect = { workspace = true, optional = true }
-libloading = { workspace = true }
+libloading = { workspace = true, optional = true }
 nonmax = { workspace = true }
 arc-swap = { workspace = true }
 thiserror = { workspace = true }

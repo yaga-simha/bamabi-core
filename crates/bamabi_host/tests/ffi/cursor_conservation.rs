@@ -516,18 +516,18 @@ fn decode_host_chat_msg(host_ptr: *const c_void) -> ChatMsg {
         sink: Option<
             unsafe extern "C" fn(
                 sink_ctx: *mut c_void,
-                field_name: StrView,
-                type_tag: StrView,
-                payload: FfiSlice<u8>,
+                field_name: *const StrView,
+                type_tag: *const StrView,
+                payload: *const FfiSlice<u8>,
             ) -> FfiResult,
         >,
         sink_ctx: *mut c_void,
     ) -> FfiResult;
     type ImportFieldFn = unsafe extern "C" fn(
         dst_ptr: *mut c_void,
-        field_name: StrView,
-        type_tag: StrView,
-        payload: FfiSlice<u8>,
+        field_name: *const StrView,
+        type_tag: *const StrView,
+        payload: *const FfiSlice<u8>,
     ) -> FfiResult;
 
     let export_ptr =
@@ -545,9 +545,9 @@ fn decode_host_chat_msg(host_ptr: *const c_void) -> ChatMsg {
     }
     unsafe extern "C" fn fwd(
         ctx: *mut c_void,
-        name: StrView,
-        tag: StrView,
-        payload: FfiSlice<u8>,
+        name: *const StrView,
+        tag: *const StrView,
+        payload: *const FfiSlice<u8>,
     ) -> FfiResult {
         let c = unsafe { &*ctx.cast::<Ctx>() };
         unsafe { (c.import_fn)(c.dst, name, tag, payload) }

@@ -25,6 +25,9 @@ pub unsafe extern "C" fn host_cmd_spawn_persistent(
     if out_entity.is_null() {
         return FfiResult::NULL_POINTER;
     }
+    if !out_entity.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
     // SAFETY: Validates `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
     let cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
     // SAFETY: `cmds` is validated, `out_entity` is non-null and writable, and caller guarantees `components`/`data_ptrs`.

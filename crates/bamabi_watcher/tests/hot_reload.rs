@@ -381,13 +381,13 @@ fn watcher_live_reloads_modified_shared_library() {
         .expect("initial load");
     std::thread::sleep(Duration::from_millis(200));
     app.update();
+    app.world_mut().resource_mut::<WatchCounter>().value = 0;
+    app.update();
+    assert_eq!(app.world().resource::<WatchCounter>().value, 1);
     app.world_mut()
         .resource_mut::<ModHotReloadHistory>()
         .outcomes
         .clear();
-    app.world_mut().resource_mut::<WatchCounter>().value = 0;
-    app.update();
-    assert_eq!(app.world().resource::<WatchCounter>().value, 1);
 
     std::thread::sleep(Duration::from_millis(120));
     assert!(compile_c_watch_mod(
@@ -444,12 +444,12 @@ fn watcher_cascades_dag_reload_on_base_mod_rebuild_and_rejects_broken_semver_edi
 
     std::fs::write(
         base_dir.join("mod.toml"),
-        "[mod]\nid = \"base_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n",
+        "[mod]\nid = \"base_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n",
     )
     .unwrap();
     std::fs::write(
         addon_dir.join("mod.toml"),
-        "[mod]\nid = \"addon_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nbase_mod = \"^1.0\"\n",
+        "[mod]\nid = \"addon_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n\n[dependencies]\nbase_mod = \"^1.0\"\n",
     )
     .unwrap();
 
@@ -821,7 +821,7 @@ fn broken_mod_toml_edit_produces_failed_and_keeps_old_mod() {
     let cfg_toml = cfg_dir.join("mod.toml");
     std::fs::write(
         &cfg_toml,
-        "[mod]\nid = \"cfg_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n",
+        "[mod]\nid = \"cfg_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n",
     )
     .unwrap();
     if !compile_c_watch_mod(&build_dir, &cfg_dylib, "cfg_mod", "1.0.0", 4) {
@@ -933,14 +933,14 @@ fn watcher_runs_in_mod_lifecycle_flush_and_reloads_pre_update_mod() {
         .expect("load PreUpdate mod");
     std::thread::sleep(Duration::from_millis(200));
     app.update();
-    app.world_mut()
-        .resource_mut::<ModHotReloadHistory>()
-        .outcomes
-        .clear();
     app.world_mut().resource_mut::<WatchCounter>().value = 0;
 
     app.update();
     assert_eq!(app.world().resource::<WatchCounter>().value, 1);
+    app.world_mut()
+        .resource_mut::<ModHotReloadHistory>()
+        .outcomes
+        .clear();
 
     // Modify the PreUpdate mod -> ModLifecycleFlush reloads it cleanly without ScheduleLeased or UAF!
     std::thread::sleep(Duration::from_millis(120));
@@ -1030,7 +1030,7 @@ fn sync_on_start_loads_mod_with_startup_system_cleanly_before_first_update() {
     let dylib_path = startup_dir.join(dylib_filename("startup_mod"));
     std::fs::write(
         startup_dir.join("mod.toml"),
-        "[mod]\nid = \"startup_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n",
+        "[mod]\nid = \"startup_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n",
     )
     .unwrap();
     if !compile_c_startup_and_update_mod(&build_dir, &dylib_path, "startup_mod", "1.0.0", 100, 1) {
@@ -1142,12 +1142,12 @@ fn schedule_leased_defers_dag_sync_and_retries_next_frame_without_failed() {
 
     std::fs::write(
         base_dir.join("mod.toml"),
-        "[mod]\nid = \"base_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n",
+        "[mod]\nid = \"base_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n",
     )
     .unwrap();
     std::fs::write(
         addon_dir.join("mod.toml"),
-        "[mod]\nid = \"addon_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nbase_mod = \"^1.0\"\n",
+        "[mod]\nid = \"addon_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n\n[dependencies]\nbase_mod = \"^1.0\"\n",
     )
     .unwrap();
 

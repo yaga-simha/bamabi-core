@@ -1,6 +1,10 @@
-use super::*;
+use super::ModAppExt;
 use crate::AbiModPlugin;
+use bamabi_host_sys::ModErrorPolicy;
+#[cfg(feature = "signature-verification")]
+use bamabi_host_sys::ModTrustPolicy;
 use bamabi_macros::ModComponent;
+use bevy_app::App;
 use bevy_ecs::message::Message;
 
 #[derive(Message, Default, Debug, ModComponent)]
@@ -29,8 +33,11 @@ fn app_ext_forwards_non_pod_message_policy_and_load_dir_error() {
         assert!(app.evict_revoked_mods().is_empty());
     }
 
-    let err = app
-        .load_mods_dir("/nonexistent/bamabi_app_ext_missing_mods")
-        .expect_err("nonexistent directory should yield ModDagError::Io");
-    assert!(err.is_io());
+    #[cfg(feature = "dynamic-loader")]
+    {
+        let err = app
+            .load_mods_dir("/nonexistent/bamabi_app_ext_missing_mods")
+            .expect_err("nonexistent directory should yield ModDagError::Io");
+        assert!(err.is_io());
+    }
 }

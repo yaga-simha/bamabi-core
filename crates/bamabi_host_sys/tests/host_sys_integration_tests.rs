@@ -1148,13 +1148,14 @@ fn extended_host_api_slots_asset_scene_backends_and_wire_bridges() {
 
     let ctx_no_backend = bamabi_host_sys::HostContext::new(reg.snapshot_arc());
     let mut out_asset = FfiAssetHandle::NONE;
+    let hero_png_view = StrView::from_str("mods://hero.png");
     // SAFETY: Valid `ctx_no_backend` and `out_asset`.
     unsafe {
         assert_eq!(
             host_asset_load(
                 ctx_no_backend.as_ffi_ptr(),
                 tex_handle,
-                StrView::from_str("mods://hero.png"),
+                &hero_png_view,
                 &mut out_asset,
             ),
             FfiResult::UNSUPPORTED
@@ -1220,7 +1221,7 @@ fn extended_host_api_slots_asset_scene_backends_and_wire_bridges() {
             host_asset_load(
                 ctx_with_backend.as_ffi_ptr(),
                 tex_handle,
-                StrView::from_str("mods://hero.png"),
+                &hero_png_view,
                 &mut out_asset,
             ),
             FfiResult::OK
@@ -1312,11 +1313,15 @@ fn extended_host_api_slots_asset_scene_backends_and_wire_bridges() {
         assert_eq!(s_val.0, 8.0);
 
         let l_vt = &*label_vt_addr.cast::<MappedStringVTable>();
-        let view = (l_vt.get.unwrap())((&raw const l_val).cast::<c_void>());
+        let mut view = StrView::empty();
+        assert_eq!(
+            (l_vt.get.unwrap())((&raw const l_val).cast::<c_void>(), &mut view),
+            FfiResult::OK
+        );
         assert_eq!(view.try_as_str().unwrap(), "hello");
         // Verify self-aliasing `set_str(get_str)` safety!
         assert_eq!(
-            (l_vt.set.unwrap())((&raw mut l_val).cast::<c_void>(), view),
+            (l_vt.set.unwrap())((&raw mut l_val).cast::<c_void>(), &view),
             FfiResult::OK
         );
         assert_eq!(l_val.0, "hello");

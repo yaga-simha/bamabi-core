@@ -11,7 +11,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -36,13 +36,13 @@ redundant_clone = "warn"
 match_same_arms = "warn"
 
 [workspace.dependencies]
-bamabi_sys = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
-bamabi_macros = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
-bamabi_sdk_gen = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
-bamabi_trust = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-tools.git", branch = "main" }
-bamabi_manifest = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-tools.git", branch = "main" }
-bamabi_host_sys = { version = "0.3.0", path = "crates/bamabi_host_sys" }
-bamabi_host = { version = "0.3.0", path = "crates/bamabi_host" }
+bamabi_sys = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+bamabi_macros = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+bamabi_sdk_gen = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+bamabi_trust = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-tools.git", branch = "main" }
+bamabi_manifest = { version = "0.4.0", git = "https://github.com/yaga-simha/bamabi-tools.git", branch = "main" }
+bamabi_host_sys = { version = "0.4.0", path = "crates/bamabi_host_sys", default-features = false }
+bamabi_host = { version = "0.4.0", path = "crates/bamabi_host", default-features = false }
 bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
 bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
 bevy_platform = { version = "0.20.1", default-features = false, features = ["std"] }

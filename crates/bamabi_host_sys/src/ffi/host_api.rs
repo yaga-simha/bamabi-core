@@ -1,11 +1,12 @@
-//! Static 73-slot `HOST_API: BamHostApi` function table passed to `bamabi_init`.
+//! Static 90-slot `HOST_API: BamHostApi` function table passed to `bamabi_init`.
 
 use crate::ffi::assets_scene::{
     host_asset_get_load_state, host_asset_load, host_asset_release, host_cmd_spawn_scene,
 };
 use crate::ffi::commands::{
-    host_cmd_despawn, host_cmd_insert, host_cmd_insert_default, host_cmd_remove, host_cmd_spawn,
-    host_cmd_spawn_empty, host_cmd_trigger,
+    host_cmd_despawn, host_cmd_despawn_batch, host_cmd_insert, host_cmd_insert_batch,
+    host_cmd_insert_default, host_cmd_remove, host_cmd_remove_batch, host_cmd_spawn,
+    host_cmd_spawn_batch_ex, host_cmd_spawn_empty, host_cmd_trigger,
 };
 use crate::ffi::commands_ext::{
     host_cmd_clone_entity, host_cmd_despawn_all, host_cmd_insert_if_new, host_cmd_insert_resource,
@@ -14,17 +15,23 @@ use crate::ffi::commands_ext::{
 use crate::ffi::hierarchy_ext::host_sys_entity_children;
 use crate::ffi::iter::{
     host_iter_column_info, host_iter_column_mutable, host_iter_column_mutable_untracked,
-    host_iter_column_readonly, host_iter_column_rows_mutable, host_iter_column_rows_readonly,
-    host_iter_column_ticks, host_iter_entities, host_iter_mark_changed_range, host_iter_next_chunk,
-    host_iter_next_chunk_batch, host_iter_reset, host_msg_read_batch, host_msg_send,
-    host_msg_write_batch, host_par_for_each_chunk, host_res_mut_ptr, host_res_ptr, host_res_ticks,
+    host_iter_column_readonly, host_iter_column_rows_mutable,
+    host_iter_column_rows_mutable_untracked, host_iter_column_rows_readonly,
+    host_iter_column_ticks, host_iter_entities, host_iter_mark_changed_range,
+    host_iter_mark_changed_ranges, host_iter_next_chunk, host_iter_next_chunk_batch,
+    host_iter_reset, host_msg_read_batch, host_msg_read_slice, host_msg_send, host_msg_write_batch,
+    host_par_for_each_chunk, host_par_for_each_chunk_ex, host_res_mut_ptr, host_res_ptr,
+    host_res_ticks,
 };
 use crate::ffi::iter_ext::host_iter_read_removed;
 use crate::ffi::observers_ext::{host_cmd_observe, host_cmd_trigger_ex};
 use crate::ffi::proc_address::host_get_proc_address;
 use crate::ffi::register::{
-    host_load_host_ctx, host_register_component, host_register_observer, host_register_system,
-    host_resolve_component,
+    host_load_host_ctx, host_register_component, host_register_message, host_register_observer,
+    host_register_resource, host_register_system, host_resolve_component,
+};
+use crate::ffi::relations::{
+    host_sys_relation_edge_data, host_sys_relation_sources, host_sys_relation_targets,
 };
 use crate::ffi::v03_ext::{
     host_bind_named_object, host_cmd_checkpoint, host_cmd_insert_relation,
@@ -32,16 +39,17 @@ use crate::ffi::v03_ext::{
     host_configure_schedule_set, host_intern_symbol, host_iter_count, host_iter_up_cascade,
     host_log_diagnostic, host_migrate_component_column, host_mount_system_in_schedule,
     host_par_for_each_chunk_readonly, host_register_relation, host_register_system_handle,
-    host_report_guest_fault, host_resolve_component_by_uuid,
+    host_report_guest_fault, host_resolve_component_by_uuid, host_resolve_named_object,
+    host_resolve_symbol_str,
 };
 use crate::handle_header::host_last_error;
 use crate::system::{
-    host_sys_commands, host_sys_entity_get, host_sys_entity_get_mut, host_sys_host_ctx,
-    host_sys_query, host_sys_res_mut_ptr, host_sys_res_ptr,
+    host_sys_commands, host_sys_current_ticks, host_sys_entity_get, host_sys_entity_get_mut,
+    host_sys_host_ctx, host_sys_query, host_sys_res_mut_ptr, host_sys_res_ptr, host_sys_time_info,
 };
 use bamabi_sys::{ABI_VERSION, BamHostApi};
 
-/// Global immutable 73-slot C-ABI v0.3 host function table.
+/// Global immutable 90-slot C-ABI v0.4 host function table.
 pub static HOST_API: BamHostApi = BamHostApi {
     struct_size: core::mem::size_of::<BamHostApi>() as u32,
     abi_version: ABI_VERSION,
@@ -138,8 +146,29 @@ pub static HOST_API: BamHostApi = BamHostApi {
     cmd_clone_entity: Some(host_cmd_clone_entity),
     cmd_insert_resource: Some(host_cmd_insert_resource),
     cmd_remove_resource: Some(host_cmd_remove_resource),
+
+    // ABI `0.4.0` extended registration, zero-copy messaging, time, relations, and batch commands
+    register_resource: Some(host_register_resource),
+    register_message: Some(host_register_message),
+    resolve_named_object: Some(host_resolve_named_object),
+    resolve_symbol_str: Some(host_resolve_symbol_str),
+    iter_column_rows_mutable_untracked: Some(host_iter_column_rows_mutable_untracked),
+    iter_mark_changed_ranges: Some(host_iter_mark_changed_ranges),
+    sys_current_ticks: Some(host_sys_current_ticks),
+    sys_time_info: Some(host_sys_time_info),
+    par_for_each_chunk_ex: Some(host_par_for_each_chunk_ex),
+    sys_relation_targets: Some(host_sys_relation_targets),
+    sys_relation_sources: Some(host_sys_relation_sources),
+    sys_relation_edge_data: Some(host_sys_relation_edge_data),
+    cmd_despawn_batch: Some(host_cmd_despawn_batch),
+    cmd_insert_batch: Some(host_cmd_insert_batch),
+    cmd_remove_batch: Some(host_cmd_remove_batch),
+    msg_read_slice: Some(host_msg_read_slice),
+    cmd_spawn_batch_ex: Some(host_cmd_spawn_batch_ex),
 };
 
 const _: () = assert!(HOST_API.has_all_v0_2_slots());
 const _: () = assert!(HOST_API.has_all_v0_3_slots());
+const _: () = assert!(HOST_API.has_all_v0_4_slots());
 const _: () = assert!(HOST_API.has_all_slots());
+const _: () = assert!(core::mem::size_of::<BamHostApi>() == BamHostApi::MIN_V0_4_SIZE);

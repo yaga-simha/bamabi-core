@@ -217,28 +217,36 @@ fn bridge_wire_string_resource_event_relationship_shims_and_errors() {
     };
     // SAFETY: Null, unaligned, and invalid UTF-8 inputs are rejected by `StringVTableFactory`.
     unsafe {
-        assert_eq!(str_get(core::ptr::null()).len, 0);
-        assert_eq!(str_get(unaligned_ptr).len, 0);
+        let mut out_view = StrView::empty();
         assert_eq!(
-            str_get((&raw const lbl).cast::<c_void>())
-                .try_as_str()
-                .unwrap(),
-            "hello"
-        );
-        assert_eq!(
-            str_set(core::ptr::null_mut(), StrView::from_str("x")),
+            str_get(core::ptr::null(), &raw mut out_view),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            str_set(unaligned_ptr.cast_mut(), StrView::from_str("x")),
+            str_get(unaligned_ptr, &raw mut out_view),
             FfiResult::INVALID_ARGUMENT
         );
         assert_eq!(
-            str_set((&raw mut lbl).cast::<c_void>(), bad_view),
-            FfiResult::INVALID_UTF8
+            str_get((&raw const lbl).cast::<c_void>(), &raw mut out_view),
+            FfiResult::OK
+        );
+        assert_eq!(out_view.try_as_str().unwrap(), "hello");
+        let x_view = StrView::from_str("x");
+        assert_eq!(
+            str_set(core::ptr::null_mut(), &raw const x_view),
+            FfiResult::NULL_POINTER
         );
         assert_eq!(
-            str_set((&raw mut lbl).cast::<c_void>(), StrView::from_str("world")),
+            str_set(unaligned_ptr.cast_mut(), &raw const x_view),
+            FfiResult::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            str_set((&raw mut lbl).cast::<c_void>(), &raw const bad_view),
+            FfiResult::INVALID_UTF8
+        );
+        let world_view = StrView::from_str("world");
+        assert_eq!(
+            str_set((&raw mut lbl).cast::<c_void>(), &raw const world_view),
             FfiResult::OK
         );
         assert_eq!(lbl.0, "world");

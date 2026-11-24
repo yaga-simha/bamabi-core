@@ -234,9 +234,13 @@ static BamResult c_metadata_system(BamSystemCtx* sys_ctx, void* user_data) {
         }
         for (i = 0u; i < count; ++i) {
             void* elem = (void*)(tag_base + (i * col_info.size));
-            BamStrView view = st->tag_vt->get_label(elem);
+            BamStrView view = { NULL, 0u };
+            if (st->tag_vt->get_label(elem, &view) != BAM_RESULT_OK) {
+                return BAM_RESULT_INTERNAL_ERROR;
+            }
             if (view.len >= 5u && view.ptr != NULL && memcmp(view.ptr, "grunt", 5u) == 0) {
-                BamResult sres = st->tag_vt->set_label(elem, bam_str_view("elite_grunt"));
+                BamStrView elite_view = bam_str_view("elite_grunt");
+                BamResult sres = st->tag_vt->set_label(elem, &elite_view);
                 if (sres != BAM_RESULT_OK) {
                     return sres;
                 }
@@ -744,7 +748,7 @@ BAM_EXPORT BamResult bevy_c_mod_test_vtable_mutation(
             }
         }
 
-        rc = comp_vt->set_label(elem, mutated_view);
+        rc = comp_vt->set_label(elem, &mutated_view);
         if (rc != BAM_RESULT_OK) {
             return rc;
         }

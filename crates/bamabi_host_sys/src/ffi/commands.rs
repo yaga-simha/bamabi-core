@@ -17,6 +17,7 @@
 //!   [`bevy_ecs::world::EntityWorldMut::insert_by_ids`].
 
 use crate::drop_trampoline::{drop_slot_generation, run_uncommitted_slot_drop};
+use crate::ffi::relations::{PendingAcyclicTracker, PendingRelationOp};
 use crate::handle_header::{
     COMMANDS_MAGIC, HandleHeader, decode_live_entity, decode_optional_entity, ffi_try,
     validate_commands_mut,
@@ -24,8 +25,8 @@ use crate::handle_header::{
 use crate::loader::{ModId, ModScoped};
 use crate::registry::{InsertDefaultFn, ModRegistry, RegisteredComponent, RegistrySnapshot};
 use bamabi_sys::{
-    AccessMode, BamCommands, BamComponent, BamTermDesc, FfiAssetHandle, FfiEntity, FfiResult,
-    MAX_TERMS_PER_QUERY,
+    AccessMode, BAM_SPAWN_COL_FLAG_SPLAT, BAM_SPAWN_COL_KNOWN_FLAGS, BamCommands, BamComponent,
+    BamSpawnColumnDesc, BamTermDesc, FfiAssetHandle, FfiEntity, FfiResult, MAX_TERMS_PER_QUERY,
 };
 use bevy_ecs::change_detection::MaybeLocation;
 use bevy_ecs::component::{ComponentCloneBehavior, ComponentId, IS_RESOURCE};
@@ -33,9 +34,11 @@ use bevy_ecs::entity::{ComponentCloneCtx, Entity, EntityAllocator, EntityCloner,
 use bevy_ecs::event::{EntityTrigger, GlobalTrigger};
 use bevy_ecs::hierarchy::ChildOf;
 use bevy_ecs::observer::Observer;
+use bevy_ecs::prelude::Resource;
 use bevy_ecs::ptr::{OwningPtr, PtrMut};
 use bevy_ecs::query::{FilteredAccess, QueryBuilder};
 use bevy_ecs::world::World;
+use bevy_platform::collections::HashMap;
 use core::mem::MaybeUninit;
 use core::num::NonZeroUsize;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -156,6 +159,23 @@ struct ArenaWatermark {
     active_slab: usize,
     cursor: usize,
     bytes_used: usize,
+}
+
+/// Configuration [`Resource`] controlling how many backing slabs [`CommandArena`] retains across
+/// frame resets (`default = 2`).
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandArenaConfig {
+    /// Maximum number of allocated payload slabs retained by [`CommandArena`] across resets.
+    pub max_retained_slabs: usize,
+}
+
+impl Default for CommandArenaConfig {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            max_retained_slabs: 2,
+        }
+    }
 }
 
 /// Reusable multi-slab aligned bump arena storing `MaybeUninit<u8>` component payloads.
@@ -312,18 +332,25 @@ impl CommandArena {
         unsafe { core::ptr::NonNull::new_unchecked(raw) }
     }
 
-    /// Resets all slabs to cursor `0` while retaining up to 2 slabs of allocated capacity for
-    /// zero-allocation reuse on subsequent frames.
+    /// Resets all slabs to cursor `0` while retaining up to `max_retained_slabs` slabs of allocated
+    /// capacity for zero-allocation reuse on subsequent frames.
     #[inline]
-    pub fn reset(&mut self) {
-        if self.slabs.len() > 2 {
-            self.slabs.truncate(2);
+    pub fn reset_with_cap(&mut self, max_retained_slabs: usize) {
+        if self.slabs.len() > max_retained_slabs {
+            self.slabs.truncate(max_retained_slabs);
         }
         for slab in &mut self.slabs {
             slab.cursor = 0;
         }
         self.active_slab = 0;
         self.bytes_used = 0;
+    }
+
+    /// Resets all slabs to cursor `0` while retaining up to 2 slabs of allocated capacity for
+    /// zero-allocation reuse on subsequent frames.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.reset_with_cap(2);
     }
 }
 
@@ -349,6 +376,10 @@ enum RecordedCommand {
     Despawn {
         entity: Entity,
     },
+    DespawnBatch {
+        entity_start: usize,
+        entity_count: usize,
+    },
     Insert {
         entity: Entity,
         component: BamComponent,
@@ -361,12 +392,28 @@ enum RecordedCommand {
         slice: ArenaSlice,
         drop_slot: Option<(usize, u64)>,
     },
+    InsertBatch {
+        entity_start: usize,
+        entity_count: usize,
+        component: BamComponent,
+        component_id: ComponentId,
+        slice: ArenaSlice,
+        elem_size: usize,
+        is_splat: bool,
+        drop_slot: Option<(usize, u64)>,
+        validates_entity_payload: bool,
+    },
     InsertDefault {
         entity: Entity,
         insert_fn: InsertDefaultFn,
     },
     Remove {
         entity: Entity,
+        component_id: ComponentId,
+    },
+    RemoveBatch {
+        entity_start: usize,
+        entity_count: usize,
         component_id: ComponentId,
     },
     Trigger {
@@ -433,6 +480,7 @@ struct SpawnSoaColumn {
     slice: ArenaSlice,
     elem_size: usize,
     entity_count: usize,
+    is_splat: bool,
     drop_slot: Option<(usize, u64)>,
     validates_entity_payload: bool,
 }
@@ -543,6 +591,7 @@ pub struct HostCommandsStorage {
     soa_columns: Vec<SpawnSoaColumn>,
     scratch_ids: Vec<ComponentId>,
     custom_fns: Vec<Option<CustomCommandFn>>,
+    pending_relation_caches: HashMap<BamComponent, PendingAcyclicTracker>,
     last_relation_error: Option<FfiResult>,
     spawns_queued: usize,
     arena_breaches: usize,
@@ -552,7 +601,7 @@ pub struct HostCommandsStorage {
 impl HostCommandsStorage {
     /// Creates empty persistent command storage.
     #[inline]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             arena: CommandArena::new(),
             commands: Vec::new(),
@@ -562,6 +611,7 @@ impl HostCommandsStorage {
             soa_columns: Vec::new(),
             scratch_ids: Vec::new(),
             custom_fns: Vec::new(),
+            pending_relation_caches: HashMap::default(),
             last_relation_error: None,
             spawns_queued: 0,
             arena_breaches: 0,
@@ -680,6 +730,29 @@ impl HostCommandsStorage {
                         }
                     }
                 }
+                RecordedCommand::InsertBatch {
+                    entity_count,
+                    slice,
+                    elem_size,
+                    is_splat,
+                    ref mut drop_slot,
+                    ..
+                } => {
+                    if !is_splat && let Some((slot, expected_gen)) = drop_slot.take() {
+                        let base = self.arena.ptr_mut(slice);
+                        // SAFETY: `base` holds `entity_count` contiguous `elem_size` uncommitted payloads.
+                        unsafe {
+                            drop_uncommitted_soa_column(
+                                base.as_ptr(),
+                                elem_size,
+                                entity_count,
+                                slot,
+                                expected_gen,
+                                false,
+                            );
+                        }
+                    }
+                }
                 RecordedCommand::Insert {
                     slice,
                     ref mut drop_slot,
@@ -736,10 +809,9 @@ impl HostCommandsStorage {
     }
 
     /// Discards all queued commands without applying them to the `World` (used when a guest system
-    /// faults mid-invocation), dropping any uncommitted foreign destructor payloads while preserving
-    /// allocated slab and vector capacities.
+    /// faults mid-invocation), retaining up to `max_retained_slabs` payload slabs.
     #[inline]
-    pub fn clear(&mut self) {
+    pub fn clear_with_retained_slabs(&mut self, max_retained_slabs: usize) {
         self.drop_uncommitted_payloads();
         self.commands.clear();
         self.cmd_watermarks.clear();
@@ -748,8 +820,19 @@ impl HostCommandsStorage {
         self.soa_columns.clear();
         self.scratch_ids.clear();
         self.custom_fns.clear();
-        self.arena.reset();
+        for tracker in self.pending_relation_caches.values_mut() {
+            tracker.reset();
+        }
+        self.arena.reset_with_cap(max_retained_slabs);
         self.reset_invocation_counters();
+    }
+
+    /// Discards all queued commands without applying them to the `World` (used when a guest system
+    /// faults mid-invocation), dropping any uncommitted foreign destructor payloads while preserving
+    /// allocated slab and vector capacities (up to 2 retained slabs).
+    #[inline]
+    pub fn clear(&mut self) {
+        self.clear_with_retained_slabs(2);
     }
 
     /// Captures an opaque checkpoint token representing the current command-buffer watermark.
@@ -865,6 +948,39 @@ impl HostCommandsStorage {
                         let _ = slot.take();
                     }
                 }
+                RecordedCommand::InsertBatch {
+                    entity_start,
+                    entity_count,
+                    slice,
+                    elem_size,
+                    is_splat,
+                    drop_slot,
+                    ..
+                } => {
+                    min_soa_ent_len = min_soa_ent_len.min(*entity_start);
+                    let ec = *entity_count;
+                    let esize = *elem_size;
+                    let splat = *is_splat;
+                    let s = *slice;
+                    if !splat && let Some((slot, expected_gen)) = drop_slot.take() {
+                        let base = self.arena.ptr_mut(s);
+                        // SAFETY: `base` holds `ec` contiguous `esize` uncommitted payloads.
+                        unsafe {
+                            drop_uncommitted_soa_column(
+                                base.as_ptr(),
+                                esize,
+                                ec,
+                                slot,
+                                expected_gen,
+                                true,
+                            );
+                        }
+                    }
+                }
+                RecordedCommand::DespawnBatch { entity_start, .. }
+                | RecordedCommand::RemoveBatch { entity_start, .. } => {
+                    min_soa_ent_len = min_soa_ent_len.min(*entity_start);
+                }
                 RecordedCommand::Despawn { .. }
                 | RecordedCommand::InsertDefault { .. }
                 | RecordedCommand::Remove { .. }
@@ -882,9 +998,296 @@ impl HostCommandsStorage {
         self.soa_entities.truncate(min_soa_ent_len);
         self.soa_columns.truncate(min_soa_col_len);
         self.custom_fns.truncate(min_custom_len);
+        for tracker in self.pending_relation_caches.values_mut() {
+            if tracker.applied_cmd_len > checkpoint {
+                tracker.reset();
+            }
+        }
         self.arena.rewind(rewind_wm);
         self.spawns_queued = self.spawns_queued.saturating_sub(rolled_back_spawns);
         (FfiResult::OK, rolled_back_spawns)
+    }
+
+    /// Merges all queued commands and payloads from `other` into `self` in deterministic FIFO
+    /// order while enforcing `max_arena_bytes` across cumulative arena bytes and preserving
+    /// `other`'s allocated arena slabs and vector capacities for reuse.
+    pub(crate) fn merge_from_bounded(
+        &mut self,
+        other: &mut Self,
+        max_arena_bytes: Option<usize>,
+    ) -> Result<(), FfiResult> {
+        self.arena_breaches = self.arena_breaches.saturating_add(other.arena_breaches);
+        self.spawn_breaches = self.spawn_breaches.saturating_add(other.spawn_breaches);
+        if other.commands.is_empty() {
+            self.spawns_queued = self.spawns_queued.saturating_add(other.spawns_queued);
+            other.reset_invocation_counters();
+            return Ok(());
+        }
+        for tracker in self.pending_relation_caches.values_mut() {
+            tracker.reset();
+        }
+
+        /// Copies `slice` bytes from `src` into `dst`, returning the copied [`ArenaSlice`] or
+        /// `CAPACITY_EXCEEDED` if `max_arena_bytes` would be breached.
+        ///
+        /// # Safety
+        /// If `slice.size > 0`, `slice` must reference a live, in-bounds allocation within `src`
+        /// such that `src.ptr_mut(slice)` is readable for `slice.size` `MaybeUninit<u8>` bytes.
+        #[inline]
+        unsafe fn copy_slice(
+            dst: &mut CommandArena,
+            src: &mut CommandArena,
+            slice: ArenaSlice,
+            max_arena_bytes: Option<usize>,
+        ) -> Result<ArenaSlice, FfiResult> {
+            if slice.size == 0 {
+                // SAFETY: `size == 0` never dereferences `null()`.
+                return unsafe {
+                    dst.alloc_copy_raw_bounded(core::ptr::null(), 0, slice.align, max_arena_bytes)
+                };
+            }
+            let nn = src.ptr_mut(slice);
+            // SAFETY: `nn` points to `slice.size` valid `MaybeUninit<u8>` bytes in `src`.
+            unsafe {
+                dst.alloc_copy_raw_bounded(
+                    nn.as_ptr().cast_const(),
+                    slice.size,
+                    slice.align,
+                    max_arena_bytes,
+                )
+            }
+        }
+
+        let cmd_count = other.commands.len();
+        self.commands.reserve(cmd_count);
+        self.cmd_watermarks.reserve(cmd_count);
+
+        for i in 0..cmd_count {
+            let pre_wm = self.arena.watermark();
+            let mut cmd = other.commands[i];
+            match &mut cmd {
+                RecordedCommand::SpawnBatch {
+                    batch_start,
+                    batch_len,
+                    ..
+                } => {
+                    let old_start = *batch_start;
+                    let len = *batch_len;
+                    let new_start = self.batch_items.len();
+                    self.batch_items.reserve(len);
+                    for j in old_start..(old_start + len) {
+                        let mut item = other.batch_items[j];
+                        // SAFETY: `item.slice` points to `item.slice.size` valid bytes in `other.arena`.
+                        let copied = match unsafe {
+                            copy_slice(
+                                &mut self.arena,
+                                &mut other.arena,
+                                item.slice,
+                                max_arena_bytes,
+                            )
+                        } {
+                            Ok(s) => s,
+                            Err(err) => {
+                                for pushed in self.batch_items.drain(new_start..) {
+                                    if let Some((slot, expected_gen)) = pushed.drop_slot {
+                                        let nn = self.arena.ptr_mut(pushed.slice);
+                                        // SAFETY: `nn` holds uncommitted copied payload in `self.arena`.
+                                        unsafe {
+                                            run_uncommitted_slot_drop(
+                                                slot,
+                                                expected_gen,
+                                                nn.as_ptr(),
+                                            );
+                                        }
+                                    }
+                                }
+                                self.arena.rewind(pre_wm);
+                                self.arena_breaches = self.arena_breaches.saturating_add(1);
+                                other.clear();
+                                return Err(err);
+                            }
+                        };
+                        other.batch_items[j].drop_slot = None;
+                        item.slice = copied;
+                        self.batch_items.push(item);
+                    }
+                    *batch_start = new_start;
+                    self.spawns_queued = self.spawns_queued.saturating_add(1);
+                }
+                RecordedCommand::SpawnSoaBatch {
+                    entity_start,
+                    entity_count,
+                    col_start,
+                    col_count,
+                    ..
+                } => {
+                    let old_es = *entity_start;
+                    let ec = *entity_count;
+                    let new_es = self.soa_entities.len();
+                    self.soa_entities
+                        .extend_from_slice(&other.soa_entities[old_es..(old_es + ec)]);
+                    *entity_start = new_es;
+
+                    let old_cs = *col_start;
+                    let cc = *col_count;
+                    let new_cs = self.soa_columns.len();
+                    self.soa_columns.reserve(cc);
+                    for c in old_cs..(old_cs + cc) {
+                        let mut col = other.soa_columns[c];
+                        // SAFETY: `col.slice` points to `col.slice.size` valid bytes in `other.arena`.
+                        let copied = match unsafe {
+                            copy_slice(
+                                &mut self.arena,
+                                &mut other.arena,
+                                col.slice,
+                                max_arena_bytes,
+                            )
+                        } {
+                            Ok(s) => s,
+                            Err(err) => {
+                                for pushed in self.soa_columns.drain(new_cs..) {
+                                    if !pushed.is_splat
+                                        && let Some((slot, expected_gen)) = pushed.drop_slot
+                                    {
+                                        let base = self.arena.ptr_mut(pushed.slice);
+                                        // SAFETY: `base` holds `ec` uncommitted payloads in `self.arena`.
+                                        unsafe {
+                                            drop_uncommitted_soa_column(
+                                                base.as_ptr(),
+                                                pushed.elem_size,
+                                                ec,
+                                                slot,
+                                                expected_gen,
+                                                false,
+                                            );
+                                        }
+                                    }
+                                }
+                                self.soa_entities.truncate(new_es);
+                                self.arena.rewind(pre_wm);
+                                self.arena_breaches = self.arena_breaches.saturating_add(1);
+                                other.clear();
+                                return Err(err);
+                            }
+                        };
+                        other.soa_columns[c].drop_slot = None;
+                        col.slice = copied;
+                        self.soa_columns.push(col);
+                    }
+                    *col_start = new_cs;
+                    self.spawns_queued = self.spawns_queued.saturating_add(ec);
+                }
+                RecordedCommand::DespawnBatch {
+                    entity_start,
+                    entity_count,
+                }
+                | RecordedCommand::RemoveBatch {
+                    entity_start,
+                    entity_count,
+                    ..
+                } => {
+                    let old_es = *entity_start;
+                    let ec = *entity_count;
+                    let new_es = self.soa_entities.len();
+                    self.soa_entities
+                        .extend_from_slice(&other.soa_entities[old_es..(old_es + ec)]);
+                    *entity_start = new_es;
+                }
+                RecordedCommand::InsertBatch {
+                    entity_start,
+                    entity_count,
+                    slice,
+                    ..
+                } => {
+                    // SAFETY: `*slice` points to valid bytes in `other.arena`.
+                    let copied = match unsafe {
+                        copy_slice(&mut self.arena, &mut other.arena, *slice, max_arena_bytes)
+                    } {
+                        Ok(s) => s,
+                        Err(err) => {
+                            self.arena.rewind(pre_wm);
+                            self.arena_breaches = self.arena_breaches.saturating_add(1);
+                            other.clear();
+                            return Err(err);
+                        }
+                    };
+                    let old_es = *entity_start;
+                    let ec = *entity_count;
+                    let new_es = self.soa_entities.len();
+                    self.soa_entities
+                        .extend_from_slice(&other.soa_entities[old_es..(old_es + ec)]);
+                    *entity_start = new_es;
+                    if let RecordedCommand::InsertBatch {
+                        drop_slot: ref mut src_slot,
+                        ..
+                    } = other.commands[i]
+                    {
+                        *src_slot = None;
+                    }
+                    *slice = copied;
+                }
+                RecordedCommand::Insert { slice, .. }
+                | RecordedCommand::InsertIfNew { slice, .. }
+                | RecordedCommand::InsertResource { slice, .. } => {
+                    // SAFETY: `*slice` points to valid bytes in `other.arena`.
+                    let copied = match unsafe {
+                        copy_slice(&mut self.arena, &mut other.arena, *slice, max_arena_bytes)
+                    } {
+                        Ok(s) => s,
+                        Err(err) => {
+                            self.arena.rewind(pre_wm);
+                            self.arena_breaches = self.arena_breaches.saturating_add(1);
+                            other.clear();
+                            return Err(err);
+                        }
+                    };
+                    match &mut other.commands[i] {
+                        RecordedCommand::Insert { drop_slot, .. }
+                        | RecordedCommand::InsertIfNew { drop_slot, .. }
+                        | RecordedCommand::InsertResource { drop_slot, .. } => {
+                            *drop_slot = None;
+                        }
+                        _ => {}
+                    }
+                    *slice = copied;
+                }
+                RecordedCommand::Trigger { slice, .. }
+                | RecordedCommand::InsertRelation { slice, .. } => {
+                    // SAFETY: `*slice` points to valid bytes in `other.arena`.
+                    *slice = match unsafe {
+                        copy_slice(&mut self.arena, &mut other.arena, *slice, max_arena_bytes)
+                    } {
+                        Ok(s) => s,
+                        Err(err) => {
+                            self.arena.rewind(pre_wm);
+                            self.arena_breaches = self.arena_breaches.saturating_add(1);
+                            other.clear();
+                            return Err(err);
+                        }
+                    };
+                }
+                RecordedCommand::Custom { idx } => {
+                    let old_idx = *idx;
+                    let new_idx = self.custom_fns.len();
+                    let func = other.custom_fns.get_mut(old_idx).and_then(Option::take);
+                    self.custom_fns.push(func);
+                    *idx = new_idx;
+                }
+                RecordedCommand::SpawnEmpty { .. } | RecordedCommand::SpawnScene { .. } => {
+                    self.spawns_queued = self.spawns_queued.saturating_add(1);
+                }
+                RecordedCommand::Despawn { .. }
+                | RecordedCommand::InsertDefault { .. }
+                | RecordedCommand::Remove { .. }
+                | RecordedCommand::RemoveRelation { .. }
+                | RecordedCommand::CloneEntity { .. }
+                | RecordedCommand::RemoveResource { .. } => {}
+            }
+            self.push_command(pre_wm, cmd);
+        }
+
+        other.clear();
+        Ok(())
     }
 
     /// Rolls back all commands queued after `checkpoint`, invoking foreign destructors in reverse
@@ -902,7 +1305,11 @@ impl HostCommandsStorage {
     /// Applies all queued commands to `world` in FIFO order and resets all internal buffers for reuse.
     pub fn apply_to_world(&mut self, world: &mut World, snapshot: &RegistrySnapshot) {
         self.last_relation_error = None;
+        let max_retained_slabs = world
+            .get_resource::<CommandArenaConfig>()
+            .map_or(2, |cfg| cfg.max_retained_slabs);
         if self.commands.is_empty() {
+            self.arena.reset_with_cap(max_retained_slabs);
             self.reset_invocation_counters();
             return;
         }
@@ -913,6 +1320,7 @@ impl HostCommandsStorage {
             .as_ref()
             .map(ModRegistry::snapshot)
             .unwrap_or(snapshot);
+        let mod_scoped_cid = world.register_component::<ModScoped>();
         let mut abort_remaining_relations = false;
 
         for i in 0..self.commands.len() {
@@ -966,9 +1374,6 @@ impl HostCommandsStorage {
                         }
                     }
                     if let Ok(mut entity_mut) = world.spawn_empty_at(entity) {
-                        if let Some(mod_id) = owner_mod_id {
-                            entity_mut.insert(ModScoped(mod_id));
-                        }
                         self.scratch_ids.clear();
                         let batch_slice =
                             &mut self.batch_items[batch_start..(batch_start + batch_len)];
@@ -979,9 +1384,15 @@ impl HostCommandsStorage {
                                 self.scratch_ids.push(item.component_id);
                             }
                         }
+                        let mut scoped_storage = owner_mod_id.map(ModScoped);
+                        let include_scoped =
+                            scoped_storage.is_some() && !self.scratch_ids.contains(&mod_scoped_cid);
+                        if include_scoped {
+                            self.scratch_ids.push(mod_scoped_cid);
+                        }
                         if !self.scratch_ids.is_empty() {
                             let arena = &mut self.arena;
-                            let ptrs_iter = batch_slice
+                            let comp_ptrs = batch_slice
                                 .iter()
                                 .enumerate()
                                 .filter(|(idx, _)| include[*idx])
@@ -991,9 +1402,20 @@ impl HostCommandsStorage {
                                     // the registered `(size, align)` of `scratch_ids[k]`, transferring ownership into Bevy ECS.
                                     unsafe { OwningPtr::new(nn) }
                                 });
+                            let scoped_ptr = include_scoped
+                                .then(|| {
+                                    scoped_storage.as_mut().map(|scoped| {
+                                        let nn = core::ptr::NonNull::from(scoped).cast::<u8>();
+                                        // SAFETY: `scoped` is stack-owned `ModScoped` (`Copy`, no drop),
+                                        // matching `mod_scoped_cid`.
+                                        unsafe { OwningPtr::new(nn) }
+                                    })
+                                })
+                                .flatten();
+                            let ptrs_iter = comp_ptrs.chain(scoped_ptr);
                             // SAFETY: `scratch_ids` has no duplicate `ComponentId`s (verified during
-                            // `host_cmd_spawn`), matches `ptrs_iter` length, and each `ComponentId`
-                            // was registered in `world` with the exact payload layout.
+                            // `host_cmd_spawn` and `ModScoped` dedup check), matches `ptrs_iter` length,
+                            // and each `ComponentId` was registered in `world` with the exact payload layout.
                             unsafe {
                                 entity_mut.insert_by_ids(&self.scratch_ids, ptrs_iter);
                             }
@@ -1054,8 +1476,9 @@ impl HostCommandsStorage {
                             }
                             if col.validates_entity_payload {
                                 let base = self.arena.ptr_mut(col.slice);
-                                // SAFETY: `base` holds `entity_count` contiguous 8-byte `FfiEntity` values.
-                                let elem_ptr = unsafe { base.as_ptr().add(r * col.elem_size) };
+                                let offset = if col.is_splat { 0 } else { r * col.elem_size };
+                                // SAFETY: `base` holds contiguous `col.elem_size` `FfiEntity` values.
+                                let elem_ptr = unsafe { base.as_ptr().add(offset) };
                                 // SAFETY: `elem_ptr` points to 8 readable bytes (`FfiEntity`).
                                 if !unsafe {
                                     validate_parent_payload_in_world(
@@ -1071,31 +1494,47 @@ impl HostCommandsStorage {
                             row_cols[c_idx] = true;
                             self.scratch_ids.push(col.component_id);
                         }
+                        let mut scoped_storage = owner_mod_id.map(ModScoped);
+                        let include_scoped =
+                            scoped_storage.is_some() && !self.scratch_ids.contains(&mod_scoped_cid);
+                        if include_scoped {
+                            self.scratch_ids.push(mod_scoped_cid);
+                        }
                         if let Ok(mut entity_mut) = world.spawn_empty_at(entity) {
-                            if let Some(mod_id) = owner_mod_id {
-                                entity_mut.insert(ModScoped(mod_id));
-                            }
                             if !self.scratch_ids.is_empty() {
                                 let arena = &mut self.arena;
                                 let cols = &self.soa_columns[col_start..(col_start + col_count)];
-                                let ptrs_iter = cols
+                                let comp_ptrs = cols
                                     .iter()
                                     .enumerate()
                                     .filter(|(c_idx, _)| row_cols[*c_idx])
                                     .map(|(_, col)| {
                                         let base = arena.ptr_mut(col.slice);
-                                        // SAFETY: `base` holds `entity_count` contiguous `col.elem_size`
-                                        // elements inside `arena`.
-                                        let raw = unsafe { base.as_ptr().add(r * col.elem_size) };
+                                        let offset =
+                                            if col.is_splat { 0 } else { r * col.elem_size };
+                                        // SAFETY: `base` holds valid `col.elem_size` payloads
+                                        // inside `arena` (single element for splat, `entity_count` for dense).
+                                        let raw = unsafe { base.as_ptr().add(offset) };
                                         // SAFETY: `base` is non-null, so `base.add(...)` is non-null
                                         // and ownership of row `r` transfers into Bevy ECS.
                                         let nn = unsafe { core::ptr::NonNull::new_unchecked(raw) };
                                         // SAFETY: Aligned storage matching `col.component_id`.
                                         unsafe { OwningPtr::new(nn) }
                                     });
+                                let scoped_ptr = include_scoped
+                                    .then(|| {
+                                        scoped_storage.as_mut().map(|scoped| {
+                                            let nn = core::ptr::NonNull::from(scoped).cast::<u8>();
+                                            // SAFETY: `scoped` is stack-owned `ModScoped` (`Copy`, no drop),
+                                            // matching `mod_scoped_cid`.
+                                            unsafe { OwningPtr::new(nn) }
+                                        })
+                                    })
+                                    .flatten();
+                                let ptrs_iter = comp_ptrs.chain(scoped_ptr);
                                 // SAFETY: `scratch_ids` has no duplicate `ComponentId`s (validated
-                                // at enqueue time), matches `ptrs_iter` length, and each layout
-                                // matches the registered component.
+                                // at enqueue time plus `ModScoped` dedup), matches `ptrs_iter`
+                                // length, and each layout matches the registered component.
                                 unsafe {
                                     entity_mut.insert_by_ids(&self.scratch_ids, ptrs_iter);
                                 }
@@ -1105,7 +1544,7 @@ impl HostCommandsStorage {
                                 .iter()
                                 .enumerate()
                             {
-                                if !col_active[c_idx] {
+                                if !col_active[c_idx] || col.is_splat {
                                     continue;
                                 }
                                 if let Some((slot, expected_gen)) = col.drop_slot {
@@ -1127,6 +1566,124 @@ impl HostCommandsStorage {
                 RecordedCommand::Despawn { entity } => {
                     if let Ok(e) = world.get_entity_mut(entity) {
                         e.despawn();
+                    }
+                }
+                RecordedCommand::DespawnBatch {
+                    entity_start,
+                    entity_count,
+                } => {
+                    for r in 0..entity_count {
+                        let entity = self.soa_entities[entity_start + r];
+                        if let Ok(e) = world.get_entity_mut(entity) {
+                            e.despawn();
+                        }
+                    }
+                }
+                RecordedCommand::InsertBatch {
+                    entity_start,
+                    entity_count,
+                    component,
+                    component_id,
+                    slice,
+                    elem_size,
+                    is_splat,
+                    drop_slot,
+                    validates_entity_payload,
+                } => {
+                    if let RecordedCommand::InsertBatch {
+                        drop_slot: ref mut stored_slot,
+                        ..
+                    } = self.commands[i]
+                    {
+                        *stored_slot = None;
+                    }
+                    let Some(meta) = active_snapshot.get_by_handle(component) else {
+                        if !is_splat && let Some((slot, expected_gen)) = drop_slot {
+                            let base = self.arena.ptr_mut(slice);
+                            // SAFETY: Component handle vanished before apply; drop uncommitted payloads.
+                            unsafe {
+                                drop_uncommitted_soa_column(
+                                    base.as_ptr(),
+                                    elem_size,
+                                    entity_count,
+                                    slot,
+                                    expected_gen,
+                                    false,
+                                );
+                            }
+                        }
+                        continue;
+                    };
+                    if meta.is_dynamic && meta.drop_slot.is_some() && meta.drop_fn.is_none() {
+                        if !is_splat && let Some((slot, expected_gen)) = drop_slot {
+                            let base = self.arena.ptr_mut(slice);
+                            // SAFETY: Owning mod unloaded before apply; drop uncommitted payloads.
+                            unsafe {
+                                drop_uncommitted_soa_column(
+                                    base.as_ptr(),
+                                    elem_size,
+                                    entity_count,
+                                    slot,
+                                    expected_gen,
+                                    false,
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    let base = self.arena.ptr_mut(slice);
+                    for r in 0..entity_count {
+                        let entity = self.soa_entities[entity_start + r];
+                        let offset = if is_splat { 0 } else { r * elem_size };
+                        // SAFETY: `base` holds `elem_size` bytes per row (or 1 element when splat).
+                        let elem_ptr = unsafe { base.as_ptr().add(offset) };
+                        if validates_entity_payload
+                            // SAFETY: `validates_entity_payload` elements hold an 8-byte `FfiEntity`.
+                            && !unsafe {
+                                validate_parent_payload_in_world(
+                                    world,
+                                    entity,
+                                    elem_ptr,
+                                    "during insert_batch",
+                                )
+                            }
+                        {
+                            continue;
+                        }
+                        if !meta.is_dynamic {
+                            if let Some(insert_fn) = meta.insert_raw_fn {
+                                // SAFETY: `elem_ptr` points to `meta.size` bytes inside `self.arena`.
+                                unsafe {
+                                    insert_fn(world, entity, elem_ptr.cast_const());
+                                }
+                            }
+                        } else if let Ok(mut entity_mut) = world.get_entity_mut(entity) {
+                            // SAFETY: `base` is non-null, so `elem_ptr` is non-null.
+                            let nn = unsafe { core::ptr::NonNull::new_unchecked(elem_ptr) };
+                            // SAFETY: `nn` holds `meta.size` aligned bytes for `component_id`.
+                            let owning = unsafe { OwningPtr::new(nn) };
+                            // SAFETY: `component_id` was registered in `world` with `(meta.size, meta.align)`.
+                            unsafe {
+                                entity_mut.insert_by_id(component_id, owning);
+                            }
+                        } else if !is_splat && let Some((slot, expected_gen)) = drop_slot {
+                            // SAFETY: Entity did not exist; ownership remained in `self.arena`.
+                            unsafe {
+                                run_uncommitted_slot_drop(slot, expected_gen, elem_ptr);
+                            }
+                        }
+                    }
+                }
+                RecordedCommand::RemoveBatch {
+                    entity_start,
+                    entity_count,
+                    component_id,
+                } => {
+                    for r in 0..entity_count {
+                        let entity = self.soa_entities[entity_start + r];
+                        if let Ok(mut entity_mut) = world.get_entity_mut(entity) {
+                            entity_mut.remove_by_id(component_id);
+                        }
                     }
                 }
                 RecordedCommand::Insert {
@@ -1460,6 +2017,9 @@ impl HostCommandsStorage {
                         }
                         continue;
                     }
+                    if world.resource_entities().get(meta.component_id).is_none() {
+                        world.spawn(bevy_ecs::resource::IsResource::new(meta.component_id));
+                    }
                     let nn = self.arena.ptr_mut(slice);
                     // SAFETY: `nn` holds `meta.size` aligned bytes for `meta.component_id`;
                     // ownership transfers into Bevy ECS singleton resource storage.
@@ -1484,7 +2044,7 @@ impl HostCommandsStorage {
             }
         }
 
-        self.clear();
+        self.clear_with_retained_slabs(max_retained_slabs);
         // Flush deferred commands queued synchronously by guest observers during `Trigger` dispatch.
         world.flush();
     }
@@ -1501,14 +2061,16 @@ impl Drop for HostCommandsStorage {
 pub struct HostCommands<'a> {
     /// Leading handle validation header (`COMMANDS_MAGIC`) at byte offset `0`.
     pub header: HandleHeader,
-    storage: &'a mut HostCommandsStorage,
+    pub(crate) storage: &'a mut HostCommandsStorage,
     allocator: &'a EntityAllocator,
     snapshot: &'a RegistrySnapshot,
     mod_id: Option<ModId>,
     is_active: Option<Arc<AtomicBool>>,
+    is_active_borrowed: Option<&'a Arc<AtomicBool>>,
     registry: Option<&'a ModRegistry>,
     quota_limits: CommandQuotaLimits,
     shared_frame_spawns: Option<&'a AtomicUsize>,
+    shared_arena_bytes: Option<&'a AtomicUsize>,
 }
 
 const _: () = assert!(core::mem::offset_of!(HostCommands<'_>, header) == 0);
@@ -1528,9 +2090,11 @@ impl<'a> HostCommands<'a> {
             snapshot,
             mod_id: None,
             is_active: None,
+            is_active_borrowed: None,
             registry: None,
             quota_limits: CommandQuotaLimits::UNLIMITED,
             shared_frame_spawns: None,
+            shared_arena_bytes: None,
         }
     }
 
@@ -1549,9 +2113,11 @@ impl<'a> HostCommands<'a> {
             snapshot,
             mod_id: None,
             is_active: None,
+            is_active_borrowed: None,
             registry: None,
             quota_limits: CommandQuotaLimits::UNLIMITED,
             shared_frame_spawns: None,
+            shared_arena_bytes: None,
         }
     }
 
@@ -1568,21 +2134,44 @@ impl<'a> HostCommands<'a> {
         self
     }
 
+    /// Attaches an optional shared atomic arena-byte counter enforced across parallel worker
+    /// partitions in `par_for_each_chunk_ex`.
+    #[inline]
+    pub(crate) const fn with_shared_arena_bytes(
+        mut self,
+        shared_arena_bytes: Option<&'a AtomicUsize>,
+    ) -> Self {
+        self.shared_arena_bytes = shared_arena_bytes;
+        self
+    }
+
     #[inline]
     fn check_arena_capacity(&mut self, additional_bytes: usize) -> Result<(), FfiResult> {
-        if self
-            .storage
-            .arena
-            .would_exceed(additional_bytes, self.quota_limits.max_arena_bytes)
-        {
-            self.storage.arena_breaches = self.storage.arena_breaches.saturating_add(1);
-            return Err(FfiResult::CAPACITY_EXCEEDED);
+        if let Some(limit) = self.quota_limits.max_arena_bytes {
+            if let Some(shared) = self.shared_arena_bytes {
+                if shared
+                    .load(Ordering::Acquire)
+                    .checked_add(additional_bytes)
+                    .is_none_or(|total| total > limit)
+                {
+                    self.storage.arena_breaches = self.storage.arena_breaches.saturating_add(1);
+                    return Err(FfiResult::CAPACITY_EXCEEDED);
+                }
+            } else if self
+                .storage
+                .arena
+                .would_exceed(additional_bytes, Some(limit))
+            {
+                self.storage.arena_breaches = self.storage.arena_breaches.saturating_add(1);
+                return Err(FfiResult::CAPACITY_EXCEEDED);
+            }
         }
         Ok(())
     }
 
     /// Allocates and copies `size` raw payload bytes into [`CommandArena`] subject to
-    /// `self.quota_limits.max_arena_bytes`.
+    /// `self.quota_limits.max_arena_bytes` (and `self.shared_arena_bytes` when running inside
+    /// `par_for_each_chunk_ex`).
     ///
     /// # Safety
     /// If `size > 0`, `src` must be non-null and readable for `size` `MaybeUninit<u8>` bytes.
@@ -1593,8 +2182,10 @@ impl<'a> HostCommands<'a> {
         size: usize,
         align: usize,
     ) -> Result<ArenaSlice, FfiResult> {
+        let wm = self.storage.arena.watermark();
+        let prev_used = self.storage.arena.bytes_used();
         // SAFETY: Caller upholds readability of `src` for `size` `MaybeUninit<u8>` bytes.
-        match unsafe {
+        let slice = match unsafe {
             self.storage.arena.alloc_copy_raw_bounded(
                 src,
                 size,
@@ -1602,13 +2193,45 @@ impl<'a> HostCommands<'a> {
                 self.quota_limits.max_arena_bytes,
             )
         } {
-            Ok(slice) => Ok(slice),
+            Ok(s) => s,
             Err(err) => {
                 if err == FfiResult::CAPACITY_EXCEEDED {
                     self.storage.arena_breaches = self.storage.arena_breaches.saturating_add(1);
                 }
-                Err(err)
+                return Err(err);
             }
+        };
+        let consumed = self.storage.arena.bytes_used().saturating_sub(prev_used);
+        if consumed > 0
+            && let Some(shared) = self.shared_arena_bytes
+        {
+            if let Some(limit) = self.quota_limits.max_arena_bytes {
+                if shared
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                        cur.checked_add(consumed).filter(|&next| next <= limit)
+                    })
+                    .is_err()
+                {
+                    self.storage.arena.rewind(wm);
+                    self.storage.arena_breaches = self.storage.arena_breaches.saturating_add(1);
+                    return Err(FfiResult::CAPACITY_EXCEEDED);
+                }
+            } else {
+                shared.fetch_add(consumed, Ordering::AcqRel);
+            }
+        }
+        Ok(slice)
+    }
+
+    #[inline]
+    fn rewind_arena_and_release(&mut self, wm: ArenaWatermark) {
+        let before = self.storage.arena.bytes_used();
+        self.storage.arena.rewind(wm);
+        let freed = before.saturating_sub(self.storage.arena.bytes_used());
+        if freed > 0
+            && let Some(shared) = self.shared_arena_bytes
+        {
+            shared.fetch_sub(freed, Ordering::AcqRel);
         }
     }
 
@@ -1665,6 +2288,19 @@ impl<'a> HostCommands<'a> {
     ) -> Self {
         self.mod_id = mod_id;
         self.is_active = is_active;
+        self.is_active_borrowed = None;
+        self
+    }
+
+    /// Attaches the owning [`ModId`] and borrowed module liveness flag without cloning `Arc`.
+    #[inline]
+    pub(crate) const fn with_mod_context_ref(
+        mut self,
+        mod_id: Option<ModId>,
+        is_active: Option<&'a Arc<AtomicBool>>,
+    ) -> Self {
+        self.mod_id = mod_id;
+        self.is_active_borrowed = is_active;
         self
     }
 
@@ -1685,7 +2321,31 @@ impl<'a> HostCommands<'a> {
     /// Returns the shared module liveness flag (`is_active`) associated with this command buffer, if any.
     #[inline]
     pub const fn is_active(&self) -> Option<&Arc<AtomicBool>> {
-        self.is_active.as_ref()
+        match self.is_active.as_ref() {
+            Some(arc) => Some(arc),
+            None => self.is_active_borrowed,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn par_worker_template(
+        &self,
+    ) -> (
+        &'a EntityAllocator,
+        &'a RegistrySnapshot,
+        Option<ModId>,
+        Option<&Arc<AtomicBool>>,
+        CommandQuotaLimits,
+        Option<&'a AtomicUsize>,
+    ) {
+        (
+            self.allocator,
+            self.snapshot,
+            self.mod_id,
+            self.is_active(),
+            self.quota_limits,
+            self.shared_frame_spawns,
+        )
     }
 
     /// Returns the attached [`ModRegistry`] handle, if any.
@@ -1736,14 +2396,22 @@ impl<'a> HostCommands<'a> {
     /// releasing any rolled-back spawns on `self.shared_frame_spawns`.
     #[inline]
     pub fn rollback_to_checkpoint(&mut self, checkpoint: usize) -> FfiResult {
+        let before_arena_bytes = self.storage.arena.bytes_used();
         let (res, rolled_back_spawns) = self.storage.rollback_to_checkpoint_counted(checkpoint);
-        if res.is_ok()
-            && rolled_back_spawns > 0
-            && let Some(shared) = self.shared_frame_spawns
-        {
-            let _ = shared.try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                Some(cur.saturating_sub(rolled_back_spawns))
-            });
+        if res.is_ok() {
+            let freed_arena = before_arena_bytes.saturating_sub(self.storage.arena.bytes_used());
+            if freed_arena > 0
+                && let Some(shared) = self.shared_arena_bytes
+            {
+                shared.fetch_sub(freed_arena, Ordering::AcqRel);
+            }
+            if rolled_back_spawns > 0
+                && let Some(shared) = self.shared_frame_spawns
+            {
+                let _ = shared.try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                    Some(cur.saturating_sub(rolled_back_spawns))
+                });
+            }
         }
         res
     }
@@ -1800,35 +2468,54 @@ impl<'a> HostCommands<'a> {
             return FfiResult::INVALID_ARGUMENT;
         }
         if rel_meta.is_acyclic() {
-            let pending = self.storage.commands.iter().filter_map(|cmd| match *cmd {
-                RecordedCommand::InsertRelation {
-                    entity: e,
-                    relation: r,
-                    target: t,
-                    ..
-                } if r == relation => Some(crate::ffi::relations::PendingRelationOp::Insert {
-                    entity: e,
-                    target: t,
-                }),
-                RecordedCommand::RemoveRelation {
-                    entity: e,
-                    relation: r,
-                    target: t,
-                } if r == relation => Some(crate::ffi::relations::PendingRelationOp::Remove {
-                    entity: e,
-                    target: t,
-                }),
-                RecordedCommand::Despawn { entity: e } => {
-                    Some(crate::ffi::relations::PendingRelationOp::Despawn { entity: e })
+            let cmd_len = self.storage.commands.len();
+            let tracker = self
+                .storage
+                .pending_relation_caches
+                .entry(relation)
+                .or_insert_with(|| PendingAcyclicTracker::new(rel_meta.clone()));
+            let start = tracker.applied_cmd_len;
+            for cmd in &self.storage.commands[start..cmd_len] {
+                match *cmd {
+                    RecordedCommand::InsertRelation {
+                        entity: e,
+                        relation: r,
+                        target: t,
+                        ..
+                    } if r == relation => {
+                        tracker.apply_op(PendingRelationOp::Insert {
+                            entity: e,
+                            target: t,
+                        });
+                    }
+                    RecordedCommand::RemoveRelation {
+                        entity: e,
+                        relation: r,
+                        target: t,
+                    } if r == relation => {
+                        tracker.apply_op(PendingRelationOp::Remove {
+                            entity: e,
+                            target: t,
+                        });
+                    }
+                    RecordedCommand::Despawn { entity: e } => {
+                        tracker.apply_op(PendingRelationOp::Despawn { entity: e });
+                    }
+                    RecordedCommand::DespawnBatch {
+                        entity_start,
+                        entity_count,
+                    } => {
+                        for &e in
+                            &self.storage.soa_entities[entity_start..(entity_start + entity_count)]
+                        {
+                            tracker.apply_op(PendingRelationOp::Despawn { entity: e });
+                        }
+                    }
+                    _ => {}
                 }
-                _ => None,
-            });
-            let status = crate::ffi::relations::check_pending_acyclic(
-                rel_meta,
-                pending,
-                bevy_entity,
-                bevy_target,
-            );
+            }
+            tracker.applied_cmd_len = cmd_len;
+            let status = tracker.check_acyclic(bevy_entity, bevy_target);
             if status.is_err() {
                 return status;
             }
@@ -1840,6 +2527,15 @@ impl<'a> HostCommands<'a> {
         let slice = ffi_try!(unsafe {
             self.alloc_arena_copy(data_ptr, rel_meta.data_size, rel_meta.data_align)
         });
+        if rel_meta.is_acyclic()
+            && let Some(tracker) = self.storage.pending_relation_caches.get_mut(&relation)
+        {
+            tracker.apply_op(PendingRelationOp::Insert {
+                entity: bevy_entity,
+                target: bevy_target,
+            });
+            tracker.applied_cmd_len = self.storage.commands.len() + 1;
+        }
         self.storage.push_command(
             arena_wm,
             RecordedCommand::InsertRelation {
@@ -2039,6 +2735,9 @@ impl<'a> HostCommands<'a> {
         if component_count > MAX_SPAWN_BATCH_COMPONENTS {
             return FfiResult::CAPACITY_EXCEEDED;
         }
+        if entity_count > 0 && !out_entities.is_null() && !out_entities.is_aligned() {
+            return FfiResult::INVALID_ARGUMENT;
+        }
         if component_count > 0 && (components.is_null() || column_ptrs.is_null()) {
             return FfiResult::NULL_POINTER;
         }
@@ -2157,7 +2856,7 @@ impl<'a> HostCommands<'a> {
                             }
                         }
                         self.storage.soa_columns.truncate(col_start);
-                        self.storage.arena.rewind(arena_wm);
+                        self.rewind_arena_and_release(arena_wm);
                         self.release_reserved_spawns(entity_count);
                         return err;
                     }
@@ -2168,6 +2867,7 @@ impl<'a> HostCommands<'a> {
                 slice,
                 elem_size: entry.elem_size,
                 entity_count,
+                is_splat: false,
                 drop_slot: entry.drop_slot,
                 validates_entity_payload: entry.validates_entity_payload,
             });
@@ -2193,6 +2893,445 @@ impl<'a> HostCommands<'a> {
                 col_start,
                 col_count: component_count,
                 owner_mod_id: self.mod_id,
+            },
+        );
+        FfiResult::OK
+    }
+
+    /// Validates and queues an extended SoA batch spawn (`BamSpawnColumnDesc`) supporting splat columns.
+    ///
+    /// # Safety
+    /// - If `column_count > 0`, `columns` must be non-null and readable for `column_count` [`BamSpawnColumnDesc`] entries.
+    /// - Each column's `column_ptr` must be readable for `elem_size` bytes (`SPLAT`) or `entity_count * elem_size` bytes.
+    /// - If `!out_entities.is_null()` and `entity_count > 0`, `out_entities` must be writable for `entity_count` [`FfiEntity`] slots.
+    pub(crate) unsafe fn spawn_soa_batch_ex_raw(
+        &mut self,
+        columns: *const BamSpawnColumnDesc,
+        column_count: usize,
+        entity_count: usize,
+        out_entities: *mut FfiEntity,
+    ) -> FfiResult {
+        if column_count > MAX_SPAWN_BATCH_COMPONENTS {
+            return FfiResult::CAPACITY_EXCEEDED;
+        }
+        if entity_count > 0 && !out_entities.is_null() && !out_entities.is_aligned() {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        if column_count == 0 {
+            if entity_count == 0 {
+                return FfiResult::OK;
+            }
+            if let Err(err) = self.try_reserve_spawns(entity_count) {
+                return err;
+            }
+            let entity_start = self.storage.soa_entities.len();
+            self.storage.soa_entities.reserve(entity_count);
+            for i in 0..entity_count {
+                let entity = self.allocator.alloc();
+                self.storage.soa_entities.push(entity);
+                if !out_entities.is_null() {
+                    // SAFETY: `out_entities` is non-null and writable for `entity_count` slots.
+                    unsafe {
+                        *out_entities.add(i) = FfiEntity::from_bits(entity.to_bits());
+                    }
+                }
+            }
+            let arena_wm = self.storage.arena.watermark();
+            self.storage.push_command(
+                arena_wm,
+                RecordedCommand::SpawnSoaBatch {
+                    entity_start,
+                    entity_count,
+                    col_start: self.storage.soa_columns.len(),
+                    col_count: 0,
+                    owner_mod_id: self.mod_id,
+                },
+            );
+            return FfiResult::OK;
+        }
+        if columns.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !columns.is_aligned() {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+
+        #[derive(Clone, Copy)]
+        struct ValidatedExColumn {
+            handle: BamComponent,
+            component_id: ComponentId,
+            elem_size: usize,
+            total_bytes: usize,
+            align: usize,
+            ptr: *const u8,
+            is_splat: bool,
+            drop_slot: Option<(usize, u64)>,
+            validates_entity_payload: bool,
+        }
+
+        let mut validated = [ValidatedExColumn {
+            handle: BamComponent::INVALID,
+            component_id: ComponentId::new(0),
+            elem_size: 0,
+            total_bytes: 0,
+            align: 1,
+            ptr: core::ptr::null(),
+            is_splat: false,
+            drop_slot: None,
+            validates_entity_payload: false,
+        }; MAX_SPAWN_BATCH_COMPONENTS];
+
+        for (i, slot) in validated.iter_mut().take(column_count).enumerate() {
+            // SAFETY: `columns` is non-null, aligned, and readable for `column_count` entries.
+            let desc = unsafe { *columns.add(i) };
+            let status = desc.validate(entity_count);
+            if status.is_err() {
+                return status;
+            }
+            let meta = ffi_try!(resolve_insertable_component(self.snapshot, desc.component));
+            if meta.size != desc.elem_size {
+                return FfiResult::INVALID_ARGUMENT;
+            }
+            let is_splat = desc.is_splat();
+            if is_splat && meta.is_dynamic && (meta.drop_fn.is_some() || meta.drop_slot.is_some()) {
+                return FfiResult::PERMISSION_DENIED;
+            }
+            let total_bytes = if is_splat {
+                meta.size
+            } else {
+                let Some(bytes) = meta.size.checked_mul(entity_count) else {
+                    return FfiResult::INVALID_ARGUMENT;
+                };
+                bytes
+            };
+            if entity_count > 0 && meta.validates_entity_payload {
+                if meta.size != core::mem::size_of::<FfiEntity>() {
+                    return FfiResult::INVALID_ARGUMENT;
+                }
+                let check_count = if is_splat { 1 } else { entity_count };
+                for r in 0..check_count {
+                    // SAFETY: `desc.column_ptr` is non-null (`meta.size == 8`) and readable.
+                    let raw_bits = unsafe {
+                        core::ptr::read_unaligned(desc.column_ptr.add(r * meta.size).cast::<u64>())
+                    };
+                    ffi_try!(decode_live_entity(FfiEntity::from_bits(raw_bits)));
+                }
+            }
+            let drop_slot = if is_splat {
+                None
+            } else {
+                active_drop_slot(meta)
+            };
+            *slot = ValidatedExColumn {
+                handle: desc.component,
+                component_id: meta.component_id,
+                elem_size: meta.size,
+                total_bytes,
+                align: meta.align,
+                ptr: desc.column_ptr,
+                is_splat,
+                drop_slot,
+                validates_entity_payload: meta.validates_entity_payload,
+            };
+        }
+
+        for i in 0..column_count {
+            for prev in &validated[..i] {
+                if prev.component_id == validated[i].component_id {
+                    return FfiResult::INVALID_ARGUMENT;
+                }
+            }
+        }
+
+        if entity_count == 0 {
+            return FfiResult::OK;
+        }
+
+        let mut total_payload_bytes = 0usize;
+        for entry in &validated[..column_count] {
+            let Some(next) = total_payload_bytes.checked_add(entry.total_bytes) else {
+                self.storage.arena_breaches = self.storage.arena_breaches.saturating_add(1);
+                return FfiResult::CAPACITY_EXCEEDED;
+            };
+            total_payload_bytes = next;
+        }
+        if let Err(err) = self.check_arena_capacity(total_payload_bytes) {
+            return err;
+        }
+        if let Err(err) = self.try_reserve_spawns(entity_count) {
+            return err;
+        }
+
+        let arena_wm = self.storage.arena.watermark();
+        let col_start = self.storage.soa_columns.len();
+        for entry in &validated[..column_count] {
+            // SAFETY: `entry.ptr` is non-null when `entry.total_bytes > 0` and readable.
+            let slice =
+                match unsafe { self.alloc_arena_copy(entry.ptr, entry.total_bytes, entry.align) } {
+                    Ok(s) => s,
+                    Err(err) => {
+                        for col in &mut self.storage.soa_columns[col_start..] {
+                            if !col.is_splat
+                                && let Some((slot, expected_gen)) = col.drop_slot.take()
+                            {
+                                let base = self.storage.arena.ptr_mut(col.slice);
+                                // SAFETY: `base` holds `entity_count` uncommitted payloads.
+                                unsafe {
+                                    drop_uncommitted_soa_column(
+                                        base.as_ptr(),
+                                        col.elem_size,
+                                        entity_count,
+                                        slot,
+                                        expected_gen,
+                                        false,
+                                    );
+                                }
+                            }
+                        }
+                        self.storage.soa_columns.truncate(col_start);
+                        self.rewind_arena_and_release(arena_wm);
+                        self.release_reserved_spawns(entity_count);
+                        return err;
+                    }
+                };
+            self.storage.soa_columns.push(SpawnSoaColumn {
+                component: entry.handle,
+                component_id: entry.component_id,
+                slice,
+                elem_size: entry.elem_size,
+                entity_count,
+                is_splat: entry.is_splat,
+                drop_slot: entry.drop_slot,
+                validates_entity_payload: entry.validates_entity_payload,
+            });
+        }
+
+        let entity_start = self.storage.soa_entities.len();
+        self.storage.soa_entities.reserve(entity_count);
+        for i in 0..entity_count {
+            let entity = self.allocator.alloc();
+            self.storage.soa_entities.push(entity);
+            if !out_entities.is_null() {
+                // SAFETY: `out_entities` is non-null and writable for `entity_count` slots.
+                unsafe {
+                    *out_entities.add(i) = FfiEntity::from_bits(entity.to_bits());
+                }
+            }
+        }
+        self.storage.push_command(
+            arena_wm,
+            RecordedCommand::SpawnSoaBatch {
+                entity_start,
+                entity_count,
+                col_start,
+                col_count: column_count,
+                owner_mod_id: self.mod_id,
+            },
+        );
+        FfiResult::OK
+    }
+
+    /// Validates and queues a batch despawn over `entities[0..count]`.
+    ///
+    /// # Safety
+    /// If `count > 0`, `entities` must be non-null and readable for `count` [`FfiEntity`] entries.
+    pub(crate) unsafe fn despawn_batch_raw(
+        &mut self,
+        entities: *const FfiEntity,
+        count: usize,
+    ) -> FfiResult {
+        if count == 0 {
+            return FfiResult::OK;
+        }
+        if entities.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        let entity_start = self.storage.soa_entities.len();
+        for i in 0..count {
+            // SAFETY: `entities` is non-null and readable for `count` `FfiEntity` elements.
+            let raw_bits = unsafe { core::ptr::read_unaligned(entities.add(i).cast::<u64>()) };
+            match decode_live_entity(FfiEntity::from_bits(raw_bits)) {
+                Ok(ent) => self.storage.soa_entities.push(ent),
+                Err(err) => {
+                    self.storage.soa_entities.truncate(entity_start);
+                    return err;
+                }
+            }
+        }
+        let arena_wm = self.storage.arena.watermark();
+        self.storage.push_command(
+            arena_wm,
+            RecordedCommand::DespawnBatch {
+                entity_start,
+                entity_count: count,
+            },
+        );
+        FfiResult::OK
+    }
+
+    /// Validates and queues a batch component insertion across `entities[0..entity_count]`.
+    ///
+    /// # Safety
+    /// - If `entity_count > 0`, `entities` must be non-null and readable for `entity_count` entries.
+    /// - When `entity_count > 0` and `elem_size > 0`, `data_ptr` must be non-null and readable
+    ///   for `elem_size` bytes (`BAM_SPAWN_COL_FLAG_SPLAT`) or `entity_count * elem_size` bytes.
+    pub(crate) unsafe fn insert_batch_raw(
+        &mut self,
+        entities: *const FfiEntity,
+        entity_count: usize,
+        component: BamComponent,
+        data_ptr: *const u8,
+        elem_size: usize,
+        flags: u32,
+    ) -> FfiResult {
+        if (flags & !BAM_SPAWN_COL_KNOWN_FLAGS) != 0 {
+            return FfiResult::UNSUPPORTED;
+        }
+        let meta = ffi_try!(resolve_insertable_component(self.snapshot, component));
+        if meta.size != elem_size {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        let is_splat = (flags & BAM_SPAWN_COL_FLAG_SPLAT) != 0;
+        if is_splat && meta.is_dynamic && (meta.drop_fn.is_some() || meta.drop_slot.is_some()) {
+            return FfiResult::PERMISSION_DENIED;
+        }
+        if entity_count == 0 {
+            return FfiResult::OK;
+        }
+        if entities.is_null() || (elem_size > 0 && data_ptr.is_null()) {
+            return FfiResult::NULL_POINTER;
+        }
+        let total_bytes = if is_splat {
+            elem_size
+        } else {
+            let Some(bytes) = elem_size.checked_mul(entity_count) else {
+                return FfiResult::INVALID_ARGUMENT;
+            };
+            bytes
+        };
+        if let Err(err) = self.check_arena_capacity(total_bytes) {
+            return err;
+        }
+        if meta.validates_entity_payload {
+            if elem_size != core::mem::size_of::<FfiEntity>() {
+                return FfiResult::INVALID_ARGUMENT;
+            }
+            if is_splat {
+                // SAFETY: `data_ptr` is non-null (`elem_size == 8`) and readable.
+                let parent_bits = unsafe { core::ptr::read_unaligned(data_ptr.cast::<u64>()) };
+                let parent = ffi_try!(decode_live_entity(FfiEntity::from_bits(parent_bits)));
+                for i in 0..entity_count {
+                    // SAFETY: `entities` is non-null and readable for `entity_count` entries.
+                    let raw_bits =
+                        unsafe { core::ptr::read_unaligned(entities.add(i).cast::<u64>()) };
+                    let target = ffi_try!(decode_live_entity(FfiEntity::from_bits(raw_bits)));
+                    if parent == target {
+                        return FfiResult::INVALID_ENTITY;
+                    }
+                }
+            } else {
+                for i in 0..entity_count {
+                    // SAFETY: `entities` is non-null and readable for `entity_count` entries.
+                    let raw_bits =
+                        unsafe { core::ptr::read_unaligned(entities.add(i).cast::<u64>()) };
+                    let target = ffi_try!(decode_live_entity(FfiEntity::from_bits(raw_bits)));
+                    // SAFETY: `data_ptr` is non-null and readable for `entity_count * 8` bytes.
+                    let parent_bits = unsafe {
+                        core::ptr::read_unaligned(data_ptr.add(i * elem_size).cast::<u64>())
+                    };
+                    let parent = ffi_try!(decode_live_entity(FfiEntity::from_bits(parent_bits)));
+                    if parent == target {
+                        return FfiResult::INVALID_ENTITY;
+                    }
+                }
+            }
+        }
+
+        let entity_start = self.storage.soa_entities.len();
+        for i in 0..entity_count {
+            // SAFETY: `entities` is non-null and readable for `entity_count` entries.
+            let raw_bits = unsafe { core::ptr::read_unaligned(entities.add(i).cast::<u64>()) };
+            match decode_live_entity(FfiEntity::from_bits(raw_bits)) {
+                Ok(ent) => self.storage.soa_entities.push(ent),
+                Err(err) => {
+                    self.storage.soa_entities.truncate(entity_start);
+                    return err;
+                }
+            }
+        }
+
+        let arena_wm = self.storage.arena.watermark();
+        // SAFETY: `data_ptr` is non-null when `total_bytes > 0` and readable for `total_bytes`.
+        let slice = match unsafe { self.alloc_arena_copy(data_ptr, total_bytes, meta.align) } {
+            Ok(s) => s,
+            Err(err) => {
+                self.storage.soa_entities.truncate(entity_start);
+                return err;
+            }
+        };
+        let drop_slot = if is_splat {
+            None
+        } else {
+            active_drop_slot(meta)
+        };
+        self.storage.push_command(
+            arena_wm,
+            RecordedCommand::InsertBatch {
+                entity_start,
+                entity_count,
+                component,
+                component_id: meta.component_id,
+                slice,
+                elem_size,
+                is_splat,
+                drop_slot,
+                validates_entity_payload: meta.validates_entity_payload,
+            },
+        );
+        FfiResult::OK
+    }
+
+    /// Validates and queues a batch component removal across `entities[0..entity_count]`.
+    ///
+    /// # Safety
+    /// If `entity_count > 0`, `entities` must be non-null and readable for `entity_count` entries.
+    pub(crate) unsafe fn remove_batch_raw(
+        &mut self,
+        entities: *const FfiEntity,
+        entity_count: usize,
+        component: BamComponent,
+    ) -> FfiResult {
+        let Some(meta) = self.snapshot.get_by_handle(component) else {
+            return FfiResult::INVALID_COMPONENT;
+        };
+        if meta.is_resource() || meta.is_message() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if entity_count == 0 {
+            return FfiResult::OK;
+        }
+        if entities.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        let entity_start = self.storage.soa_entities.len();
+        for i in 0..entity_count {
+            // SAFETY: `entities` is non-null and readable for `entity_count` entries.
+            let raw_bits = unsafe { core::ptr::read_unaligned(entities.add(i).cast::<u64>()) };
+            match decode_live_entity(FfiEntity::from_bits(raw_bits)) {
+                Ok(ent) => self.storage.soa_entities.push(ent),
+                Err(err) => {
+                    self.storage.soa_entities.truncate(entity_start);
+                    return err;
+                }
+            }
+        }
+        let arena_wm = self.storage.arena.watermark();
+        self.storage.push_command(
+            arena_wm,
+            RecordedCommand::RemoveBatch {
+                entity_start,
+                entity_count,
+                component_id: meta.component_id,
             },
         );
         FfiResult::OK
@@ -2328,6 +3467,9 @@ pub unsafe extern "C" fn host_cmd_spawn_empty(
 ) -> FfiResult {
     if out_entity.is_null() {
         return FfiResult::NULL_POINTER;
+    }
+    if !out_entity.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
     }
     // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
     let cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
@@ -2486,7 +3628,7 @@ pub(crate) unsafe fn spawn_batch_with_scope(
                     }
                 }
                 cmds.storage.batch_items.truncate(batch_start);
-                cmds.storage.arena.rewind(arena_wm);
+                cmds.rewind_arena_and_release(arena_wm);
                 cmds.release_reserved_spawns(1);
                 return err;
             }
@@ -2533,6 +3675,9 @@ pub unsafe extern "C" fn host_cmd_spawn(
 ) -> FfiResult {
     if out_entity.is_null() {
         return FfiResult::NULL_POINTER;
+    }
+    if !out_entity.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
     }
     // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
     let cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
@@ -2715,6 +3860,107 @@ pub unsafe extern "C" fn host_cmd_trigger(
         },
     );
     FfiResult::OK
+}
+
+/// Queues deferred despawning for `entities[0..count]` (ABI `0.4` slot `85`).
+///
+/// # Safety
+/// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+/// - If `count > 0`, `entities` must point to `count` readable [`FfiEntity`] entries.
+pub unsafe extern "C" fn host_cmd_despawn_batch(
+    commands: *mut BamCommands,
+    entities: *const FfiEntity,
+    count: usize,
+) -> FfiResult {
+    if count > 0 && entities.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validates `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
+    // SAFETY: Caller guarantees `entities` is readable for `count` entries when `count > 0`.
+    unsafe { cmds.despawn_batch_raw(entities, count) }
+}
+
+/// Queues deferred batch insertion of `component` across `entities[0..entity_count]` (ABI `0.4` slot `86`).
+///
+/// # Safety
+/// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+/// - If `entity_count > 0`, `entities` must point to `entity_count` readable [`FfiEntity`] entries
+///   and `data_ptr` must be readable for `elem_size` bytes (`BAM_SPAWN_COL_FLAG_SPLAT`) or
+///   `entity_count * elem_size` bytes.
+pub unsafe extern "C" fn host_cmd_insert_batch(
+    commands: *mut BamCommands,
+    entities: *const FfiEntity,
+    entity_count: usize,
+    component: BamComponent,
+    data_ptr: *const u8,
+    elem_size: usize,
+    flags: u32,
+) -> FfiResult {
+    if (flags & !BAM_SPAWN_COL_KNOWN_FLAGS) != 0 {
+        return FfiResult::UNSUPPORTED;
+    }
+    if entity_count > 0 && entities.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validates `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
+    // SAFETY: Caller guarantees `entities` and `data_ptr` readable spans.
+    unsafe {
+        cmds.insert_batch_raw(
+            entities,
+            entity_count,
+            component,
+            data_ptr,
+            elem_size,
+            flags,
+        )
+    }
+}
+
+/// Queues deferred batch removal of `component` from `entities[0..entity_count]` (ABI `0.4` slot `87`).
+///
+/// # Safety
+/// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+/// - If `entity_count > 0`, `entities` must point to `entity_count` readable [`FfiEntity`] entries.
+pub unsafe extern "C" fn host_cmd_remove_batch(
+    commands: *mut BamCommands,
+    entities: *const FfiEntity,
+    entity_count: usize,
+    component: BamComponent,
+) -> FfiResult {
+    if entity_count > 0 && entities.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validates `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
+    // SAFETY: Caller guarantees `entities` is readable for `entity_count` entries.
+    unsafe { cmds.remove_batch_raw(entities, entity_count, component) }
+}
+
+/// Queues extended SoA batch spawning supporting dense and splat columns via [`BamSpawnColumnDesc`]
+/// (ABI `0.4` slot `89`).
+///
+/// # Safety
+/// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+/// - If `column_count > 0`, `columns` must point to `column_count` readable [`BamSpawnColumnDesc`]
+///   entries with valid `column_ptr` spans.
+/// - If `out_entities` is non-null and `entity_count > 0`, `out_entities` must point to at least
+///   `entity_count` writable [`FfiEntity`] slots.
+pub unsafe extern "C" fn host_cmd_spawn_batch_ex(
+    commands: *mut BamCommands,
+    columns: *const BamSpawnColumnDesc,
+    column_count: usize,
+    entity_count: usize,
+    out_entities: *mut FfiEntity,
+) -> FfiResult {
+    if column_count > 0 && columns.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validates `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
+    // SAFETY: Caller guarantees `columns` and optional `out_entities` spans.
+    unsafe { cmds.spawn_soa_batch_ex_raw(columns, column_count, entity_count, out_entities) }
 }
 
 #[cfg(test)]

@@ -22,6 +22,7 @@ pub mod sync_ptr;
 pub mod system;
 
 pub use drop_trampoline::{MAX_DROP_TRAMPOLINES, WorldDropGuard};
+pub use ffi::CommandArenaConfig;
 pub use ffi::assets_scene::{
     HostAssetBackend, HostSceneBackend, host_asset_get_load_state, host_asset_load,
     host_asset_release, host_cmd_spawn_scene,
@@ -67,12 +68,13 @@ pub use ffi::validation::{
     BamFieldBytePatch, BamFieldDescriptor, BamFieldPodKind, WitnessFieldDescriptor,
     apply_entity_component_fields, apply_resource_fields, ensure_component_in_target_world,
     export_entity_component_fields, export_resource_fields, extract_component_between_worlds,
-    extract_resource_between_worlds, insert_entity_component_from_fields,
+    extract_resource_between_worlds, hash_world_pod_state, insert_entity_component_from_fields,
     insert_entity_pod_with_field_patches, insert_or_apply_entity_component_fields,
     inspect_component_bam_fields, inspect_component_bam_fields_in_registry,
     inspect_component_witness_fields, inspect_component_witness_fields_in_registry,
     read_entity_bam_field_bytes, read_entity_pod_bytes, read_resource_bam_field_bytes,
-    write_entity_bam_field_bytes, write_entity_pod_bytes, write_resource_bam_field_bytes,
+    read_table_column_bytes, spawn_entity_pod_bundle, write_entity_bam_field_bytes,
+    write_entity_pod_bytes, write_resource_bam_field_bytes,
 };
 #[cfg(feature = "bridge-reflect")]
 pub use ffi::validation::{
@@ -100,27 +102,43 @@ pub use loader::{
     validate_bampack_entry_path, zeroed_binary_for_bam_sig,
 };
 pub use loader::{
-    BinaryFormat, LibraryResidencyInfo, LoadOptions, LoadedMod, LoadedModInfo, ModHost, ModId,
-    ModLoadError, ModLoaded, ModScoped, ModUnloaded, canonical_mod_name_from_path,
-    excise_and_unload_mod_in_world, inspect_library_residency, inspect_library_residency_file,
-    is_abi_version_compatible, load_mod_in_world, record_mod_named_sets_in_world,
-    restore_mod_state_in_world, rollback_unscheduled_mod_in_world, save_mod_state_in_world,
-    unload_all_mods_in_world,
+    BamResolveSymbolFn, BamSymbolTable, BinaryFormat, InMemoryModEntrypoints, InMemoryObjectLoader,
+    LibraryResidencyInfo, LoadOptions, LoadedMod, LoadedModInfo, ModBacking, ModHost, ModId,
+    ModLoadError, ModLoaded, ModNamedObjects, ModScoped, ModUnloaded, PreparedModImage,
+    canonical_mod_name_from_path, ensure_symbol_tables_in_world, excise_and_unload_mod_in_world,
+    inspect_library_residency, inspect_library_residency_file, is_abi_version_compatible,
+    load_mod_from_entrypoints_in_world, load_mod_in_world, load_prepared_mod_in_world,
+    prepare_entrypoints_in_world, record_mod_named_sets_in_world, restore_mod_state_in_world,
+    rollback_unscheduled_mod_in_world, save_mod_state_in_world, unload_all_mods_in_world,
 };
 #[cfg(feature = "keygen")]
 pub use loader::{
     GeneratedKeypair, IssuedCertificate, generate_ed25519_keypair,
     issue_ed25519_certificate_openssh, keygen, write_openssh_keypair,
 };
+#[cfg(feature = "dynamic-loader")]
+pub use loader::{LoadedLibrary, prepare_dynamic_mod_in_world};
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+pub use loader::{load_bampack_in_world, prepare_bampack_in_world};
 pub use registry::{
     ComponentCollisionError, ComponentOptions, CreateMsgCursorFn, EntityEventTriggerFn,
     ExtractEventTargetFn, ExtractRelationshipTargetsFn, HostStringBridge, HostWireBridge,
-    InsertDefaultFn, InsertRawFn, ModRegistry, MsgReadBatchFn, MsgSendFn, MsgWriteBatchFn,
-    RegisteredComponent, RegistrySnapshot, TargetEntity, TriggerEventFn,
+    InsertDefaultFn, InsertRawFn, ModRegistry, ModRelationGraph, MsgReadBatchFn, MsgSendFn,
+    MsgWriteBatchFn, RegisteredComponent, RegistrySnapshot, RelationEdgeView, RelationFlushError,
+    RelationFlushPolicy, TargetEntity, TriggerEventFn, check_relation_acyclic,
+    ensure_relation_graph_in_world, register_bridged_component, register_bridged_entity_event,
+    register_bridged_entity_event_with, register_bridged_resource,
+    register_bridged_string_component,
 };
 pub use schedule::{
-    ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
-    mark_startup_completed, resolve_builtin_schedule_id,
+    ConfiguredScheduleSet, ModNamedSystemSet, ModScheduleMap, ModScheduleSetRegistry,
+    ModScheduleSetRewirePass, ModSystemSet, ModVisibleSets, ScheduleSetConfig, ScheduleSetMode,
+    StartupCompleted, apply_mod_schedule_sets_to_schedule, configure_guest_system_for_schedule,
+    install_mod_schedule_set_pass, mark_startup_completed, mount_mod_systems_in_world,
+    prevalidate_mod_schedule_set_rewire_in_schedule, prevalidate_mod_schedule_set_rewire_in_world,
+    resolve_builtin_schedule_id, resolve_schedule_id_in_world,
+    rewire_mod_schedule_sets_in_schedule, rewire_mod_schedule_sets_in_world,
+    sync_mod_schedule_set_configs_to_schedule,
 };
 pub use sync_ptr::{GuestFnPtr, GuestInstancePtr, GuestUserData, SymbolAddress};
 pub use system::{

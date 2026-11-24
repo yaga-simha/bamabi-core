@@ -185,6 +185,7 @@ fn macho_residency_detects_thread_vars_tlv_and_reexport_flags() {
     );
 }
 
+#[cfg(feature = "dynamic-loader")]
 #[test]
 fn shadow_copy_stages_and_cleans_up_pdb_sidecar_and_patches_rsds() {
     let orig_pdb_str = "C:\\very\\long\\build\\output\\target\\debug\\sample_mod.pdb";

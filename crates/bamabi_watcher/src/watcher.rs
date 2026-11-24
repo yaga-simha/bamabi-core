@@ -9,20 +9,37 @@ use bamabi_host::mod_dag::{
     ModDagError, ModDependencyGraph, ModTomlManifest, discover_mod_manifests,
     resolve_dependency_dag,
 };
+use bamabi_host::schedule_sets::leased_schedules;
 use bamabi_host::world_ext::ModWorldExt;
-use bamabi_host::{ModLifecycleFlush, ensure_mod_lifecycle_flush_schedule};
+use bamabi_host::{
+    ModLifecycleFlush, ModScheduleSetRegistry, ScheduleSetMode,
+    ensure_mod_lifecycle_flush_schedule, prevalidate_mod_schedule_set_rewire_in_world,
+    rewire_mod_schedule_sets_in_world,
+};
+#[cfg(feature = "signature-verification")]
+use bamabi_host_sys::BAMPACK_MAGIC;
+use bamabi_host_sys::schedule::{ModNamedSystemSet, ModVisibleSets, resolve_schedule_id_in_world};
 use bamabi_host_sys::{LoadOptions, ModHost, ModId, ModLoadError, canonical_mod_name_from_path};
+use bamabi_sys::ScheduleId;
 use bevy_app::{App, Plugin};
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::world::World;
 use notify_debouncer_full::notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify_debouncer_full::notify::{EventKind, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
+
+/// Default bounded capacity of [`ModHotReloadHistory`] ring buffer (`256` entries).
+pub const DEFAULT_MAX_HOT_RELOAD_HISTORY: usize = 256;
+
+/// Default number of consecutive identical `(size, modified, inode)` polls required before a
+/// changed mod artifact is treated as stable and eligible for loading/reloading.
+pub const DEFAULT_STABILITY_POLLS: usize = 2;
 
 /// Action taken by [`ModHotReloadWatcher`] for a changed or deleted mod artifact / manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,11 +66,52 @@ pub struct ModHotReloadOutcome {
     pub action: ModHotReloadAction,
 }
 
-/// World resource recording outcomes emitted by [`ModHotReloadPlugin`]'s polling system.
-#[derive(Resource, Default, Debug, Clone)]
+/// World resource recording bounded ring-buffer outcomes emitted by [`ModHotReloadPlugin`].
+#[derive(Resource, Debug, Clone)]
 pub struct ModHotReloadHistory {
-    /// Chronological list of hot-reload outcomes observed in this `World`.
-    pub outcomes: Vec<ModHotReloadOutcome>,
+    /// Chronological ring buffer of hot-reload outcomes observed in this `World`.
+    pub outcomes: VecDeque<ModHotReloadOutcome>,
+    max_history: usize,
+}
+
+impl Default for ModHotReloadHistory {
+    #[inline]
+    fn default() -> Self {
+        Self::with_max_history(DEFAULT_MAX_HOT_RELOAD_HISTORY)
+    }
+}
+
+impl ModHotReloadHistory {
+    /// Creates an empty [`ModHotReloadHistory`] retaining up to `max_history.max(1)` outcomes.
+    #[inline]
+    pub fn with_max_history(max_history: usize) -> Self {
+        let cap = max_history.max(1);
+        Self {
+            outcomes: VecDeque::with_capacity(cap),
+            max_history: cap,
+        }
+    }
+
+    /// Returns the maximum number of retained historical outcomes.
+    #[inline]
+    pub const fn max_history(&self) -> usize {
+        self.max_history
+    }
+
+    /// Appends a single [`ModHotReloadOutcome`], evicting the oldest record when full.
+    pub fn push(&mut self, outcome: ModHotReloadOutcome) {
+        while self.outcomes.len() >= self.max_history {
+            let _ = self.outcomes.pop_front();
+        }
+        self.outcomes.push_back(outcome);
+    }
+
+    /// Appends a batch of [`ModHotReloadOutcome`]s while enforcing the bounded ring capacity.
+    pub fn extend_outcomes<I: IntoIterator<Item = ModHotReloadOutcome>>(&mut self, iter: I) {
+        for item in iter {
+            self.push(item);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -114,9 +172,11 @@ pub struct ModHotReloadWatcher {
     load_options: LoadOptions,
     debounce: Duration,
     unload_on_delete: bool,
+    stability_polls_required: usize,
     rx: Mutex<mpsc::Receiver<DebounceEventResult>>,
     pending_deletes: Mutex<HashMap<PathBuf, Instant>>,
     pending_retries: Mutex<PendingRetries>,
+    pending_stability: Mutex<HashMap<PathBuf, (FileFingerprint, usize)>>,
     sync_fingerprints: Mutex<HashMap<PathBuf, (FileFingerprint, Instant)>>,
     disconnected_logged: AtomicBool,
     disconnected_outcome_recorded: AtomicBool,
@@ -161,9 +221,11 @@ impl ModHotReloadWatcher {
             load_options: load_options.with_shadow_copy(true),
             debounce,
             unload_on_delete: true,
+            stability_polls_required: DEFAULT_STABILITY_POLLS,
             rx: Mutex::new(rx),
             pending_deletes: Mutex::new(HashMap::new()),
             pending_retries: Mutex::new(PendingRetries::default()),
+            pending_stability: Mutex::new(HashMap::new()),
             sync_fingerprints: Mutex::new(HashMap::new()),
             disconnected_logged: AtomicBool::new(false),
             disconnected_outcome_recorded: AtomicBool::new(false),
@@ -183,14 +245,24 @@ impl ModHotReloadWatcher {
             load_options: load_options.with_shadow_copy(true),
             debounce,
             unload_on_delete: true,
+            stability_polls_required: 1,
             rx: Mutex::new(rx),
             pending_deletes: Mutex::new(HashMap::new()),
             pending_retries: Mutex::new(PendingRetries::default()),
+            pending_stability: Mutex::new(HashMap::new()),
             sync_fingerprints: Mutex::new(HashMap::new()),
             disconnected_logged: AtomicBool::new(false),
             disconnected_outcome_recorded: AtomicBool::new(false),
             _debouncer: Mutex::new(None),
         }
+    }
+
+    /// Configures how many consecutive identical `(size, modified, inode)` polls are required
+    /// before a modified/created artifact is treated as write-complete (`>= 1`).
+    #[must_use]
+    pub fn with_stability_polls(mut self, polls: usize) -> Self {
+        self.stability_polls_required = polls.max(1);
+        self
     }
 
     /// Enables or disables automatic unloading when a watched mod binary or `mod.toml` is
@@ -386,8 +458,61 @@ impl ModHotReloadWatcher {
             }
         }
 
+        if self.stability_polls_required > 1 {
+            let mut stability = self
+                .pending_stability
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut ready = Vec::new();
+
+            for path in &changed {
+                if let Some(fp) = FileFingerprint::from_path(path) {
+                    let count = match stability.get(path) {
+                        Some(&(prev_fp, prev_count)) if prev_fp == fp => prev_count + 1,
+                        _ => 1,
+                    };
+                    if count >= self.stability_polls_required {
+                        stability.remove(path);
+                        ready.push(path.clone());
+                    } else {
+                        stability.insert(path.clone(), (fp, count));
+                    }
+                }
+            }
+
+            let existing_keys: Vec<PathBuf> = stability
+                .keys()
+                .filter(|p| !seen_changed.contains(*p))
+                .cloned()
+                .collect();
+            for path in existing_keys {
+                if !path.is_file() {
+                    stability.remove(&path);
+                    continue;
+                }
+                if let Some(fp) = FileFingerprint::from_path(&path) {
+                    let count = match stability.get(&path) {
+                        Some(&(prev_fp, prev_count)) if prev_fp == fp => prev_count + 1,
+                        _ => 1,
+                    };
+                    if count >= self.stability_polls_required {
+                        stability.remove(&path);
+                        if seen_changed.insert(path.clone()) {
+                            ready.push(path);
+                        }
+                    } else {
+                        stability.insert(path, (fp, count));
+                    }
+                }
+            }
+            for del in &deleted {
+                stability.remove(del);
+            }
+            changed = ready;
+        }
+
         for path in retries.changes {
-            if path.is_file() && !pending.contains_key(&path) && seen_changed.insert(path.clone()) {
+            if path.is_file() && !pending.contains_key(&path) && !changed.contains(&path) {
                 changed.push(path);
             }
         }
@@ -522,6 +647,7 @@ pub struct ModHotReloadPlugin {
     recursive: bool,
     unload_on_delete: bool,
     sync_on_start: bool,
+    max_history: usize,
     load_options: LoadOptions,
 }
 
@@ -534,6 +660,7 @@ impl ModHotReloadPlugin {
             recursive: true,
             unload_on_delete: true,
             sync_on_start: false,
+            max_history: DEFAULT_MAX_HOT_RELOAD_HISTORY,
             load_options: LoadOptions::default().with_shadow_copy(true),
         }
     }
@@ -567,6 +694,13 @@ impl ModHotReloadPlugin {
         self
     }
 
+    /// Configures the bounded ring-buffer capacity for [`ModHotReloadHistory`] (`>= 1`).
+    #[must_use]
+    pub fn with_max_history(mut self, max_history: usize) -> Self {
+        self.max_history = max_history.max(1);
+        self
+    }
+
     /// Overrides the [`LoadOptions`] used when loading or reloading mods.
     #[must_use]
     pub fn with_load_options(mut self, load_options: LoadOptions) -> Self {
@@ -578,7 +712,7 @@ impl ModHotReloadPlugin {
 impl Plugin for ModHotReloadPlugin {
     fn build(&self, app: &mut App) {
         if !app.world().contains_resource::<ModHotReloadHistory>() {
-            app.init_resource::<ModHotReloadHistory>();
+            app.insert_resource(ModHotReloadHistory::with_max_history(self.max_history));
         }
         ensure_mod_lifecycle_flush_schedule(app);
         match ModHotReloadWatcher::watch_with_options(
@@ -594,7 +728,7 @@ impl Plugin for ModHotReloadPlugin {
                     if let Some(mut hist) =
                         app.world_mut().get_resource_mut::<ModHotReloadHistory>()
                     {
-                        hist.outcomes.extend(initial);
+                        hist.extend_outcomes(initial);
                     }
                 }
                 app.insert_resource(watcher);
@@ -606,6 +740,15 @@ impl Plugin for ModHotReloadPlugin {
                     error = %err,
                     "failed to initialize ModHotReloadWatcher"
                 );
+                if let Some(mut hist) = app.world_mut().get_resource_mut::<ModHotReloadHistory>() {
+                    hist.push(ModHotReloadOutcome {
+                        path: self.watch_dir.clone(),
+                        mod_id: None,
+                        action: ModHotReloadAction::Failed(format!(
+                            "failed to initialize ModHotReloadWatcher: {err}"
+                        )),
+                    });
+                }
             }
         }
     }
@@ -644,7 +787,7 @@ fn poll_hot_reload_watcher_system(world: &mut World) {
             world.init_resource::<ModHotReloadHistory>();
         }
         if let Some(mut history) = world.get_resource_mut::<ModHotReloadHistory>() {
-            history.outcomes.extend(outcomes);
+            history.extend_outcomes(outcomes);
         }
     }
 }
@@ -683,8 +826,656 @@ fn is_dylib_path(path: &Path) -> bool {
         })
 }
 
+fn is_sig_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("sig"))
+}
+
+fn is_bampack_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bampack"))
+}
+
+fn is_schedule_delta_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.ends_with(".schedule_delta.json"))
+}
+
 fn is_watchable_mod_path(path: &Path) -> bool {
-    is_dylib_path(path) || is_manifest_path(path)
+    is_dylib_path(path)
+        || is_manifest_path(path)
+        || is_sig_path(path)
+        || is_bampack_path(path)
+        || is_schedule_delta_path(path)
+}
+
+fn has_valid_native_binary_magic(path: &Path) -> Result<(), String> {
+    let mut file = std::fs::File::open(path).map_err(|err| {
+        format!(
+            "failed to open '{}' for header check: {err}",
+            path.display()
+        )
+    })?;
+    let mut hdr = [0u8; 4];
+    let n = file
+        .read(&mut hdr)
+        .map_err(|err| format!("failed to read '{}' header: {err}", path.display()))?;
+    if n < 2 {
+        return Err(format!(
+            "mod binary '{}' is truncated ({n} bytes)",
+            path.display()
+        ));
+    }
+    if hdr[..2] == *b"MZ" {
+        return Ok(());
+    }
+    if n < 4 {
+        return Err(format!(
+            "mod binary '{}' is truncated ({n} bytes)",
+            path.display()
+        ));
+    }
+    let magic_be = u32::from_be_bytes(hdr);
+    let is_elf = hdr == *b"\x7fELF";
+    let is_macho = matches!(
+        magic_be,
+        0xFEED_FACE
+            | 0xCEFA_EDFE
+            | 0xFEED_FACF
+            | 0xCFFA_EDFE
+            | 0xCAFE_BABE
+            | 0xBEBA_FECA
+            | 0xCAFE_BABF
+            | 0xBFBA_FECA
+    );
+    if is_elf || is_macho {
+        Ok(())
+    } else {
+        Err(format!(
+            "mod binary '{}' has invalid ELF/Mach-O/PE magic header",
+            path.display()
+        ))
+    }
+}
+
+fn has_valid_bampack_magic(path: &Path) -> Result<(), String> {
+    let mut file = std::fs::File::open(path).map_err(|err| {
+        format!(
+            "failed to open '{}' for bampack header check: {err}",
+            path.display()
+        )
+    })?;
+    let mut hdr = [0u8; 8];
+    let n = file
+        .read(&mut hdr)
+        .map_err(|err| format!("failed to read '{}' bampack header: {err}", path.display()))?;
+    #[cfg(feature = "signature-verification")]
+    let expected = *BAMPACK_MAGIC;
+    #[cfg(not(feature = "signature-verification"))]
+    let expected = *b"BAMPACK\0";
+    if n == 8 && hdr == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "bampack archive '{}' has invalid BAMPACK magic header",
+            path.display()
+        ))
+    }
+}
+
+fn resolve_sig_target_path(world: &World, sig_path: &Path) -> Option<PathBuf> {
+    let candidate = sig_path.with_extension("");
+    if candidate.is_file() && (is_dylib_path(&candidate) || is_bampack_path(&candidate)) {
+        return Some(candidate);
+    }
+    if let Some(host) = world.get_resource::<ModHost>() {
+        for m in host.loaded_mods() {
+            if !m.is_active() {
+                continue;
+            }
+            let src = m.source_path();
+            if same_path(
+                &src.with_extension(format!(
+                    "{}.sig",
+                    src.extension().and_then(|e| e.to_str()).unwrap_or("")
+                )),
+                sig_path,
+            ) {
+                return Some(src.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
+struct JsonCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonCursor<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            bytes: input.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if b.is_ascii_whitespace() {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_ws();
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn next(&mut self) -> Option<u8> {
+        let b = self.peek()?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn parse_string(&mut self) -> Result<String, String> {
+        if self.next() != Some(b'"') {
+            return Err("expected JSON string".to_string());
+        }
+        let mut out = String::new();
+        while let Some(&b) = self.bytes.get(self.pos) {
+            self.pos += 1;
+            match b {
+                b'"' => return Ok(out),
+                b'\\' => {
+                    let esc = self
+                        .bytes
+                        .get(self.pos)
+                        .copied()
+                        .ok_or_else(|| "unterminated string escape".to_string())?;
+                    self.pos += 1;
+                    match esc {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        _ => return Err(format!("unsupported escape '\\{}'", esc as char)),
+                    }
+                }
+                _ => out.push(b as char),
+            }
+        }
+        Err("unterminated JSON string".to_string())
+    }
+
+    fn parse_bool(&mut self) -> Result<bool, String> {
+        self.skip_ws();
+        if self.bytes.get(self.pos..self.pos + 4) == Some(b"true") {
+            self.pos += 4;
+            Ok(true)
+        } else if self.bytes.get(self.pos..self.pos + 5) == Some(b"false") {
+            self.pos += 5;
+            Ok(false)
+        } else {
+            Err("expected JSON boolean".to_string())
+        }
+    }
+
+    fn parse_u32(&mut self) -> Result<u32, String> {
+        self.skip_ws();
+        let start = self.pos;
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if b.is_ascii_digit() {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let slice = self
+            .bytes
+            .get(start..self.pos)
+            .ok_or_else(|| "invalid integer span".to_string())?;
+        let text = core::str::from_utf8(slice).map_err(|_| "invalid UTF-8 integer".to_string())?;
+        text.parse::<u32>()
+            .map_err(|_| format!("invalid u32 integer '{text}'"))
+    }
+
+    fn parse_string_array(&mut self) -> Result<Vec<String>, String> {
+        if self.next() != Some(b'[') {
+            return Err("expected '[' for string array".to_string());
+        }
+        let mut items = Vec::new();
+        if self.peek() == Some(b']') {
+            let _ = self.next();
+            return Ok(items);
+        }
+        loop {
+            items.push(self.parse_string()?);
+            match self.next() {
+                Some(b',') => continue,
+                Some(b']') => return Ok(items),
+                _ => return Err("expected ',' or ']' in string array".to_string()),
+            }
+        }
+    }
+
+    fn skip_value(&mut self) -> Result<(), String> {
+        match self.peek() {
+            Some(b'"') => {
+                let _ = self.parse_string()?;
+                Ok(())
+            }
+            Some(b'{') => {
+                let _ = self.next();
+                if self.peek() == Some(b'}') {
+                    let _ = self.next();
+                    return Ok(());
+                }
+                loop {
+                    let _ = self.parse_string()?;
+                    if self.next() != Some(b':') {
+                        return Err("expected ':' in JSON object".to_string());
+                    }
+                    self.skip_value()?;
+                    match self.next() {
+                        Some(b',') => continue,
+                        Some(b'}') => return Ok(()),
+                        _ => return Err("expected ',' or '}' in JSON object".to_string()),
+                    }
+                }
+            }
+            Some(b'[') => {
+                let _ = self.next();
+                if self.peek() == Some(b']') {
+                    let _ = self.next();
+                    return Ok(());
+                }
+                loop {
+                    self.skip_value()?;
+                    match self.next() {
+                        Some(b',') => continue,
+                        Some(b']') => return Ok(()),
+                        _ => return Err("expected ',' or ']' in JSON array".to_string()),
+                    }
+                }
+            }
+            Some(b't') | Some(b'f') => {
+                let _ = self.parse_bool()?;
+                Ok(())
+            }
+            Some(b'n') => {
+                if self.bytes.get(self.pos..self.pos + 4) == Some(b"null") {
+                    self.pos += 4;
+                    Ok(())
+                } else {
+                    Err("invalid JSON literal".to_string())
+                }
+            }
+            Some(b'-') | Some(b'0'..=b'9') => {
+                if self.bytes.get(self.pos) == Some(&b'-') {
+                    self.pos += 1;
+                }
+                while let Some(&b) = self.bytes.get(self.pos) {
+                    if b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-') {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            _ => Err("unexpected JSON token".to_string()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ScheduleDeltaSetEntry {
+    schedule_override: Option<ScheduleId>,
+    set: String,
+    mode: Option<ScheduleSetMode>,
+    before: Option<Vec<String>>,
+    after: Option<Vec<String>>,
+    before_weak: Option<bool>,
+    after_weak: Option<bool>,
+    parent_sets: Option<Vec<String>>,
+}
+
+struct ScheduleDeltaDocument {
+    schedule: ScheduleId,
+    sets: Vec<ScheduleDeltaSetEntry>,
+}
+
+fn parse_schedule_id_from_cursor(cur: &mut JsonCursor<'_>) -> Result<ScheduleId, String> {
+    if cur.peek() == Some(b'"') {
+        let name = cur.parse_string()?;
+        match name.as_str() {
+            "Update" | "update" => Ok(ScheduleId::UPDATE),
+            "Startup" | "startup" => Ok(ScheduleId::STARTUP),
+            "PreUpdate" | "pre_update" => Ok(ScheduleId::PRE_UPDATE),
+            "PostUpdate" | "post_update" => Ok(ScheduleId::POST_UPDATE),
+            "FixedUpdate" | "fixed_update" => Ok(ScheduleId::FIXED_UPDATE),
+            "Last" | "last" => Ok(ScheduleId::LAST),
+            _ => Err(format!("unknown schedule name '{name}'")),
+        }
+    } else {
+        Ok(ScheduleId(cur.parse_u32()?))
+    }
+}
+
+fn parse_schedule_mode(raw: &str) -> Result<ScheduleSetMode, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "parallel" => Ok(ScheduleSetMode::Parallel),
+        "sequence" => Ok(ScheduleSetMode::Sequence),
+        "sequence_weak" | "sequenceweak" => Ok(ScheduleSetMode::SequenceWeak),
+        _ => Err(format!("unknown schedule set mode '{raw}'")),
+    }
+}
+
+fn parse_delta_set_object(cur: &mut JsonCursor<'_>) -> Result<ScheduleDeltaSetEntry, String> {
+    if cur.next() != Some(b'{') {
+        return Err("expected '{' for schedule delta set entry".to_string());
+    }
+    let mut entry = ScheduleDeltaSetEntry::default();
+    if cur.peek() == Some(b'}') {
+        let _ = cur.next();
+        return Err("schedule delta set entry is missing 'set'".to_string());
+    }
+    loop {
+        let key = cur.parse_string()?;
+        if cur.next() != Some(b':') {
+            return Err("expected ':' after key".to_string());
+        }
+        match key.as_str() {
+            "schedule" => entry.schedule_override = Some(parse_schedule_id_from_cursor(cur)?),
+            "set" | "name" => entry.set = cur.parse_string()?,
+            "mode" => {
+                let mode_str = cur.parse_string()?;
+                entry.mode = Some(parse_schedule_mode(&mode_str)?);
+            }
+            "before" | "before_sets" => entry.before = Some(cur.parse_string_array()?),
+            "after" | "after_sets" => entry.after = Some(cur.parse_string_array()?),
+            "before_weak" => entry.before_weak = Some(cur.parse_bool()?),
+            "after_weak" => entry.after_weak = Some(cur.parse_bool()?),
+            "parent_sets" => entry.parent_sets = Some(cur.parse_string_array()?),
+            _ => cur.skip_value()?,
+        }
+        match cur.next() {
+            Some(b',') => continue,
+            Some(b'}') => break,
+            _ => return Err("expected ',' or '}' in schedule delta entry".to_string()),
+        }
+    }
+    if entry.set.is_empty() {
+        return Err("schedule delta set entry has empty 'set'".to_string());
+    }
+    Ok(entry)
+}
+
+fn parse_schedule_delta_json(input: &str) -> Result<ScheduleDeltaDocument, String> {
+    let mut cur = JsonCursor::new(input);
+    if cur.next() != Some(b'{') {
+        return Err("schedule delta JSON root must be an object".to_string());
+    }
+    let mut schedule = ScheduleId::UPDATE;
+    let mut sets = Vec::new();
+    let mut top_single = ScheduleDeltaSetEntry::default();
+
+    if cur.peek() != Some(b'}') {
+        loop {
+            let key = cur.parse_string()?;
+            if cur.next() != Some(b':') {
+                return Err("expected ':' after key".to_string());
+            }
+            match key.as_str() {
+                "schedule" => schedule = parse_schedule_id_from_cursor(&mut cur)?,
+                "sets" => {
+                    if cur.next() != Some(b'[') {
+                        return Err("expected '[' for 'sets'".to_string());
+                    }
+                    if cur.peek() != Some(b']') {
+                        loop {
+                            sets.push(parse_delta_set_object(&mut cur)?);
+                            match cur.next() {
+                                Some(b',') => continue,
+                                Some(b']') => break,
+                                _ => return Err("expected ',' or ']' in 'sets'".to_string()),
+                            }
+                        }
+                    } else {
+                        let _ = cur.next();
+                    }
+                }
+                "set" | "name" => top_single.set = cur.parse_string()?,
+                "mode" => {
+                    let s = cur.parse_string()?;
+                    top_single.mode = Some(parse_schedule_mode(&s)?);
+                }
+                "before" | "before_sets" => top_single.before = Some(cur.parse_string_array()?),
+                "after" | "after_sets" => top_single.after = Some(cur.parse_string_array()?),
+                "before_weak" => top_single.before_weak = Some(cur.parse_bool()?),
+                "after_weak" => top_single.after_weak = Some(cur.parse_bool()?),
+                "parent_sets" => top_single.parent_sets = Some(cur.parse_string_array()?),
+                _ => cur.skip_value()?,
+            }
+            match cur.next() {
+                Some(b',') => continue,
+                Some(b'}') => break,
+                _ => return Err("expected ',' or '}' at JSON root".to_string()),
+            }
+        }
+    } else {
+        let _ = cur.next();
+    }
+
+    if sets.is_empty() && !top_single.set.is_empty() {
+        sets.push(top_single);
+    }
+    if sets.is_empty() {
+        return Err("schedule delta JSON defines no sets".to_string());
+    }
+    Ok(ScheduleDeltaDocument { schedule, sets })
+}
+
+enum DeltaApplyError {
+    Leased,
+    Failed(String),
+}
+
+fn find_set_handle_by_name(
+    registry: &ModScheduleSetRegistry,
+    schedule: ScheduleId,
+    raw_name: &str,
+) -> Option<bamabi_sys::BamSystemSet> {
+    if let Some((mod_part, set_part)) = raw_name.split_once("::") {
+        registry
+            .sets_for_schedule(schedule)
+            .find(|e| e.mod_name.as_ref() == mod_part && e.set_name.as_ref() == set_part)
+            .map(|e| e.handle)
+    } else {
+        let mut matches = registry
+            .sets_for_schedule(schedule)
+            .filter(|e| e.set_name.as_ref() == raw_name);
+        let first = matches.next()?.handle;
+        if matches.next().is_some() {
+            None
+        } else {
+            Some(first)
+        }
+    }
+}
+
+fn apply_schedule_delta_file(world: &mut World, path: &Path) -> Result<(), DeltaApplyError> {
+    let contents = std::fs::read_to_string(path).map_err(|err| {
+        DeltaApplyError::Failed(format!("failed to read '{}': {err}", path.display()))
+    })?;
+    let doc = parse_schedule_delta_json(&contents).map_err(DeltaApplyError::Failed)?;
+
+    let mut target_schedules = Vec::new();
+    for entry in &doc.sets {
+        let sid = entry.schedule_override.unwrap_or(doc.schedule);
+        if !target_schedules.contains(&sid) {
+            target_schedules.push(sid);
+        }
+    }
+
+    let leased = leased_schedules(world);
+    if !leased.is_empty() {
+        for &sid in &target_schedules {
+            if let Some(label) = resolve_schedule_id_in_world(world, sid)
+                && leased.contains(&label)
+            {
+                return Err(DeltaApplyError::Leased);
+            }
+        }
+    }
+
+    let Some(original_reg) = world.get_resource::<ModScheduleSetRegistry>().cloned() else {
+        return Err(DeltaApplyError::Failed(
+            "ModScheduleSetRegistry resource not present in World".to_string(),
+        ));
+    };
+    let mut staged_reg = original_reg.clone();
+
+    for delta in doc.sets {
+        let sid = delta.schedule_override.unwrap_or(doc.schedule);
+        let handle = find_set_handle_by_name(&staged_reg, sid, &delta.set).ok_or_else(|| {
+            DeltaApplyError::Failed(format!(
+                "schedule set '{}' not found in schedule {}",
+                delta.set, sid.0
+            ))
+        })?;
+        let Some(existing) = staged_reg.get(handle).cloned() else {
+            return Err(DeltaApplyError::Failed(format!(
+                "schedule set handle {} missing",
+                handle.0
+            )));
+        };
+
+        if let Some(mode) = delta.mode {
+            staged_reg
+                .set_mode(handle, mode)
+                .map_err(|err| DeltaApplyError::Failed(format!("set_mode failed ({err})")))?;
+        }
+        if delta.before.is_some()
+            || delta.after.is_some()
+            || delta.before_weak.is_some()
+            || delta.after_weak.is_some()
+        {
+            let before_handles = match delta.before {
+                Some(ref names) => {
+                    let mut out = Vec::with_capacity(names.len());
+                    for n in names {
+                        let h = find_set_handle_by_name(&staged_reg, sid, n).ok_or_else(|| {
+                            DeltaApplyError::Failed(format!("unknown before target set '{n}'"))
+                        })?;
+                        out.push(h);
+                    }
+                    out
+                }
+                None => existing.before_sets.clone(),
+            };
+            let after_handles = match delta.after {
+                Some(ref names) => {
+                    let mut out = Vec::with_capacity(names.len());
+                    for n in names {
+                        let h = find_set_handle_by_name(&staged_reg, sid, n).ok_or_else(|| {
+                            DeltaApplyError::Failed(format!("unknown after target set '{n}'"))
+                        })?;
+                        out.push(h);
+                    }
+                    out
+                }
+                None => existing.after_sets.clone(),
+            };
+            staged_reg
+                .set_edges(
+                    handle,
+                    before_handles,
+                    after_handles,
+                    delta.before_weak.unwrap_or(existing.before_weak),
+                    delta.after_weak.unwrap_or(existing.after_weak),
+                )
+                .map_err(|err| DeltaApplyError::Failed(format!("set_edges failed ({err})")))?;
+        }
+        if let Some(parents) = delta.parent_sets {
+            for parent_raw in &parents {
+                if let Some(stripped) = parent_raw.strip_prefix("host::") {
+                    let valid_host = world
+                        .get_resource::<ModVisibleSets>()
+                        .is_some_and(|sets| sets.resolve(stripped).is_some());
+                    if !valid_host {
+                        return Err(DeltaApplyError::Failed(format!(
+                            "unknown host parent set '{parent_raw}' in schedule {}",
+                            sid.0
+                        )));
+                    }
+                } else {
+                    let Some(parsed) =
+                        ModNamedSystemSet::parse_target(parent_raw, &existing.mod_name)
+                    else {
+                        return Err(DeltaApplyError::Failed(format!(
+                            "invalid parent set target '{parent_raw}' in schedule {}",
+                            sid.0
+                        )));
+                    };
+                    let exists_in_reg = staged_reg.sets_for_schedule(sid).any(|cand| {
+                        cand.mod_name == parsed.mod_name && cand.set_name == parsed.system_name
+                    });
+                    if !exists_in_reg {
+                        return Err(DeltaApplyError::Failed(format!(
+                            "unknown parent set '{parent_raw}' in schedule {}",
+                            sid.0
+                        )));
+                    }
+                }
+            }
+            if let Some(entry_mut) = staged_reg.get_mut(handle) {
+                entry_mut.parent_sets = parents;
+            }
+        }
+    }
+
+    for &sid in &target_schedules {
+        if let Err((_code, msg)) = staged_reg.validate_parent_sets_in_schedule(sid) {
+            return Err(DeltaApplyError::Failed(msg));
+        }
+        if let Err(err) = prevalidate_mod_schedule_set_rewire_in_world(world, &staged_reg, sid) {
+            return Err(DeltaApplyError::Failed(format!(
+                "schedule pre-validation failed: {err}"
+            )));
+        }
+    }
+
+    if let Some(mut set_reg) = world.get_resource_mut::<ModScheduleSetRegistry>() {
+        *set_reg = staged_reg;
+    }
+
+    let mut rewired_sids = Vec::with_capacity(target_schedules.len());
+    for sid in target_schedules {
+        if let Err(err) = rewire_mod_schedule_sets_in_world(world, sid) {
+            if let Some(mut set_reg) = world.get_resource_mut::<ModScheduleSetRegistry>() {
+                *set_reg = original_reg;
+            }
+            for prev_sid in rewired_sids {
+                let _ = rewire_mod_schedule_sets_in_world(world, prev_sid);
+            }
+            return Err(DeltaApplyError::Failed(format!(
+                "schedule rewire failed: {err}"
+            )));
+        }
+        rewired_sids.push(sid);
+    }
+    Ok(())
 }
 
 fn is_manifest_path(path: &Path) -> bool {
@@ -748,19 +1539,37 @@ fn find_loaded_mod_for_manifest_dir(
     None
 }
 
+type DiscoveredDirResult = Result<(Vec<ModTomlManifest>, Vec<ModDagError>), ModDagError>;
+
+#[cfg(test)]
 fn validate_dir_dag_for_reload(
     world: &World,
     watch_dir: &Path,
     target_mod_name: &str,
     target_manifest_path: Option<&Path>,
 ) -> Result<Option<ModTomlManifest>, String> {
-    let (manifests, parse_errors) = match discover_mod_manifests(watch_dir) {
-        Ok(res) => res,
+    let discovery = discover_mod_manifests(watch_dir);
+    validate_dir_dag_for_reload_from_discovery(
+        world,
+        &discovery,
+        target_mod_name,
+        target_manifest_path,
+    )
+}
+
+fn validate_dir_dag_for_reload_from_discovery(
+    world: &World,
+    discovery: &DiscoveredDirResult,
+    target_mod_name: &str,
+    target_manifest_path: Option<&Path>,
+) -> Result<Option<ModTomlManifest>, String> {
+    let (manifests, parse_errors) = match discovery {
+        Ok((manifests, errs)) => (manifests.clone(), errs),
         Err(err) => return Err(err.to_string()),
     };
 
     if let Some(t_path) = target_manifest_path {
-        for err in &parse_errors {
+        for err in parse_errors {
             let err_str = err.to_string();
             if err_str.contains(&t_path.display().to_string()) {
                 return Err(err_str);
@@ -829,13 +1638,23 @@ fn load_unloaded_dag_mods(
     watch_dir: &Path,
     load_options: &LoadOptions,
 ) -> SyncDirResult {
+    let discovery = discover_mod_manifests(watch_dir);
+    load_unloaded_dag_mods_from_discovery(world, watch_dir, load_options, &discovery)
+}
+
+fn load_unloaded_dag_mods_from_discovery(
+    world: &mut World,
+    watch_dir: &Path,
+    load_options: &LoadOptions,
+    discovery: &DiscoveredDirResult,
+) -> SyncDirResult {
     let mut outcomes = Vec::new();
     let mut retry_changes = Vec::new();
     let mut loaded_paths = Vec::new();
-    let (manifests, parse_errors) = match discover_mod_manifests(watch_dir) {
-        Ok(res) => res,
+    let (manifests, parse_errors) = match discovery {
+        Ok((manifests, parse_errors)) => (manifests.clone(), parse_errors),
         Err(err) => {
-            if is_schedule_leased_dag_error(&err) {
+            if is_schedule_leased_dag_error(err) {
                 if let Some(p) = err.path() {
                     retry_changes.push(p.to_path_buf());
                 }
@@ -855,7 +1674,7 @@ fn load_unloaded_dag_mods(
     };
 
     for err in parse_errors {
-        if is_schedule_leased_dag_error(&err) {
+        if is_schedule_leased_dag_error(err) {
             if let Some(p) = err.path() {
                 retry_changes.push(p.to_path_buf());
             }
@@ -974,6 +1793,16 @@ fn load_unloaded_dag_mods(
             }
         };
 
+        if let Err(reason) = has_valid_native_binary_magic(&lib_path) {
+            outcomes.push(ModHotReloadOutcome {
+                path: lib_path,
+                mod_id: None,
+                action: ModHotReloadAction::Failed(reason),
+            });
+            failed_mods.insert(manifest.name);
+            continue;
+        }
+
         match world.load_mod_with(&lib_path, opts.clone()) {
             Ok(id) => {
                 loaded_names.insert(manifest.name);
@@ -1056,7 +1885,7 @@ fn apply_hot_reload_events(
     for del_path in deleted_paths {
         let target = if is_manifest_path(del_path) {
             find_loaded_mod_for_manifest_dir(world, del_path, None).map(|(id, _name, _lib)| id)
-        } else if is_dylib_path(del_path) {
+        } else if is_dylib_path(del_path) || is_bampack_path(del_path) {
             find_loaded_mod_for_dylib(world, del_path).map(|(id, _)| id)
         } else {
             None
@@ -1086,15 +1915,113 @@ fn apply_hot_reload_events(
         }
     }
 
-    // 2. Handle changes to already-loaded mods (re-validating `mod.toml` SemVer + DAG and
-    //    cascading reload across dependents in reverse/forward topological order).
+    // Expand `.sig` sidecar updates into their sibling mod binary/bampack paths (deduplicated).
+    let mut expanded_changes: Vec<PathBuf> = Vec::with_capacity(changed_paths.len());
+    let mut seen_expanded: HashSet<PathBuf> = HashSet::new();
+    for path in changed_paths {
+        if is_sig_path(path) {
+            if let Some(target) = resolve_sig_target_path(world, path)
+                && seen_expanded.insert(canonical_key(&target))
+            {
+                expanded_changes.push(target);
+            }
+            continue;
+        }
+        if seen_expanded.insert(canonical_key(path)) {
+            expanded_changes.push(path.clone());
+        }
+    }
+
+    // 2. Handle changes to already-loaded mods, `.schedule_delta.json`, and `.bampack` archives
+    //    using at most ONE recursive `discover_mod_manifests` directory walk per batch.
     let mut reloaded_in_batch: HashSet<String> = HashSet::new();
     let mut deferred_in_batch: HashSet<String> = HashSet::new();
     let mut needs_dag_sync = false;
     let mut standalone_dylibs: Vec<PathBuf> = Vec::new();
+    let mut cached_discovery: Option<DiscoveredDirResult> = None;
 
-    for path in changed_paths {
-        if is_manifest_path(path) {
+    for path in &expanded_changes {
+        if is_schedule_delta_path(path) && path.is_file() {
+            match apply_schedule_delta_file(world, path) {
+                Ok(()) => outcomes.push(ModHotReloadOutcome {
+                    path: path.clone(),
+                    mod_id: None,
+                    action: ModHotReloadAction::Reloaded,
+                }),
+                Err(DeltaApplyError::Leased) => retry_changes.push(path.clone()),
+                Err(DeltaApplyError::Failed(msg)) => outcomes.push(ModHotReloadOutcome {
+                    path: path.clone(),
+                    mod_id: None,
+                    action: ModHotReloadAction::Failed(msg),
+                }),
+            }
+        } else if is_bampack_path(path) && path.is_file() {
+            if let Err(reason) = has_valid_bampack_magic(path) {
+                outcomes.push(ModHotReloadOutcome {
+                    path: path.clone(),
+                    mod_id: None,
+                    action: ModHotReloadAction::Failed(reason),
+                });
+                continue;
+            }
+            #[cfg(feature = "signature-verification")]
+            {
+                if let Some((mod_id, mod_name)) = find_loaded_mod_for_dylib(world, path) {
+                    if reloaded_in_batch.contains(&mod_name)
+                        || deferred_in_batch.contains(&mod_name)
+                    {
+                        continue;
+                    }
+                    let cascade_names = collect_cascade_names(world, mod_id);
+                    match world.reload_bampack(mod_id, path, opts.clone()) {
+                        Ok(new_id) => {
+                            reloaded_in_batch.extend(cascade_names);
+                            outcomes.push(ModHotReloadOutcome {
+                                path: path.clone(),
+                                mod_id: Some(new_id),
+                                action: ModHotReloadAction::Reloaded,
+                            });
+                        }
+                        Err(err) if is_schedule_leased_load_error(&err) => {
+                            deferred_in_batch.insert(mod_name);
+                            retry_changes.push(path.clone());
+                        }
+                        Err(err) => outcomes.push(ModHotReloadOutcome {
+                            path: path.clone(),
+                            mod_id: None,
+                            action: ModHotReloadAction::Failed(err.to_string()),
+                        }),
+                    }
+                } else {
+                    match world.load_bampack_with(path, opts.clone()) {
+                        Ok(id) => outcomes.push(ModHotReloadOutcome {
+                            path: path.clone(),
+                            mod_id: Some(id),
+                            action: ModHotReloadAction::Loaded,
+                        }),
+                        Err(err) if is_schedule_leased_load_error(&err) => {
+                            retry_changes.push(path.clone());
+                        }
+                        Err(err) => outcomes.push(ModHotReloadOutcome {
+                            path: path.clone(),
+                            mod_id: None,
+                            action: ModHotReloadAction::Failed(err.to_string()),
+                        }),
+                    }
+                }
+            }
+            #[cfg(not(feature = "signature-verification"))]
+            {
+                outcomes.push(ModHotReloadOutcome {
+                    path: path.clone(),
+                    mod_id: None,
+                    action: ModHotReloadAction::Failed(
+                        "loading .bampack bundles requires the `signature-verification` feature"
+                            .to_string(),
+                    ),
+                });
+            }
+        } else if is_manifest_path(path) {
             let parsed = match ModTomlManifest::from_file(path) {
                 Ok(m) => m,
                 Err(err) => {
@@ -1113,12 +2040,27 @@ fn apply_hot_reload_events(
                 if reloaded_in_batch.contains(&mod_name) || deferred_in_batch.contains(&mod_name) {
                     continue;
                 }
-                match validate_dir_dag_for_reload(world, watch_dir, &mod_name, Some(path)) {
+                let discovery =
+                    cached_discovery.get_or_insert_with(|| discover_mod_manifests(watch_dir));
+                match validate_dir_dag_for_reload_from_discovery(
+                    world,
+                    discovery,
+                    &mod_name,
+                    Some(path),
+                ) {
                     Ok(validated_opt) => {
                         let resolved_lib = validated_opt
                             .as_ref()
                             .and_then(|m| m.resolve_library_path().ok())
                             .unwrap_or(lib_path);
+                        if let Err(reason) = has_valid_native_binary_magic(&resolved_lib) {
+                            outcomes.push(ModHotReloadOutcome {
+                                path: resolved_lib,
+                                mod_id: None,
+                                action: ModHotReloadAction::Failed(reason),
+                            });
+                            continue;
+                        }
                         let cascade_names = collect_cascade_names(world, mod_id);
                         match world.reload_mod_from(mod_id, &resolved_lib, opts.clone()) {
                             Ok(new_id) => {
@@ -1180,13 +2122,26 @@ fn apply_hot_reload_events(
                 }
                 let sidecar_manifest = path.parent().map(|d| d.join("mod.toml"));
                 let sidecar_opt = sidecar_manifest.as_deref().filter(|p| p.is_file());
-                if let Err(err) =
-                    validate_dir_dag_for_reload(world, watch_dir, &mod_name, sidecar_opt)
-                {
+                let discovery =
+                    cached_discovery.get_or_insert_with(|| discover_mod_manifests(watch_dir));
+                if let Err(err) = validate_dir_dag_for_reload_from_discovery(
+                    world,
+                    discovery,
+                    &mod_name,
+                    sidecar_opt,
+                ) {
                     outcomes.push(ModHotReloadOutcome {
                         path: path.clone(),
                         mod_id: None,
                         action: ModHotReloadAction::Failed(err),
+                    });
+                    continue;
+                }
+                if let Err(reason) = has_valid_native_binary_magic(path) {
+                    outcomes.push(ModHotReloadOutcome {
+                        path: path.clone(),
+                        mod_id: None,
+                        action: ModHotReloadAction::Failed(reason),
                     });
                     continue;
                 }
@@ -1231,9 +2186,10 @@ fn apply_hot_reload_events(
     }
 
     // 3. Incrementally load any newly added `mod.toml` mods (or newly satisfied dependents) in
-    //    Kahn topological order.
+    //    Kahn topological order reusing the cached manifest walk when already performed.
     if needs_dag_sync {
-        let sync = load_unloaded_dag_mods(world, watch_dir, &opts);
+        let discovery = cached_discovery.get_or_insert_with(|| discover_mod_manifests(watch_dir));
+        let sync = load_unloaded_dag_mods_from_discovery(world, watch_dir, &opts, discovery);
         outcomes.extend(sync.outcomes);
         retry_changes.extend(sync.retry_changes);
     }
@@ -1244,10 +2200,19 @@ fn apply_hot_reload_events(
         if find_loaded_mod_for_dylib(world, &lib_path).is_some() {
             continue;
         }
-        let key = std::fs::canonicalize(&lib_path).unwrap_or_else(|_| lib_path.clone());
+        let key = canonical_key(&lib_path);
         if !seen_standalone.insert(key) {
             continue;
         }
+        if let Err(reason) = has_valid_native_binary_magic(&lib_path) {
+            outcomes.push(ModHotReloadOutcome {
+                path: lib_path,
+                mod_id: None,
+                action: ModHotReloadAction::Failed(reason),
+            });
+            continue;
+        }
+
         match world.load_mod_with(&lib_path, opts.clone()) {
             Ok(id) => outcomes.push(ModHotReloadOutcome {
                 path: lib_path,

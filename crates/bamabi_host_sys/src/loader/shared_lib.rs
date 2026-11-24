@@ -10,22 +10,27 @@ use crate::loader::signing::{
 use crate::system::ModErrorPolicy;
 use bamabi_sys::ScheduleId;
 use bevy_platform::collections::HashMap;
+#[cfg(feature = "dynamic-loader")]
 use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "dynamic-loader")]
 use libloading::Library;
 #[cfg(feature = "signature-verification")]
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "signature-verification")]
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
 use std::sync::OnceLock;
 use std::sync::{Arc, LazyLock, Mutex};
 
+#[cfg(feature = "dynamic-loader")]
 static NEXT_SHADOW_SEQ: AtomicU64 = AtomicU64::new(1);
-#[cfg(feature = "signature-verification")]
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
 static VERIFIED_SHADOW_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Configuration options controlling how `ModWorldExt::load_mod_with` / `ModAppExt::load_mod_with`
 /// opens, validates, and schedules a guest shared library.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LoadOptions {
     /// When `true` (default in debug builds), copies the `.dll`/`.so`/`.dylib` to a unique
     /// temporary file before `dlopen` / `LoadLibraryW` and unlinks it automatically after `dlclose`.
@@ -46,6 +51,26 @@ pub struct LoadOptions {
     /// if the OS dynamic linker will pin the image resident across `dlclose` (`DF_1_NODELETE`,
     /// `DF_STATIC_TLS`, `PT_TLS`, or Mach-O TLS/TLV sections).
     pub warn_on_resident_image: bool,
+    /// Optional predicate restricting which guest systems (`system_name`) are mounted from this mod.
+    pub system_filter: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+}
+
+impl core::fmt::Debug for LoadOptions {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LoadOptions")
+            .field("shadow_copy", &self.shadow_copy)
+            .field("shadow_dir", &self.shadow_dir)
+            .field("schedule_override", &self.schedule_override)
+            .field("strict", &self.strict)
+            .field("error_policy", &self.error_policy)
+            .field("signature_path", &self.signature_path)
+            .field("warn_on_resident_image", &self.warn_on_resident_image)
+            .field(
+                "system_filter",
+                &self.system_filter.as_ref().map(|_| "<filter>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for LoadOptions {
@@ -59,6 +84,7 @@ impl Default for LoadOptions {
             error_policy: None,
             signature_path: None,
             warn_on_resident_image: true,
+            system_filter: None,
         }
     }
 }
@@ -118,6 +144,29 @@ impl LoadOptions {
         self.warn_on_resident_image = enabled;
         self
     }
+
+    /// Attaches a system-name filter predicate restricting which guest systems are mounted.
+    #[inline]
+    pub fn with_system_filter<F>(mut self, filter: F) -> Self
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        self.system_filter = Some(Arc::new(filter));
+        self
+    }
+}
+
+/// Abstract in-memory compiled-object / JIT loader seam (`cranelift-object-loader`) producing
+/// [`InMemoryModEntrypoints`](crate::loader::mod_host::InMemoryModEntrypoints) directly from an
+/// in-memory object buffer without touching `dlopen`.
+pub trait InMemoryObjectLoader: Send + Sync {
+    /// Materializes entrypoints and retains any executable memory backing for `label` from
+    /// `object_bytes`.
+    fn load_object_bytes(
+        &self,
+        label: &str,
+        object_bytes: &[u8],
+    ) -> Result<crate::loader::mod_host::InMemoryModEntrypoints, ModLoadError>;
 }
 
 /// Binary container format detected when inspecting shared library residency indicators.
@@ -167,11 +216,13 @@ impl LibraryResidencyInfo {
 
 /// RAII file guard that unlinks a temporary shadow-copied shared library (and any shadow `.pdb`
 /// sidecar) on `Drop`.
+#[cfg(feature = "dynamic-loader")]
 pub(crate) struct ShadowFileGuard {
     path: PathBuf,
     pdb_path: Option<PathBuf>,
 }
 
+#[cfg(feature = "dynamic-loader")]
 impl ShadowFileGuard {
     #[inline]
     pub(crate) fn path(&self) -> &Path {
@@ -185,6 +236,7 @@ impl ShadowFileGuard {
     }
 }
 
+#[cfg(feature = "dynamic-loader")]
 impl Drop for ShadowFileGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -194,40 +246,22 @@ impl Drop for ShadowFileGuard {
     }
 }
 
-/// Wrapper pairing a [`libloading::Library`] with its optional [`ShadowFileGuard`].
+/// Wrapper pairing a [`libloading::Library`] with its optional `ShadowFileGuard`.
 ///
 /// Field declaration order is load-bearing: Rust drops struct fields in declaration order, so
 /// `library` (`dlclose` / `FreeLibrary`) runs **strictly before** `_shadow_guard` unlinks the
 /// temporary file (and `.pdb` sidecar) on Windows, macOS, and Linux.
-pub(crate) struct LoadedLibrary {
-    #[cfg(not(test))]
+#[cfg(feature = "dynamic-loader")]
+pub struct LoadedLibrary {
     library: Library,
-    #[cfg(test)]
-    library: Option<Library>,
     _shadow_guard: Option<ShadowFileGuard>,
 }
 
+#[cfg(feature = "dynamic-loader")]
 impl LoadedLibrary {
-    #[cfg(not(test))]
     #[inline]
-    pub(crate) fn lib(&self) -> &Library {
+    pub(crate) const fn lib(&self) -> &Library {
         &self.library
-    }
-
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn lib(&self) -> &Library {
-        self.library
-            .as_ref()
-            .expect("live LoadedLibrary must hold an open libloading::Library")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mock_empty_for_test() -> Self {
-        Self {
-            library: None,
-            _shadow_guard: None,
-        }
     }
     /// Stages a shadow copy (or verifies & exclusively stages when `signature-verification`
     /// is active and enforced) and opens the shared library via `libloading`.
@@ -346,15 +380,100 @@ impl LoadedLibrary {
             })?;
 
         Ok(Self {
-            #[cfg(not(test))]
             library,
-            #[cfg(test)]
-            library: Some(library),
             _shadow_guard: shadow_guard,
         })
     }
+
+    /// Stages raw native shared-library bytes into an exclusive temporary shadow file and loads it.
+    ///
+    /// # Safety
+    /// `binary_bytes` must represent a valid, verified/trusted native shared library image.
+    #[cfg(feature = "signature-verification")]
+    pub(crate) unsafe fn open_shadow_bytes(
+        virtual_source: &Path,
+        binary_bytes: &[u8],
+        options: &LoadOptions,
+    ) -> Result<(Self, PathBuf), ModLoadError> {
+        let residency = inspect_library_residency(binary_bytes);
+        let dir = ensure_shadow_dir(options.shadow_dir.as_deref())?;
+        let shadow_guard = stage_shadow_bytes_in_dir(virtual_source, &dir, binary_bytes)?;
+        let load_path = shadow_guard.path().to_path_buf();
+        // SAFETY: `load_path` was exclusively created and written with `binary_bytes`.
+        let lib = unsafe {
+            Self::open_prepared_with_residency(
+                virtual_source,
+                load_path.clone(),
+                Some(shadow_guard),
+                residency,
+                options.warn_on_resident_image,
+            )?
+        };
+        Ok((lib, load_path))
+    }
 }
 
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+fn stage_shadow_bytes_in_dir(
+    source_path: &Path,
+    dir: &Path,
+    bytes: &[u8],
+) -> Result<ShadowFileGuard, ModLoadError> {
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o700);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        open_opts.share_mode(0x0000_0001);
+    }
+    let mut last_err = None;
+    for _ in 0..8u8 {
+        let dest_path = next_shadow_dest_path(source_path, dir);
+        match open_opts.open(&dest_path) {
+            Ok(mut file) => {
+                let guard = ShadowFileGuard {
+                    path: dest_path,
+                    pdb_path: None,
+                };
+                file.write_all(bytes)
+                    .map_err(|source| ModLoadError::ShadowCopy {
+                        path: source_path.to_path_buf(),
+                        source,
+                    })?;
+                file.flush().map_err(|source| ModLoadError::ShadowCopy {
+                    path: source_path.to_path_buf(),
+                    source,
+                })?;
+                return Ok(guard);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = Some(err);
+            }
+            Err(source) => {
+                return Err(ModLoadError::ShadowCopy {
+                    path: source_path.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    Err(ModLoadError::ShadowCopy {
+        path: source_path.to_path_buf(),
+        source: last_err.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "failed to stage unique shadow file after 8 attempts",
+            )
+        }),
+    })
+}
+
+#[cfg(feature = "dynamic-loader")]
 fn ensure_shadow_dir(custom_dir: Option<&Path>) -> Result<PathBuf, ModLoadError> {
     let dir = custom_dir
         .map(Path::to_path_buf)
@@ -376,6 +495,7 @@ fn ensure_shadow_dir(custom_dir: Option<&Path>) -> Result<PathBuf, ModLoadError>
     Ok(dir)
 }
 
+#[cfg(feature = "dynamic-loader")]
 fn next_shadow_dest_path(source_path: &Path, dir: &Path) -> PathBuf {
     let stem = source_path
         .file_stem()
@@ -391,6 +511,7 @@ fn next_shadow_dest_path(source_path: &Path, dir: &Path) -> PathBuf {
     dir.join(file_name)
 }
 
+#[cfg(feature = "dynamic-loader")]
 fn stage_shadow_copy(
     source_path: &Path,
     custom_dir: Option<&Path>,
@@ -541,7 +662,7 @@ fn verify_source_and_sig(
     Ok((binary_bytes, verified, sig_path))
 }
 
-#[cfg(feature = "signature-verification")]
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
 fn validate_verified_shadow_dir_leaf(dir: &Path) -> Result<PathBuf, ModLoadError> {
     let meta = std::fs::symlink_metadata(dir).map_err(|source| ModLoadError::ShadowCopy {
         path: dir.to_path_buf(),
@@ -584,7 +705,7 @@ fn validate_verified_shadow_dir_leaf(dir: &Path) -> Result<PathBuf, ModLoadError
     Ok(dir.to_path_buf())
 }
 
-#[cfg(feature = "signature-verification")]
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
 fn ensure_verified_shadow_dir(custom_dir: Option<&Path>) -> Result<PathBuf, ModLoadError> {
     if let Some(dir) = custom_dir {
         match std::fs::symlink_metadata(dir) {
@@ -666,7 +787,7 @@ fn ensure_verified_shadow_dir(custom_dir: Option<&Path>) -> Result<PathBuf, ModL
     })
 }
 
-#[cfg(feature = "signature-verification")]
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
 fn stage_verified_shadow_bytes(
     source_path: &Path,
     custom_dir: Option<&Path>,
@@ -1467,6 +1588,7 @@ pub fn patch_pe_codeview_pdb_path(pe_bytes: &mut [u8], shadow_pdb_path: &Path) -
     patched
 }
 
+#[cfg(feature = "dynamic-loader")]
 fn stage_pdb_sidecar_and_patch_pe(source_path: &Path, dest_dll_path: &Path) -> Option<PathBuf> {
     let is_dll = source_path
         .extension()

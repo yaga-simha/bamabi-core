@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! Safe headless Bevy host crate for `bamabi` (`ABI 0.3.0`).
+//! Safe headless Bevy host crate for `bamabi` (`ABI 0.4.0`).
 //!
 //! `bamabi_host` provides core Bevy ECS (`v0.20+`) integration (`ModWorldExt`, `ModAppExt`,
 //! `ModCommandsExt`, `AbiModPlugin`) for loading, executing, quarantining, and hot-unloading
@@ -58,15 +58,19 @@ pub mod commands_ext;
 #[cfg(feature = "diagnostics")]
 pub mod diagnostics;
 pub mod events;
+pub mod harness;
 pub mod mod_dag;
 pub mod plugin;
 pub mod schedule_sets;
+pub mod telemetry;
 pub mod world_ext;
 
 pub use bamabi_macros::{AbiPod, ModComponent};
 pub use bamabi_sys;
 
-pub use app_ext::ModAppExt;
+#[cfg(feature = "dynamic-loader")]
+pub use app_ext::ModLoaderAppExt;
+pub use app_ext::{ModAppExt, ModRegistryAppExt};
 pub use bamabi_host_sys::PersistentMessageCursors;
 pub use bamabi_host_sys::loader::{
     ExportedFieldRecord, ReloadColumnSnapshot, SnapshotComponentColumn, SnapshotEntityFields,
@@ -88,16 +92,30 @@ pub use bamabi_host_sys::{
     validate_bampack_entry_path, zeroed_binary_for_bam_sig,
 };
 pub use bamabi_host_sys::{
-    BinaryFormat, ComponentCollisionError, ComponentOptions, LibraryResidencyInfo, LoadOptions,
-    LoadedMod, ModErrorPolicy, ModErrorPolicyConfig, ModHost, ModId, ModLoadError, ModQuarantine,
-    ModRegistry, ModScoped, RegisteredComponent, RegistrySnapshot, TargetEntity,
-    WitnessFieldDescriptor, WorldDropGuard, apply_entity_component_fields, apply_resource_fields,
-    ensure_component_in_target_world, export_entity_component_fields, export_resource_fields,
-    extract_component_between_worlds, extract_resource_between_worlds,
-    insert_entity_component_from_fields, insert_or_apply_entity_component_fields,
+    BamFieldBytePatch, BamFieldDescriptor, BamFieldPodKind, BamResolveSymbolFn, BamSymbolTable,
+    BinaryFormat, CascadeHierarchyCache, CommandArenaConfig, ComponentCollisionError,
+    ComponentOptions, ConfiguredScheduleSet, HostStringBridge, HostWireBridge,
+    InMemoryModEntrypoints, InMemoryObjectLoader, LibraryResidencyInfo, LoadOptions, LoadedMod,
+    ModBacking, ModErrorPolicy, ModErrorPolicyConfig, ModHost, ModId, ModLoadError,
+    ModNamedObjects, ModQuarantine, ModRegistry, ModRelationGraph, ModScheduleSetRegistry,
+    ModScheduleSetRewirePass, ModScoped, PreparedModImage, RegisteredComponent, RegistrySnapshot,
+    RelationEdgeView, RelationFlushError, RelationFlushPolicy, ScheduleSetConfig, ScheduleSetMode,
+    TargetEntity, WitnessFieldDescriptor, WorldDropGuard, apply_entity_component_fields,
+    apply_mod_schedule_sets_to_schedule, apply_resource_fields, check_relation_acyclic,
+    ensure_component_in_target_world, ensure_relation_graph_in_world,
+    export_entity_component_fields, export_resource_fields, extract_component_between_worlds,
+    extract_resource_between_worlds, hash_world_pod_state, insert_entity_component_from_fields,
+    insert_entity_pod_with_field_patches, insert_or_apply_entity_component_fields,
+    inspect_component_bam_fields, inspect_component_bam_fields_in_registry,
     inspect_component_witness_fields, inspect_component_witness_fields_in_registry,
     inspect_library_residency, inspect_library_residency_file, is_abi_version_compatible,
-    read_entity_pod_bytes, write_entity_pod_bytes,
+    prevalidate_mod_schedule_set_rewire_in_schedule, prevalidate_mod_schedule_set_rewire_in_world,
+    read_entity_bam_field_bytes, read_entity_pod_bytes, read_resource_bam_field_bytes,
+    read_table_column_bytes, register_bridged_component, register_bridged_entity_event,
+    register_bridged_entity_event_with, register_bridged_resource,
+    register_bridged_string_component, rewire_mod_schedule_sets_in_schedule,
+    rewire_mod_schedule_sets_in_world, spawn_entity_pod_bundle, write_entity_bam_field_bytes,
+    write_entity_pod_bytes, write_resource_bam_field_bytes,
 };
 #[cfg(feature = "keygen")]
 pub use bamabi_host_sys::{
@@ -111,8 +129,10 @@ pub use budgets::{
 };
 pub use commands_ext::ModCommandsExt;
 pub use events::{
-    LoadedModInfo, ModLoaded, ModSystemError, ModSystemFaulted, ModUnloaded, SystemInitError,
+    LoadedModInfo, ModLoadFailed, ModLoaded, ModSystemError, ModSystemFaulted, ModUnloaded,
+    SystemInitError,
 };
+pub use harness::HeadlessModTestHarness;
 pub use mod_dag::{
     DagResolution, DirectoryLoadReport, ManifestError, ModDagError, ModDagErrorKind, ModDagNode,
     ModDependencyGraph, ModTomlManifest, discover_mod_manifests, host_abi_semver,
@@ -125,11 +145,16 @@ pub use schedule_sets::{
     ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
     configure_guest_system_in_world, configure_weak_set_chain,
 };
+pub use telemetry::{
+    DEFAULT_TELEMETRY_RING_CAPACITY, ModTelemetryRing, ModTelemetrySinkPlugin,
+    NativeSystemTelemetryTracker, TelemetryDigestSinkFn, record_native_system_run,
+    with_native_system_telemetry, wrap_native_system,
+};
 pub use world_ext::{
     ModUnloadHookFn, ModUnloadHooks, ModWorldExt, register_mod_unload_hook_in_world,
 };
 
-/// Convenient prelude module for Bevy games hosting native C-ABI mods (`ABI 0.3.0`).
+/// Convenient prelude module for Bevy games hosting native C-ABI mods (`ABI 0.4.0`).
 pub mod prelude {
     pub use crate::app_ext::ModAppExt;
     pub use crate::budgets::{
@@ -141,8 +166,10 @@ pub mod prelude {
     #[cfg(feature = "signature-verification")]
     pub use crate::events::VerifiedModSignature;
     pub use crate::events::{
-        LoadedModInfo, ModLoaded, ModSystemError, ModSystemFaulted, ModUnloaded, SystemInitError,
+        LoadedModInfo, ModLoadFailed, ModLoaded, ModSystemError, ModSystemFaulted, ModUnloaded,
+        SystemInitError,
     };
+    pub use crate::harness::HeadlessModTestHarness;
     pub use crate::mod_dag::{
         DirectoryLoadReport, ModDagError, ModDagErrorKind, ModDependencyGraph, ModTomlManifest,
     };
@@ -154,11 +181,19 @@ pub mod prelude {
         ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
         configure_guest_system_in_world, configure_weak_set_chain,
     };
+    pub use crate::telemetry::{ModTelemetryRing, ModTelemetrySinkPlugin};
     pub use crate::world_ext::{ModUnloadHooks, ModWorldExt};
     pub use crate::{
-        AbiPod, ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModComponent,
-        ModErrorPolicy, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry, ModScoped,
-        PersistentMessageCursors, TargetEntity,
+        AbiPod, BamSymbolTable, CascadeHierarchyCache, CommandArenaConfig, ComponentCollisionError,
+        ComponentOptions, ConfiguredScheduleSet, InMemoryModEntrypoints, InMemoryObjectLoader,
+        LoadOptions, LoadedMod, ModBacking, ModComponent, ModErrorPolicy, ModHost, ModId,
+        ModLoadError, ModNamedObjects, ModQuarantine, ModRegistry, ModRelationGraph,
+        ModScheduleSetRegistry, ModScheduleSetRewirePass, ModScoped, PersistentMessageCursors,
+        ScheduleSetConfig, ScheduleSetMode, TargetEntity, hash_world_pod_state,
+        insert_entity_pod_with_field_patches, inspect_component_bam_fields,
+        read_entity_bam_field_bytes, read_resource_bam_field_bytes, read_table_column_bytes,
+        rewire_mod_schedule_sets_in_world, spawn_entity_pod_bundle, write_entity_bam_field_bytes,
+        write_resource_bam_field_bytes,
     };
     #[cfg(feature = "signature-verification")]
     pub use crate::{

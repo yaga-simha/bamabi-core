@@ -160,6 +160,15 @@ fn hot_reload_transfers_state_handles_errors_and_supports_legacy_manifests() {
         ),
         "unexpected error: {restore_err:?}"
     );
+    // Atomic staged reload rolls back only the staged replacement and preserves `active_id`!
+    assert_eq!(app.world().resource::<ModHost>().loaded_mods().len(), 1);
+    assert!(
+        app.world()
+            .resource::<ModHost>()
+            .get_mod(active_id)
+            .is_some()
+    );
+    app.unload_mod(active_id).unwrap();
     assert!(app.world().resource::<ModHost>().is_empty());
 
     // 5. Backwards compatibility: reloading a mod without state callbacks (`ordered_sets_mod`) succeeds cleanly!

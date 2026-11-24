@@ -1177,6 +1177,7 @@ fn observers_ext_all_guard_branches_and_payload_edge_cases() {
 
     // Pre-insert `DynamicTriggerState` so `DynamicTriggerGuard::drop` restores `previous` (`line 78`).
     world.insert_resource(DynamicTriggerState {
+        active: true,
         current_target: None,
         propagate: true,
         watched_ids: Vec::new(),
@@ -1215,6 +1216,7 @@ fn observers_ext_all_guard_branches_and_payload_edge_cases() {
             callback: Some(GuestFnPtr(obs_noop_cb)),
             mut_callback: None,
             ctx_callback: None,
+            ctx_mut_callback: None,
             query_specs: Vec::new(),
             user_data: crate::sync_ptr::GuestUserData::new(null_mut()),
             is_active: Arc::clone(&active),
@@ -1255,6 +1257,7 @@ fn observers_ext_all_guard_branches_and_payload_edge_cases() {
             callback: Some(GuestFnPtr(obs_noop_cb)),
             mut_callback: None,
             ctx_callback: None,
+            ctx_mut_callback: None,
             query_specs: Vec::new(),
             user_data: crate::sync_ptr::GuestUserData::new(null_mut()),
             is_active: Arc::clone(&active),
@@ -2175,10 +2178,9 @@ fn ctx_observer_validation_quarantine_reentrancy_rollback_and_truncated_compat()
         assert_eq!(rc_spawn, FfiResult::OK);
         // SAFETY: `sys_ctx` is active for this invocation.
         let host_ctx = unsafe { host_sys_host_ctx(sys_ctx) };
-        // SAFETY: `host_ctx` is valid and `StrView` points to static UTF-8 bytes.
-        unsafe {
-            host_report_guest_fault(host_ctx, StrView::from_str("ctx observer explicit fault"))
-        };
+        let msg_view = StrView::from_str("ctx observer explicit fault");
+        // SAFETY: `host_ctx` is valid and `msg_view` points to static UTF-8 bytes.
+        unsafe { host_report_guest_fault(host_ctx, &msg_view) };
         FfiResult::INTERNAL_ERROR
     }
 

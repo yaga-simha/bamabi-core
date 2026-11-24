@@ -155,13 +155,16 @@ fn reg_dyn_table_comp(
 #[test]
 fn witness_sink_resolve_field_info_and_resource_paths_cover_errors_and_zsts() {
     // 1. `collect_witness_export_sink` error branches.
+    let a_view = StrView::from_str("a");
+    let u32_view = StrView::from_str("u32");
+    let empty_slice = FfiSlice::empty();
     // SAFETY: Null context pointer is explicitly handled by `collect_witness_export_sink`.
     let rc_null_ctx = unsafe {
         collect_witness_export_sink(
             core::ptr::null_mut(),
-            StrView::from_str("a"),
-            StrView::from_str("u32"),
-            FfiSlice::empty(),
+            &raw const a_view,
+            &raw const u32_view,
+            &raw const empty_slice,
         )
     };
     assert_eq!(rc_null_ctx, FfiResult::NULL_POINTER);
@@ -176,20 +179,21 @@ fn witness_sink_resolve_field_info_and_resource_paths_cover_errors_and_zsts() {
     let rc_bad_name = unsafe {
         collect_witness_export_sink(
             (&raw mut sink_out).cast::<c_void>(),
-            bad_view,
-            StrView::from_str("u32"),
-            FfiSlice::empty(),
+            &raw const bad_view,
+            &raw const u32_view,
+            &raw const empty_slice,
         )
     };
     assert_eq!(rc_bad_name, FfiResult::INVALID_UTF8);
 
+    let x_view = StrView::from_str("x");
     // SAFETY: `sink_out` and `bad_view` point to valid stack allocations.
     let rc_bad_tag = unsafe {
         collect_witness_export_sink(
             (&raw mut sink_out).cast::<c_void>(),
-            StrView::from_str("x"),
-            bad_view,
-            FfiSlice::empty(),
+            &raw const x_view,
+            &raw const bad_view,
+            &raw const empty_slice,
         )
     };
     assert_eq!(rc_bad_tag, FfiResult::INVALID_UTF8);
@@ -202,21 +206,23 @@ fn witness_sink_resolve_field_info_and_resource_paths_cover_errors_and_zsts() {
     let rc_null_slice = unsafe {
         collect_witness_export_sink(
             (&raw mut sink_out).cast::<c_void>(),
-            StrView::from_str("x"),
-            StrView::from_str("u32"),
-            null_nonempty,
+            &raw const x_view,
+            &raw const u32_view,
+            &raw const null_nonempty,
         )
     };
     assert_eq!(rc_null_slice, FfiResult::NULL_POINTER);
 
     // Empty slice succeeds.
-    // SAFETY: `sink_out` is valid and `FfiSlice::empty()` has `len == 0`.
+    let empty_name_view = StrView::from_str("empty_field");
+    let unit_tag_view = StrView::from_str("()");
+    // SAFETY: `sink_out` is valid and `empty_slice` has `len == 0`.
     let rc_empty = unsafe {
         collect_witness_export_sink(
             (&raw mut sink_out).cast::<c_void>(),
-            StrView::from_str("empty_field"),
-            StrView::from_str("()"),
-            FfiSlice::empty(),
+            &raw const empty_name_view,
+            &raw const unit_tag_view,
+            &raw const empty_slice,
         )
     };
     assert_eq!(rc_empty, FfiResult::OK);
@@ -238,11 +244,15 @@ fn witness_sink_resolve_field_info_and_resource_paths_cover_errors_and_zsts() {
 
     unsafe extern "C" fn mock_import_not_found(
         _dst: *mut c_void,
-        _name: StrView,
-        _tag: StrView,
-        payload: FfiSlice<u8>,
+        _name: *const StrView,
+        _tag: *const StrView,
+        payload: *const FfiSlice<u8>,
     ) -> FfiResult {
-        if payload.len == 0 {
+        if payload.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: Valid `payload` pointer provided by caller.
+        if unsafe { (*payload).len } == 0 {
             FfiResult::NOT_FOUND
         } else {
             FfiResult::TYPE_MISMATCH
@@ -457,18 +467,21 @@ fn witness_resolve_from_loaded_mod_and_insert_paths_cover_all_branches() {
     }
     unsafe extern "C" fn guest_import_field(
         dst: *mut c_void,
-        field_name: StrView,
-        _tag: StrView,
-        payload: FfiSlice<u8>,
+        field_name: *const StrView,
+        _tag: *const StrView,
+        payload: *const FfiSlice<u8>,
     ) -> FfiResult {
-        // SAFETY: Test passes valid UTF-8 `field_name` and `payload`.
-        let name = unsafe { field_name.try_as_str() }.unwrap_or("");
+        if field_name.is_null() || payload.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: Test passes valid readable pointers for `field_name` and `payload`.
+        let (name, payload_ref) = unsafe { ((*field_name).try_as_str().unwrap_or(""), &*payload) };
         if name == "bad" {
             return FfiResult::INVALID_ARGUMENT;
         }
-        if name == "val" && payload.len == 4 {
-            // SAFETY: `payload` holds 4 bytes and `dst` points to live `GuestDropBox`.
-            let v = u32::from_ne_bytes(unsafe { payload.as_slice() }.try_into().unwrap());
+        if name == "val" && payload_ref.len == 4 {
+            // SAFETY: `payload_ref` holds 4 bytes and `dst` points to live `GuestDropBox`.
+            let v = u32::from_ne_bytes(unsafe { payload_ref.as_slice() }.try_into().unwrap());
             // SAFETY: `dst` is valid aligned `GuestDropBox`.
             unsafe { (*dst.cast::<GuestDropBox>()).val = v };
             return FfiResult::OK;
@@ -486,13 +499,16 @@ fn witness_resolve_from_loaded_mod_and_insert_paths_cover_all_branches() {
         // SAFETY: `src` points to live `GuestDropBox`.
         let v = unsafe { (*src.cast::<GuestDropBox>()).val };
         let bytes = v.to_ne_bytes();
-        // SAFETY: `ctx` and `bytes` live for this synchronous callback.
+        let name_view = StrView::from_str("val");
+        let tag_view = StrView::from_str("u32");
+        let slice = FfiSlice::from_slice(&bytes);
+        // SAFETY: `ctx`, `name_view`, `tag_view`, and `slice` live for this synchronous callback.
         unsafe {
             sink_fn(
                 ctx,
-                StrView::from_str("val"),
-                StrView::from_str("u32"),
-                FfiSlice::from_slice(&bytes),
+                &raw const name_view,
+                &raw const tag_view,
+                &raw const slice,
             )
         }
     }
@@ -1861,4 +1877,76 @@ fn bridge_reflect_pool_covers_struct_reflect_traits_and_component_fns() {
     assert!(reflect_resource_component_mut(&mut world, imm_cid, &imm_rfp).is_none());
     assert!(reflect_resource_component_mut(&mut world, flat_cid, &imm_rfp).is_none());
     let _ = flat_rfp;
+}
+
+#[test]
+fn pod_bundle_spawn_table_column_read_and_world_hash_round_trip() {
+    #[repr(C)]
+    #[derive(Component, Clone, Copy, PartialEq, Debug, ModComponent)]
+    #[mod_component(name = "val_cov::BundlePos")]
+    struct BundlePos {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Component, Clone, Copy, PartialEq, Debug, ModComponent)]
+    #[mod_component(name = "val_cov::BundleVel")]
+    struct BundleVel {
+        dx: i32,
+    }
+
+    let mut world = World::new();
+    let mut reg = ModRegistry::new();
+    let pos_cid = world.register_component::<BundlePos>();
+    let vel_cid = world.register_component::<BundleVel>();
+    let pos_h = reg
+        .register_component::<BundlePos>(pos_cid, ComponentOptions::default())
+        .unwrap();
+    let vel_h = reg
+        .register_component::<BundleVel>(vel_cid, ComponentOptions::default())
+        .unwrap();
+    world.insert_resource(reg);
+
+    let p1 = BundlePos { x: 10, y: 20 };
+    let v1 = BundleVel { dx: -5 };
+    // SAFETY: `BundlePos` and `BundleVel` are `#[repr(C)]` POD test types.
+    let p1_bytes = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::from_ref(&p1).cast::<u8>(),
+            core::mem::size_of::<BundlePos>(),
+        )
+    };
+    // SAFETY: `BundleVel` is `#[repr(C)]` POD.
+    let v1_bytes = unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::from_ref(&v1).cast::<u8>(),
+            core::mem::size_of::<BundleVel>(),
+        )
+    };
+
+    let before_count = world.entities().len();
+    // Atomic failure check: invalid payload length rejects bundle without spawning a partial entity.
+    let err = spawn_entity_pod_bundle(&mut world, &[(pos_h, p1_bytes), (vel_h, &[1u8, 2u8])])
+        .expect_err("wrong byte length must fail atomically");
+    assert_eq!(err, FfiResult::INVALID_ARGUMENT);
+    assert_eq!(world.entities().len(), before_count);
+
+    let e = spawn_entity_pod_bundle(&mut world, &[(pos_h, p1_bytes), (vel_h, v1_bytes)])
+        .expect("valid POD bundle spawns cleanly");
+    assert_eq!(world.get::<BundlePos>(e), Some(&p1));
+    assert_eq!(world.get::<BundleVel>(e), Some(&v1));
+
+    let col = read_table_column_bytes(&world, pos_h).expect("read table column");
+    assert_eq!(col.len(), 1);
+    assert_eq!(col[0].0, e);
+    assert_eq!(col[0].1.as_slice(), p1_bytes);
+
+    let h1 = hash_world_pod_state(&world);
+    let h1_again = hash_world_pod_state(&world);
+    assert_eq!(h1, h1_again);
+
+    world.get_mut::<BundlePos>(e).unwrap().x = 99;
+    let h2 = hash_world_pod_state(&world);
+    assert_ne!(h1, h2);
 }

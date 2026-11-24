@@ -7,11 +7,18 @@ use crate::ffi::observers_ext::spawn_registered_observers_in_world;
 use crate::ffi::register::LoadContext;
 use crate::handle_header::lock_unpoison;
 use crate::loader::error::{ModLoadError, is_abi_version_compatible};
-use crate::loader::shared_lib::{
-    LoadOptions, LoadedLibrary, SharedLibState, shared_lib_state_for_path,
+use crate::loader::schema_migration::{
+    StagedColumnMigrationUndo, rollback_staged_column_migrations,
 };
+#[cfg(feature = "dynamic-loader")]
+use crate::loader::shared_lib::LoadedLibrary;
+use crate::loader::shared_lib::{LoadOptions, SharedLibState, shared_lib_state_for_path};
 #[cfg(feature = "signature-verification")]
-use crate::loader::signing::{ModTrustPolicy, VerifiedModSignature, default_signature_path_for};
+use crate::loader::signing::VerifiedModSignature;
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+use crate::loader::signing::{BamPackEntry, parse_bampack_entries_unverified};
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+use crate::loader::signing::{ModTrustPolicy, default_signature_path_for};
 use crate::loader::symbols::{ModNamedObjects, ensure_symbol_tables_in_world};
 use crate::loader::transaction::LoadTransaction;
 use crate::registry::{ModRegistry, RegistrySnapshot};
@@ -32,15 +39,111 @@ use bevy_ecs::resource::IsResource;
 use bevy_ecs::schedule::{InternedScheduleLabel, ScheduleCleanupPolicy, Schedules};
 use bevy_ecs::world::World;
 use bevy_platform::collections::{HashMap, HashSet};
+use core::any::Any;
 use core::ffi::{CStr, c_char, c_void};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use libloading::Symbol;
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-pub(crate) type BamResolveSymbolFn =
+/// Optional per-instance symbol lookup callback (`"bam.v0.*"`) exported by `export_mod!`
+/// or [`InMemoryModEntrypoints`] modules for runtime witness schema migration.
+pub type BamResolveSymbolFn =
     unsafe extern "C" fn(instance: *const BamInstance, name: *const c_char) -> *const c_void;
+
+/// Backing executable image keeping guest functions mapped until after `bamabi_shutdown`
+/// and drop-trampoline disarmament complete.
+pub enum ModBacking {
+    /// OS shared library opened via `libloading` (`dynamic-loader` feature).
+    #[cfg(feature = "dynamic-loader")]
+    Dynamic(LoadedLibrary),
+    /// In-memory static or JIT-compiled backing handle (zero `dlopen`).
+    InMemory(Box<dyn Any + Send + Sync>),
+}
+
+/// Host-supplied C-ABI entry points for loading a mod directly in memory without `dlopen`
+/// (`static-only`, statically linked guest modules, or JIT object loaders).
+pub struct InMemoryModEntrypoints {
+    /// Mandatory `bamabi_manifest` getter callback.
+    pub manifest: BamManifestFn,
+    /// Mandatory `bamabi_init` setup callback.
+    pub init: BamInitFn,
+    /// Mandatory `bamabi_shutdown` teardown callback.
+    pub shutdown: BamShutdownFn,
+    /// Optional `"bam.v0.*"` witness symbol resolver for live schema migration.
+    pub resolve_symbol: Option<BamResolveSymbolFn>,
+    /// Optional type-erased executable/object backing allocation kept alive until mod unload.
+    pub backing: Option<Box<dyn Any + Send + Sync>>,
+}
+
+impl core::fmt::Debug for InMemoryModEntrypoints {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("InMemoryModEntrypoints")
+            .field("has_resolve_symbol", &self.resolve_symbol.is_some())
+            .field("has_backing", &self.backing.is_some())
+            .finish()
+    }
+}
+
+impl InMemoryModEntrypoints {
+    /// Constructs in-memory entry points from `bamabi_manifest`, `bamabi_init`, and
+    /// `bamabi_shutdown` function pointers.
+    #[inline]
+    pub const fn new(manifest: BamManifestFn, init: BamInitFn, shutdown: BamShutdownFn) -> Self {
+        Self {
+            manifest,
+            init,
+            shutdown,
+            resolve_symbol: None,
+            backing: None,
+        }
+    }
+
+    /// Attaches an optional `"bam.v0.*"` symbol resolver callback.
+    #[inline]
+    pub const fn with_resolve_symbol(mut self, resolver: BamResolveSymbolFn) -> Self {
+        self.resolve_symbol = Some(resolver);
+        self
+    }
+
+    /// Attaches an owned backing allocation kept alive until the loaded mod is unloaded.
+    #[inline]
+    pub fn with_backing<B: Any + Send + Sync>(mut self, backing: B) -> Self {
+        self.backing = Some(Box::new(backing));
+        self
+    }
+}
+
+/// Validated, pre-staged mod image (dynamic library, verified `.bampack`, or in-memory
+/// entrypoints) ready to execute `bamabi_init` atomically without modifying the active world first.
+pub struct PreparedModImage {
+    source_path: PathBuf,
+    loaded_path: PathBuf,
+    backing: ModBacking,
+    manifest_name: Arc<str>,
+    manifest_version: Arc<str>,
+    init_fn: BamInitFn,
+    shutdown_fn: BamShutdownFn,
+    save_state_fn: Option<BamSaveStateFn>,
+    restore_state_fn: Option<BamRestoreStateFn>,
+    resolve_symbol_fn: Option<BamResolveSymbolFn>,
+    #[cfg(feature = "signature-verification")]
+    verified_signature: Option<VerifiedModSignature>,
+}
+
+impl PreparedModImage {
+    /// Returns the validated canonical `BamManifest::name` before `bamabi_init` executes.
+    #[inline]
+    pub fn manifest_name(&self) -> &str {
+        &self.manifest_name
+    }
+
+    /// Returns the validated `BamManifest::version` before `bamabi_init` executes.
+    #[inline]
+    pub fn manifest_version(&self) -> &str {
+        &self.manifest_version
+    }
+}
 
 static NEXT_MOD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -135,7 +238,8 @@ pub struct LoadedMod {
     generation: u64,
     pre_snapshot: Arc<RegistrySnapshot>,
     staged_drop_bindings: Vec<StagedDropBinding>,
-    library: LoadedLibrary,
+    staged_migrations: Vec<StagedColumnMigrationUndo>,
+    backing: ModBacking,
     shutdown_fn: BamShutdownFn,
     save_state_fn: Option<BamSaveStateFn>,
     restore_state_fn: Option<BamRestoreStateFn>,
@@ -216,6 +320,19 @@ impl LoadedMod {
         self.is_active.load(Ordering::Acquire)
     }
 
+    /// Returns a cloned atomic handle to this module's liveness flag.
+    #[inline]
+    pub(crate) fn is_active_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.is_active)
+    }
+
+    /// Returns `true` if this module is backed by [`ModBacking::InMemory`] rather than an OS
+    /// shared library.
+    #[inline]
+    pub const fn is_in_memory(&self) -> bool {
+        matches!(self.backing, ModBacking::InMemory(_))
+    }
+
     /// Iterates over the [`InternedScheduleLabel`]s in which this mod registered guest systems or
     /// scoped system sets.
     #[inline]
@@ -255,7 +372,6 @@ impl LoadedMod {
         let mod_name: Arc<str> = Arc::from(name);
         let sys_lib_path = Path::new("in_memory_test_mod.dylib");
         let loaded_path = sys_lib_path.to_path_buf();
-        let loaded_lib = LoadedLibrary::mock_empty_for_test();
         #[cfg(feature = "signature-verification")]
         let verified_signature = None;
         let lib_state = shared_lib_state_for_path(&loaded_path);
@@ -277,7 +393,8 @@ impl LoadedMod {
             generation: 0,
             pre_snapshot,
             staged_drop_bindings: Vec::new(),
-            library: loaded_lib,
+            staged_migrations: Vec::new(),
+            backing: ModBacking::InMemory(Box::new(())),
             shutdown_fn,
             save_state_fn: None,
             restore_state_fn: None,
@@ -313,7 +430,7 @@ unsafe fn unload_loaded_mod(loaded: LoadedMod, invoke_shutdown: bool) {
     }
 
     state_guard.active_count = state_guard.active_count.saturating_sub(1);
-    drop(loaded.library);
+    drop(loaded.backing);
     drop(state_guard);
 }
 
@@ -325,6 +442,7 @@ unsafe fn unload_loaded_mod(loaded: LoadedMod, invoke_shutdown: bool) {
 pub struct ModHost {
     loaded_libraries: Vec<LoadedMod>,
     mod_generations: HashMap<Arc<str>, u64>,
+    pending_generation_override: Option<(Arc<str>, u64)>,
 }
 
 impl ModHost {
@@ -336,6 +454,11 @@ impl ModHost {
 
     /// Returns the current reload generation for `mod_name` (`0` on initial load).
     pub fn mod_generation(&self, mod_name: &str) -> u64 {
+        if let Some((ref pending_name, pending_gen)) = self.pending_generation_override
+            && pending_name.as_ref() == mod_name
+        {
+            return pending_gen;
+        }
         if let Some(active) = self
             .loaded_libraries
             .iter()
@@ -413,128 +536,40 @@ impl ModHost {
             // Once scheduled in `World`, fresh slots are live and must only be pruned (never
             // prematurely freed before `WorldDropGuard::drop` + `live_values == 0`) on unload.
             loaded.staged_drop_bindings.clear();
+            loaded.staged_migrations.clear();
         }
     }
 
-    /// Core loader opening `source_path` (with optional shadow copy), validating `bamabi_manifest`,
-    /// running `bamabi_init` against `LoadContext`, and capturing `*mut BamInstance`.
+    /// Validates `bamabi_manifest` and builds a [`PreparedModImage`] from an open [`LoadedLibrary`].
     ///
     /// # Safety
-    /// - `source_path` must point to a trusted native mod shared library.
-    /// - `world_ptr` must point to an exclusively borrowed `World`.
-    pub(crate) unsafe fn load_mod_core(
-        &mut self,
+    /// - `loaded_lib` must remain mapped and valid until ownership transfers into `PreparedModImage`.
+    #[cfg(feature = "dynamic-loader")]
+    unsafe fn prepare_from_loaded_library(
         source_path: &Path,
-        options: &LoadOptions,
-        registry: ModRegistry,
-        world_ptr: *mut World,
+        loaded_path: PathBuf,
+        loaded_lib: LoadedLibrary,
+        #[cfg(feature = "signature-verification")] verified_signature: Option<VerifiedModSignature>,
+        #[cfg(feature = "signature-verification")] options: &LoadOptions,
         #[cfg(feature = "signature-verification")] trust_policy: Option<&ModTrustPolicy>,
-    ) -> Result<(ModId, Vec<GuestSystem>), ModLoadError> {
-        #[cfg(feature = "signature-verification")]
-        // SAFETY: Stage shadow copy (verified bytes when enforced) and open shared library via `libloading`.
-        let (loaded_lib, actual_path, verified_signature) =
-            unsafe { LoadedLibrary::open(source_path, options, trust_policy)? };
-        #[cfg(not(feature = "signature-verification"))]
-        // SAFETY: Stage shadow copy if requested and open shared library via `libloading`.
-        let (loaded_lib, actual_path) = unsafe { LoadedLibrary::open(source_path, options)? };
-
-        let lib_state = shared_lib_state_for_path(&actual_path);
-        let mut state_guard = lock_unpoison(&lib_state);
-
-        let mod_id = ModId::allocate();
-        let pre_snapshot = registry.snapshot_arc();
-        let is_active = Arc::new(AtomicBool::new(true));
-
-        // Declared *after* `loaded_lib` so Rust's reverse local drop order runs `LoadTransaction::drop`
-        // (disarming drop trampolines and restoring `pre_snapshot`) *before* `dlclose` + shadow unlink.
-        let tx = LoadTransaction::new(world_ptr, Arc::clone(&is_active), Arc::clone(&pre_snapshot));
-
+    ) -> Result<PreparedModImage, ModLoadError> {
         // 1. Mandatory `bamabi_manifest`.
         // SAFETY: Resolving mandatory `bamabi_manifest` symbol with signature `extern "C" fn() -> *const BamManifest`.
-        let manifest_fn: Symbol<BamManifestFn> = unsafe {
-            loaded_lib
+        let manifest_fn: BamManifestFn = unsafe {
+            *loaded_lib
                 .lib()
-                .get(b"bamabi_manifest\0")
+                .get::<BamManifestFn>(b"bamabi_manifest\0")
                 .map_err(|source| ModLoadError::MissingManifest {
                     path: source_path.to_path_buf(),
                     source,
                 })?
         };
-
-        // SAFETY: Invoking side-effect-free manifest descriptor getter.
-        let manifest_ptr = unsafe { manifest_fn() };
-        if manifest_ptr.is_null() {
-            return Err(ModLoadError::InvalidManifest {
-                path: source_path.to_path_buf(),
-                status: FfiResult::NULL_POINTER,
-                detail: "bamabi_manifest() returned null".to_string(),
-            });
-        }
-
-        // SAFETY: `read_descriptor` checks alignment and `struct_size >= BamManifest::MIN_V0_2_SIZE`.
-        let manifest = unsafe { read_descriptor::<BamManifest>(manifest_ptr.cast::<c_void>()) }
-            .map_err(|status| ModLoadError::InvalidManifest {
-                path: source_path.to_path_buf(),
-                status,
-                detail: "BamManifest struct_size is smaller than MIN_V0_2_SIZE".to_string(),
-            })?;
-
-        if !is_abi_version_compatible(ABI_VERSION, manifest.abi_version) {
-            return Err(ModLoadError::IncompatibleAbiVersion {
-                path: source_path.to_path_buf(),
-                host_version: ABI_VERSION,
-                guest_version: manifest.abi_version,
-            });
-        }
-
-        let manifest_status = manifest.validate_for_host(ABI_VERSION);
-        if manifest_status.is_err() {
-            return Err(ModLoadError::InvalidManifest {
-                path: source_path.to_path_buf(),
-                status: manifest_status,
-                detail: "BamManifest failed structural/flag validation".to_string(),
-            });
-        }
-
-        // SAFETY: `manifest.validate_for_host` verified `!manifest.name.is_null()` and `!manifest.version.is_null()`.
-        let manifest_name_str =
-            unsafe { CStr::from_ptr(manifest.name) }
-                .to_str()
-                .map_err(|_| ModLoadError::InvalidManifest {
-                    path: source_path.to_path_buf(),
-                    status: FfiResult::INVALID_UTF8,
-                    detail: "BamManifest `name` is not valid UTF-8".to_string(),
-                })?;
-        if manifest_name_str.is_empty() {
-            return Err(ModLoadError::InvalidManifest {
-                path: source_path.to_path_buf(),
-                status: FfiResult::INVALID_ARGUMENT,
-                detail: "BamManifest `name` must not be empty".to_string(),
-            });
-        }
-
-        // SAFETY: `manifest.version` was checked non-null above.
-        let manifest_version_str = unsafe { CStr::from_ptr(manifest.version) }
-            .to_str()
-            .map_err(|_| ModLoadError::InvalidManifest {
-                path: source_path.to_path_buf(),
-                status: FfiResult::INVALID_UTF8,
-                detail: "BamManifest `version` is not valid UTF-8".to_string(),
-            })?;
-        if manifest_version_str.is_empty() {
-            return Err(ModLoadError::InvalidManifest {
-                path: source_path.to_path_buf(),
-                status: FfiResult::INVALID_ARGUMENT,
-                detail: "BamManifest `version` must not be empty".to_string(),
-            });
-        }
-
-        let manifest_name: Arc<str> = Arc::from(manifest_name_str);
-        let manifest_version: Arc<str> = Arc::from(manifest_version_str);
+        let (manifest_name, manifest_version, save_state_fn, restore_state_fn) =
+            validate_manifest_from_fn(source_path, manifest_fn)?;
 
         #[cfg(feature = "signature-verification")]
         if let (Some(policy), Some(receipt)) = (trust_policy, verified_signature.as_ref())
-            && let Err(source) = policy.verify_manifest_principal(receipt, manifest_name_str)
+            && let Err(source) = policy.verify_manifest_principal(receipt, manifest_name.as_ref())
         {
             let signature_path = options
                 .signature_path
@@ -549,14 +584,15 @@ impl ModHost {
 
         // 2. Mandatory `bamabi_init` and `bamabi_shutdown`.
         // SAFETY: Resolving `bamabi_init`.
-        let init_fn: Symbol<BamInitFn> = unsafe {
-            loaded_lib.lib().get(b"bamabi_init\0").map_err(|source| {
-                ModLoadError::MissingEntryPoint {
+        let init_fn: BamInitFn = unsafe {
+            *loaded_lib
+                .lib()
+                .get::<BamInitFn>(b"bamabi_init\0")
+                .map_err(|source| ModLoadError::MissingEntryPoint {
                     path: source_path.to_path_buf(),
                     symbol: "bamabi_init",
                     source,
-                }
-            })?
+                })?
         };
 
         // SAFETY: Resolving `bamabi_shutdown`.
@@ -582,6 +618,226 @@ impl ModHost {
                 .map(|sym| *sym)
         };
 
+        Ok(PreparedModImage {
+            source_path: source_path.to_path_buf(),
+            loaded_path,
+            backing: ModBacking::Dynamic(loaded_lib),
+            manifest_name,
+            manifest_version,
+            init_fn,
+            shutdown_fn,
+            save_state_fn,
+            restore_state_fn,
+            resolve_symbol_fn,
+            #[cfg(feature = "signature-verification")]
+            verified_signature,
+        })
+    }
+
+    /// Stages and validates a disk shared library into a [`PreparedModImage`] without modifying
+    /// the active `World` or running `bamabi_init` yet.
+    ///
+    /// # Safety
+    /// When signature verification is disabled, `source_path` must refer to a trusted shared library.
+    #[cfg(feature = "dynamic-loader")]
+    pub(crate) unsafe fn prepare_dynamic_mod_image(
+        source_path: &Path,
+        options: &LoadOptions,
+        #[cfg(feature = "signature-verification")] trust_policy: Option<&ModTrustPolicy>,
+    ) -> Result<PreparedModImage, ModLoadError> {
+        #[cfg(feature = "signature-verification")]
+        let (loaded_lib, actual_path, verified_signature) =
+            // SAFETY: Caller upholds library trustworthiness when verification is disabled.
+            unsafe { LoadedLibrary::open(source_path, options, trust_policy)? };
+        #[cfg(not(feature = "signature-verification"))]
+        let (loaded_lib, actual_path) =
+            // SAFETY: Caller upholds library trustworthiness.
+            unsafe { LoadedLibrary::open(source_path, options)? };
+
+        // SAFETY: `loaded_lib` was just opened and validated above.
+        unsafe {
+            Self::prepare_from_loaded_library(
+                source_path,
+                actual_path,
+                loaded_lib,
+                #[cfg(feature = "signature-verification")]
+                verified_signature,
+                #[cfg(feature = "signature-verification")]
+                options,
+                #[cfg(feature = "signature-verification")]
+                trust_policy,
+            )
+        }
+    }
+
+    /// Stages, verifies, extracts, and validates a `.bampack` archive into a [`PreparedModImage`]
+    /// without modifying the active `World` or running `bamabi_init` yet.
+    ///
+    /// # Safety
+    /// When signature verification is disabled/unconfigured on `trust_policy`, `bampack_path` must
+    /// point to a trusted `.bampack` archive.
+    #[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+    pub(crate) unsafe fn prepare_bampack_mod_image(
+        bampack_path: &Path,
+        options: &LoadOptions,
+        trust_policy: Option<&ModTrustPolicy>,
+    ) -> Result<PreparedModImage, ModLoadError> {
+        let (entries, verified_signature): (Vec<BamPackEntry>, Option<VerifiedModSignature>) =
+            if let Some(policy) = trust_policy.filter(|p| p.is_enforced()) {
+                let verified_pack = policy.verify_bampack_file(bampack_path).map_err(|source| {
+                    ModLoadError::SignatureVerification {
+                        path: bampack_path.to_path_buf(),
+                        signature_path: bampack_path.to_path_buf(),
+                        source,
+                    }
+                })?;
+                (
+                    verified_pack.entries,
+                    Some(VerifiedModSignature::from(verified_pack.signature)),
+                )
+            } else {
+                let archive_bytes =
+                    std::fs::read(bampack_path).map_err(|err| ModLoadError::BamPack {
+                        path: bampack_path.to_path_buf(),
+                        detail: err.to_string(),
+                    })?;
+                let (entries, _has_sig) = parse_bampack_entries_unverified(
+                    &archive_bytes,
+                    trust_policy
+                        .map_or(crate::loader::signing::DEFAULT_MAX_MOD_BINARY_BYTES, |p| {
+                            p.max_binary_bytes()
+                        }),
+                )
+                .map_err(|err| ModLoadError::BamPack {
+                    path: bampack_path.to_path_buf(),
+                    detail: err.to_string(),
+                })?;
+                (entries, None)
+            };
+
+        let dll_suffix = std::env::consts::DLL_SUFFIX;
+        let native_entry = entries
+            .iter()
+            .find(|entry| {
+                if cfg!(windows) {
+                    entry
+                        .path
+                        .to_ascii_lowercase()
+                        .ends_with(&dll_suffix.to_ascii_lowercase())
+                } else {
+                    entry.path.ends_with(dll_suffix)
+                }
+            })
+            .ok_or_else(|| ModLoadError::BamPack {
+                path: bampack_path.to_path_buf(),
+                detail: format!(
+                    "no native shared library matching '{dll_suffix}' found inside .bampack archive"
+                ),
+            })?;
+
+        let virtual_source = bampack_path.with_file_name(
+            Path::new(&native_entry.path)
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("mod_bundle")),
+        );
+        // SAFETY: `native_entry.data` came from a verified or caller-trusted `.bampack` archive.
+        let (loaded_lib, actual_path) = unsafe {
+            LoadedLibrary::open_shadow_bytes(&virtual_source, &native_entry.data, options)?
+        };
+
+        // SAFETY: `loaded_lib` was just opened from verified/trusted `.bampack` bytes.
+        unsafe {
+            Self::prepare_from_loaded_library(
+                bampack_path,
+                actual_path,
+                loaded_lib,
+                verified_signature,
+                options,
+                trust_policy,
+            )
+        }
+    }
+
+    /// Validates [`InMemoryModEntrypoints`] and packages them into a [`PreparedModImage`] ready
+    /// for atomic initialization.
+    pub(crate) fn prepare_entrypoints_mod_image(
+        virtual_path: &Path,
+        entrypoints: InMemoryModEntrypoints,
+    ) -> Result<PreparedModImage, ModLoadError> {
+        let (manifest_name, manifest_version, save_state_fn, restore_state_fn) =
+            validate_manifest_from_fn(virtual_path, entrypoints.manifest)?;
+        Ok(PreparedModImage {
+            source_path: virtual_path.to_path_buf(),
+            loaded_path: virtual_path.to_path_buf(),
+            backing: ModBacking::InMemory(entrypoints.backing.unwrap_or_else(|| Box::new(()))),
+            manifest_name,
+            manifest_version,
+            init_fn: entrypoints.init,
+            shutdown_fn: entrypoints.shutdown,
+            save_state_fn,
+            restore_state_fn,
+            resolve_symbol_fn: entrypoints.resolve_symbol,
+            #[cfg(feature = "signature-verification")]
+            verified_signature: None,
+        })
+    }
+
+    /// Executes `bamabi_init` on a pre-staged [`PreparedModImage`], applies `options.system_filter`,
+    /// and registers the active [`LoadedMod`] inside `self`.
+    ///
+    /// # Safety
+    /// - `world_ptr` must point to an exclusively borrowed `World`.
+    pub(crate) unsafe fn load_prepared_mod(
+        &mut self,
+        prepared: PreparedModImage,
+        options: &LoadOptions,
+        generation_override: Option<u64>,
+        registry: ModRegistry,
+        world_ptr: *mut World,
+    ) -> Result<(ModId, Vec<GuestSystem>), ModLoadError> {
+        let PreparedModImage {
+            source_path,
+            loaded_path,
+            backing,
+            manifest_name,
+            manifest_version,
+            init_fn,
+            shutdown_fn,
+            save_state_fn,
+            restore_state_fn,
+            resolve_symbol_fn,
+            #[cfg(feature = "signature-verification")]
+            verified_signature,
+        } = prepared;
+
+        let lib_state = shared_lib_state_for_path(&loaded_path);
+        let mut state_guard = lock_unpoison(&lib_state);
+
+        let mod_id = ModId::allocate();
+        let pre_snapshot = registry.snapshot_arc();
+        let is_active = Arc::new(AtomicBool::new(true));
+
+        let generation = generation_override.unwrap_or_else(|| {
+            *self
+                .mod_generations
+                .get(manifest_name.as_ref())
+                .unwrap_or(&0)
+        });
+
+        // Declared *after* `backing` so Rust's reverse local drop order runs `LoadTransaction::drop`
+        // (disarming drop trampolines and restoring `pre_snapshot`) *before* `dlclose` + shadow unlink.
+        let tx = LoadTransaction::new(world_ptr, Arc::clone(&is_active), Arc::clone(&pre_snapshot));
+
+        let prev_pending_gen = self
+            .pending_generation_override
+            .replace((Arc::clone(&manifest_name), generation));
+        let mut known_generations = self.mod_generations.clone();
+        for active in &self.loaded_libraries {
+            if active.is_active() {
+                known_generations.insert(Arc::clone(&active.name), active.generation);
+            }
+        }
+        known_generations.insert(Arc::clone(&manifest_name), generation);
         let mut load_ctx = LoadContext::with_manifest_name(
             registry,
             Arc::clone(&is_active),
@@ -589,7 +845,10 @@ impl ModHost {
             Some(mod_id),
             Some(Arc::clone(&manifest_name)),
         )
-        .with_staged_drop_bindings(tx.staged_drop_bindings());
+        .with_staged_drop_bindings(tx.staged_drop_bindings())
+        .with_staged_migrations(tx.staged_migrations())
+        .with_mod_generation(generation)
+        .with_known_mod_generations(known_generations);
 
         let mut instance_ptr: *mut BamInstance = core::ptr::null_mut();
         // SAFETY: Invoking guest `bamabi_init` with static `HOST_API`, stack-scoped `LoadContext`
@@ -597,6 +856,7 @@ impl ModHost {
         let status = unsafe { init_fn(&HOST_API, load_ctx.as_ffi_ptr(), &mut instance_ptr) };
         let diagnostic = load_ctx.host_ctx.last_error_message();
         load_ctx.finish_init();
+        self.pending_generation_override = prev_pending_gen;
 
         if status == FfiResult::PANIC_CAUGHT {
             if !world_ptr.is_null() {
@@ -607,7 +867,7 @@ impl ModHost {
                 }
             }
             return Err(ModLoadError::InitPanicked {
-                path: source_path.to_path_buf(),
+                path: source_path,
                 diagnostic,
             });
         }
@@ -620,10 +880,36 @@ impl ModHost {
                 }
             }
             return Err(ModLoadError::InitFailed {
-                path: source_path.to_path_buf(),
+                path: source_path,
                 status,
                 diagnostic,
             });
+        }
+
+        if let Some(ref filter) = options.system_filter {
+            let mut rejected_names: Vec<Arc<str>> = Vec::new();
+            load_ctx.registered_systems.retain(|sys| {
+                if filter(sys.system_name()) {
+                    true
+                } else {
+                    rejected_names.push(sys.system_name_arc());
+                    false
+                }
+            });
+            if !rejected_names.is_empty() && !world_ptr.is_null() {
+                // SAFETY: `world_ptr` is exclusively borrowed and `load_ctx` holds no `&mut World`.
+                let world = unsafe { &mut *world_ptr };
+                if let Some(mut set_registry) = world.get_resource_mut::<ModScheduleSetRegistry>() {
+                    for sys_name in rejected_names {
+                        let named_set = ModNamedSystemSet::with_generation(
+                            Arc::clone(&manifest_name),
+                            sys_name,
+                            generation,
+                        );
+                        set_registry.unmount_system_anywhere(&named_set);
+                    }
+                }
+            }
         }
 
         // Ensure `World`'s `ModRegistry` reflects any components registered during `init`,
@@ -642,11 +928,6 @@ impl ModHost {
             );
         }
 
-        let generation = *self
-            .mod_generations
-            .get(manifest_name.as_ref())
-            .unwrap_or(&0);
-
         for sys in &mut load_ctx.registered_systems {
             sys.set_registry(load_ctx.registry.clone());
             sys.set_mod_id(mod_id);
@@ -660,7 +941,7 @@ impl ModHost {
             }
         }
 
-        let staged_drop_bindings = tx.commit();
+        let (staged_drop_bindings, staged_migrations) = tx.commit();
         state_guard.active_count += 1;
         drop(state_guard);
 
@@ -670,18 +951,19 @@ impl ModHost {
             id: mod_id,
             name: manifest_name,
             version: manifest_version,
-            source_path: source_path.to_path_buf(),
-            loaded_path: actual_path,
+            source_path,
+            loaded_path,
             system_count,
             fault_count: 0,
             entity: None,
             generation,
             pre_snapshot,
             staged_drop_bindings,
-            library: loaded_lib,
+            staged_migrations,
+            backing,
             shutdown_fn,
-            save_state_fn: manifest.save_state,
-            restore_state_fn: manifest.restore_state,
+            save_state_fn,
+            restore_state_fn,
             resolve_symbol_fn,
             instance: GuestInstancePtr::new(instance_ptr),
             is_active,
@@ -693,6 +975,34 @@ impl ModHost {
         });
 
         Ok((mod_id, systems))
+    }
+
+    /// Core loader opening `source_path` (with optional shadow copy), validating `bamabi_manifest`,
+    /// running `bamabi_init` against `LoadContext`, and capturing `*mut BamInstance`.
+    ///
+    /// # Safety
+    /// - `source_path` must point to a trusted native mod shared library.
+    /// - `world_ptr` must point to an exclusively borrowed `World`.
+    #[cfg(feature = "dynamic-loader")]
+    pub(crate) unsafe fn load_mod_core(
+        &mut self,
+        source_path: &Path,
+        options: &LoadOptions,
+        registry: ModRegistry,
+        world_ptr: *mut World,
+        #[cfg(feature = "signature-verification")] trust_policy: Option<&ModTrustPolicy>,
+    ) -> Result<(ModId, Vec<GuestSystem>), ModLoadError> {
+        // SAFETY: Caller upholds library trustworthiness when signature verification is off.
+        let prepared = unsafe {
+            Self::prepare_dynamic_mod_image(
+                source_path,
+                options,
+                #[cfg(feature = "signature-verification")]
+                trust_policy,
+            )?
+        };
+        // SAFETY: `world_ptr` points to an exclusively borrowed `World`.
+        unsafe { self.load_prepared_mod(prepared, options, None, registry, world_ptr) }
     }
 
     /// Crate-internal unload of a single module after schedule excision and registry eviction.
@@ -715,10 +1025,11 @@ impl ModHost {
             .iter()
             .any(|m| m.is_active() && m.name == loaded.name)
         {
-            *self
+            let gen_entry = self
                 .mod_generations
                 .entry(Arc::clone(&loaded.name))
-                .or_insert(0) += 1;
+                .or_insert(0);
+            *gen_entry = (*gen_entry).max(loaded.generation.saturating_add(1));
         }
         let mod_name = Arc::clone(&loaded.name);
         let source_path = loaded.source_path.clone();
@@ -752,6 +1063,194 @@ impl Drop for ModHost {
     }
 }
 
+fn validate_manifest_from_fn(
+    source_path: &Path,
+    manifest_fn: BamManifestFn,
+) -> Result<
+    (
+        Arc<str>,
+        Arc<str>,
+        Option<BamSaveStateFn>,
+        Option<BamRestoreStateFn>,
+    ),
+    ModLoadError,
+> {
+    // SAFETY: Invoking side-effect-free manifest descriptor getter.
+    let manifest_ptr = unsafe { manifest_fn() };
+    if manifest_ptr.is_null() {
+        return Err(ModLoadError::InvalidManifest {
+            path: source_path.to_path_buf(),
+            status: FfiResult::NULL_POINTER,
+            detail: "bamabi_manifest() returned null".to_string(),
+        });
+    }
+
+    // SAFETY: `read_descriptor` checks alignment and `struct_size >= BamManifest::MIN_V0_2_SIZE`.
+    let manifest = unsafe { read_descriptor::<BamManifest>(manifest_ptr.cast::<c_void>()) }
+        .map_err(|status| ModLoadError::InvalidManifest {
+            path: source_path.to_path_buf(),
+            status,
+            detail: "BamManifest struct_size is smaller than MIN_V0_2_SIZE".to_string(),
+        })?;
+
+    if !is_abi_version_compatible(ABI_VERSION, manifest.abi_version) {
+        return Err(ModLoadError::IncompatibleAbiVersion {
+            path: source_path.to_path_buf(),
+            host_version: ABI_VERSION,
+            guest_version: manifest.abi_version,
+        });
+    }
+
+    let manifest_status = manifest.validate_for_host(ABI_VERSION);
+    if manifest_status.is_err() {
+        return Err(ModLoadError::InvalidManifest {
+            path: source_path.to_path_buf(),
+            status: manifest_status,
+            detail: "BamManifest failed structural/flag validation".to_string(),
+        });
+    }
+
+    // SAFETY: `manifest.validate_for_host` verified `!manifest.name.is_null()` and `!manifest.version.is_null()`.
+    let manifest_name_str = unsafe { CStr::from_ptr(manifest.name) }
+        .to_str()
+        .map_err(|_| ModLoadError::InvalidManifest {
+            path: source_path.to_path_buf(),
+            status: FfiResult::INVALID_UTF8,
+            detail: "BamManifest `name` is not valid UTF-8".to_string(),
+        })?;
+    if manifest_name_str.is_empty() {
+        return Err(ModLoadError::InvalidManifest {
+            path: source_path.to_path_buf(),
+            status: FfiResult::INVALID_ARGUMENT,
+            detail: "BamManifest `name` must not be empty".to_string(),
+        });
+    }
+
+    // SAFETY: `manifest.version` was checked non-null above.
+    let manifest_version_str = unsafe { CStr::from_ptr(manifest.version) }
+        .to_str()
+        .map_err(|_| ModLoadError::InvalidManifest {
+            path: source_path.to_path_buf(),
+            status: FfiResult::INVALID_UTF8,
+            detail: "BamManifest `version` is not valid UTF-8".to_string(),
+        })?;
+    if manifest_version_str.is_empty() {
+        return Err(ModLoadError::InvalidManifest {
+            path: source_path.to_path_buf(),
+            status: FfiResult::INVALID_ARGUMENT,
+            detail: "BamManifest `version` must not be empty".to_string(),
+        });
+    }
+
+    Ok((
+        Arc::from(manifest_name_str),
+        Arc::from(manifest_version_str),
+        manifest.save_state,
+        manifest.restore_state,
+    ))
+}
+
+fn ensure_loader_world_resources(world: &mut World) {
+    world.init_resource::<WorldDropGuard>();
+    world.init_resource::<ModHost>();
+    world.init_resource::<ModRegistry>();
+    world.init_resource::<ModQuarantine>();
+    ensure_symbol_tables_in_world(world);
+}
+
+/// Stages and validates a disk shared library at `path` into a [`PreparedModImage`] without
+/// mutating `world` or executing `bamabi_init`.
+#[cfg(feature = "dynamic-loader")]
+pub fn prepare_dynamic_mod_in_world(
+    world: &World,
+    path: &Path,
+    options: &LoadOptions,
+) -> Result<PreparedModImage, ModLoadError> {
+    #[cfg(feature = "signature-verification")]
+    let trust_policy = world.get_resource::<ModTrustPolicy>().cloned();
+    #[cfg(not(feature = "signature-verification"))]
+    let _ = world;
+
+    #[cfg(feature = "signature-verification")]
+    // SAFETY: Verification is delegated to `trust_policy` when enforced; otherwise `path` is caller-trusted.
+    unsafe {
+        ModHost::prepare_dynamic_mod_image(path, options, trust_policy.as_ref())
+    }
+    #[cfg(not(feature = "signature-verification"))]
+    // SAFETY: Caller guarantees `path` points to a trusted shared library.
+    unsafe {
+        ModHost::prepare_dynamic_mod_image(path, options)
+    }
+}
+
+/// Stages, verifies, and extracts a `.bampack` archive at `path` into a [`PreparedModImage`]
+/// without mutating `world` or executing `bamabi_init`.
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+pub fn prepare_bampack_in_world(
+    world: &World,
+    path: &Path,
+    options: &LoadOptions,
+) -> Result<PreparedModImage, ModLoadError> {
+    let trust_policy = world.get_resource::<ModTrustPolicy>().cloned();
+    // SAFETY: Verification is enforced whenever `trust_policy` is configured; otherwise `path` is caller-trusted.
+    unsafe { ModHost::prepare_bampack_mod_image(path, options, trust_policy.as_ref()) }
+}
+
+/// Validates [`InMemoryModEntrypoints`] and packages them into a [`PreparedModImage`].
+pub fn prepare_entrypoints_in_world(
+    virtual_path: &Path,
+    entrypoints: InMemoryModEntrypoints,
+) -> Result<PreparedModImage, ModLoadError> {
+    ModHost::prepare_entrypoints_mod_image(virtual_path, entrypoints)
+}
+
+/// Runs `bamabi_init` on an already-prepared [`PreparedModImage`], registering the mod in `world`
+/// with an optional explicit reload `generation_override`.
+pub fn load_prepared_mod_in_world(
+    world: &mut World,
+    prepared: PreparedModImage,
+    options: &LoadOptions,
+    generation_override: Option<u64>,
+) -> Result<(ModId, Vec<GuestSystem>), ModLoadError> {
+    ensure_loader_world_resources(world);
+    world.resource_scope::<ModHost, _>(|world, mut mod_host| {
+        let registry = world
+            .get_resource::<ModRegistry>()
+            .cloned()
+            .unwrap_or_default();
+        let world_ptr = world as *mut World;
+        // SAFETY: `world` is exclusively borrowed (`&mut World`).
+        unsafe {
+            mod_host.load_prepared_mod(prepared, options, generation_override, registry, world_ptr)
+        }
+    })
+}
+
+/// Ensures [`ModHost`], [`ModRegistry`], [`ModQuarantine`], and [`WorldDropGuard`] exist in `world`
+/// and loads a mod directly from in-memory [`InMemoryModEntrypoints`] without `dlopen`.
+pub fn load_mod_from_entrypoints_in_world(
+    world: &mut World,
+    virtual_path: &Path,
+    entrypoints: InMemoryModEntrypoints,
+    options: &LoadOptions,
+) -> Result<(ModId, Vec<GuestSystem>), ModLoadError> {
+    let prepared = prepare_entrypoints_in_world(virtual_path, entrypoints)?;
+    load_prepared_mod_in_world(world, prepared, options, None)
+}
+
+/// Ensures [`ModHost`], [`ModRegistry`], [`ModQuarantine`], and [`WorldDropGuard`] exist in `world`,
+/// verifies/unpacks a `.bampack` archive, and loads the contained native mod library.
+#[cfg(all(feature = "dynamic-loader", feature = "signature-verification"))]
+pub fn load_bampack_in_world(
+    world: &mut World,
+    path: &Path,
+    options: &LoadOptions,
+) -> Result<(ModId, Vec<GuestSystem>), ModLoadError> {
+    ensure_loader_world_resources(world);
+    let prepared = prepare_bampack_in_world(world, path, options)?;
+    load_prepared_mod_in_world(world, prepared, options, None)
+}
+
 /// Ensures [`ModHost`], [`ModRegistry`], [`ModQuarantine`], and [`WorldDropGuard`] exist in `world`
 /// and loads the mod at `path` using `options`, returning its [`ModId`] and unscheduled [`GuestSystem`]s.
 pub fn load_mod_in_world(
@@ -759,32 +1258,44 @@ pub fn load_mod_in_world(
     path: &Path,
     options: &LoadOptions,
 ) -> Result<(ModId, Vec<GuestSystem>), ModLoadError> {
-    world.init_resource::<WorldDropGuard>();
-    world.init_resource::<ModHost>();
-    world.init_resource::<ModRegistry>();
-    world.init_resource::<ModQuarantine>();
-    ensure_symbol_tables_in_world(world);
-    world.resource_scope::<ModHost, _>(|world, mut mod_host| {
-        let registry = world
-            .get_resource::<ModRegistry>()
-            .cloned()
-            .unwrap_or_default();
-        #[cfg(feature = "signature-verification")]
-        let trust_policy = world.get_resource::<ModTrustPolicy>().cloned();
-        let world_ptr = world as *mut World;
-        #[cfg(feature = "signature-verification")]
-        {
-            // SAFETY: `world` is exclusively borrowed (`&mut World`) while loading `path`.
-            unsafe {
-                mod_host.load_mod_core(path, options, registry, world_ptr, trust_policy.as_ref())
+    #[cfg(feature = "dynamic-loader")]
+    {
+        ensure_loader_world_resources(world);
+        world.resource_scope::<ModHost, _>(|world, mut mod_host| {
+            let registry = world
+                .get_resource::<ModRegistry>()
+                .cloned()
+                .unwrap_or_default();
+            #[cfg(feature = "signature-verification")]
+            let trust_policy = world.get_resource::<ModTrustPolicy>().cloned();
+            let world_ptr = world as *mut World;
+            #[cfg(feature = "signature-verification")]
+            {
+                // SAFETY: `world` is exclusively borrowed (`&mut World`) while loading `path`.
+                unsafe {
+                    mod_host.load_mod_core(
+                        path,
+                        options,
+                        registry,
+                        world_ptr,
+                        trust_policy.as_ref(),
+                    )
+                }
             }
-        }
-        #[cfg(not(feature = "signature-verification"))]
-        {
-            // SAFETY: `world` is exclusively borrowed (`&mut World`) while loading `path`.
-            unsafe { mod_host.load_mod_core(path, options, registry, world_ptr) }
-        }
-    })
+            #[cfg(not(feature = "signature-verification"))]
+            {
+                // SAFETY: `world` is exclusively borrowed (`&mut World`) while loading `path`.
+                unsafe { mod_host.load_mod_core(path, options, registry, world_ptr) }
+            }
+        })
+    }
+    #[cfg(not(feature = "dynamic-loader"))]
+    {
+        let _ = (world, options);
+        Err(ModLoadError::DynamicLoaderDisabled {
+            path: path.to_path_buf(),
+        })
+    }
 }
 
 /// Records the `(InternedScheduleLabel, ModNamedSystemSet)` pairs attached for `id` so they are
@@ -808,9 +1319,11 @@ pub fn rollback_unscheduled_mod_in_world(world: &mut World, id: ModId) {
     let rollback_data = world.get_resource_mut::<ModHost>().and_then(|mut h| {
         h.get_mod_mut(id).map(|m| {
             let staged = core::mem::take(&mut m.staged_drop_bindings);
+            let migrations = core::mem::take(&mut m.staged_migrations);
             let observers = core::mem::take(&mut m.observer_entities);
             (
                 staged,
+                migrations,
                 observers,
                 Arc::clone(&m.is_active),
                 Arc::clone(&m.pre_snapshot),
@@ -818,11 +1331,14 @@ pub fn rollback_unscheduled_mod_in_world(world: &mut World, id: ModId) {
         })
     });
 
-    if let Some((staged, observers, is_active, snap)) = rollback_data {
+    if let Some((staged, migrations, observers, is_active, snap)) = rollback_data {
         for obs_entity in observers {
             if let Ok(e) = world.get_entity_mut(obs_entity) {
                 e.despawn();
             }
+        }
+        if !migrations.is_empty() {
+            rollback_staged_column_migrations(world, migrations);
         }
         if let Some(mut drop_guard) = world.get_resource_mut::<WorldDropGuard>() {
             drop_guard.rollback_staged_bindings(&staged);
@@ -1074,6 +1590,12 @@ where
     }
 }
 
+/// Host byte-sink callback used by `BamManifest::save_state` during hot-reload.
+///
+/// # Safety
+///
+/// - `writer_ctx` must be null or point to a valid, exclusively accessible `Vec<u8>`.
+/// - When `len > 0`, `bytes` must be null or readable for `len` bytes.
 unsafe extern "C" fn host_state_vec_writer(
     writer_ctx: *mut c_void,
     bytes: *const u8,

@@ -1186,8 +1186,8 @@ mod optional_changed_resources_and_collisions {
     #[repr(C)]
     struct WorldBannerVTableMirror {
         header: VTableHeader,
-        get_title: Option<unsafe extern "C" fn(*const c_void) -> StrView>,
-        set_title: Option<unsafe extern "C" fn(*mut c_void, StrView) -> FfiResult>,
+        get_title: Option<unsafe extern "C" fn(*const c_void, *mut StrView) -> FfiResult>,
+        set_title: Option<unsafe extern "C" fn(*mut c_void, *const StrView) -> FfiResult>,
     }
 
     struct ResourceTestCtx {
@@ -1256,8 +1256,13 @@ mod optional_changed_resources_and_collisions {
             assert_eq!(unsafe { (*banner_vt_ptr).header.uuid }, WorldBanner::UUID);
             let banner_ptr = unsafe { host_res_ptr(iter, 1) };
             assert!(!banner_ptr.is_null());
-            let view =
-                unsafe { ((*banner_vt_ptr).get_title.unwrap())(banner_ptr.cast::<c_void>()) };
+            let mut view = StrView::empty();
+            assert_eq!(
+                unsafe {
+                    ((*banner_vt_ptr).get_title.unwrap())(banner_ptr.cast::<c_void>(), &mut view)
+                },
+                FfiResult::OK
+            );
 
             if ctx.write_trigger.load(Ordering::SeqCst) != 0 {
                 // Mutate `SimConfig` (term 0) -> marks Bevy resource change tick!
@@ -1343,8 +1348,8 @@ mod optional_changed_resources_and_collisions {
     #[repr(C)]
     struct DefaultableTagVTableMirror {
         header: VTableHeader,
-        get_label: Option<unsafe extern "C" fn(*const c_void) -> StrView>,
-        set_label: Option<unsafe extern "C" fn(*mut c_void, StrView) -> FfiResult>,
+        get_label: Option<unsafe extern "C" fn(*const c_void, *mut StrView) -> FfiResult>,
+        set_label: Option<unsafe extern "C" fn(*mut c_void, *const StrView) -> FfiResult>,
     }
 
     #[test]
@@ -1478,7 +1483,7 @@ mod optional_changed_resources_and_collisions {
                     unsafe {
                         let stride = (*vt_ptr).header.size;
                         let elem = base.add(r * stride).cast::<c_void>();
-                        let rc = ((*vt_ptr).set_label.unwrap())(elem, view);
+                        let rc = ((*vt_ptr).set_label.unwrap())(elem, &view);
                         assert_eq!(rc, FfiResult::OK);
                     }
                 }

@@ -21,7 +21,7 @@ use crate::ffi::validation::{
     BamExportFieldsFn, BamImportFieldFn, BamInitDefaultFn,
     collect_witness_export_sink as collect_exported_field_sink,
 };
-use crate::handle_header::{AlignedBuf, validate_non_empty_cstr};
+use crate::handle_header::{AlignedBuf, lock_unpoison, validate_non_empty_cstr};
 use crate::loader::error::ModLoadError;
 use crate::loader::mod_host::{LoadedMod, ModHost, ModId, ModScoped};
 use crate::loader::symbols::ModNamedObjects;
@@ -193,6 +193,20 @@ pub fn snapshot_mod_dynamic_columns_for_reload(
     }
 
     if snapshot_candidates.is_empty() {
+        if !retained_zero_copy.is_empty()
+            && let Some(mut reg) = world.get_resource_mut::<ModRegistry>()
+        {
+            let mut snap = (*reg.snapshot_arc()).clone();
+            for retained in &retained_zero_copy {
+                if let Some(idx) = retained.handle.0.checked_sub(1).map(|i| i as usize)
+                    && let Some(entry) = snap.entries.get_mut(idx)
+                    && entry.owner == Some(mod_id)
+                {
+                    entry.owner = None;
+                }
+            }
+            reg.restore_snapshot(Arc::new(snap));
+        }
         return Ok(ReloadColumnSnapshot {
             columns: Vec::new(),
             retained_zero_copy,
@@ -368,10 +382,18 @@ pub fn snapshot_mod_dynamic_columns_for_reload(
         }
     }
 
-    if !removals.is_empty()
+    if (!retained_zero_copy.is_empty() || !removals.is_empty())
         && let Some(mut reg) = world.get_resource_mut::<ModRegistry>()
     {
         let mut snap = (*reg.snapshot_arc()).clone();
+        for retained in &retained_zero_copy {
+            if let Some(idx) = retained.handle.0.checked_sub(1).map(|i| i as usize)
+                && let Some(entry) = snap.entries.get_mut(idx)
+                && entry.owner == Some(mod_id)
+            {
+                entry.owner = None;
+            }
+        }
         for removal in removals {
             if snap.by_name.get(removal.name.as_ref()) == Some(&removal.handle) {
                 snap.by_name.remove(removal.name.as_ref());
@@ -441,6 +463,58 @@ pub fn cleanup_orphaned_mod_scoped_entities(world: &mut World, old_id: ModId) {
 struct MigratedChunk {
     entities: Vec<Entity>,
     dst_buf: AlignedBuf,
+}
+
+/// Reversible pre-migration chunk buffer captured when `migrate_component_column` executes
+/// inside a transactional mod load/reload (`LoadTransaction` / `LoadedMod`).
+pub(crate) struct StagedMigrationUndoChunk {
+    pub(crate) entities: Vec<Entity>,
+    pub(crate) old_buf: AlignedBuf,
+}
+
+/// Reversible undo record for a single `migrate_component_column` swap (`old_comp_id` <-> `new_comp_id`),
+/// restoring surviving entities' original `AbiPod` component bytes if initialization or cascade
+/// staging subsequently fails before Phase 5 commit.
+pub(crate) struct StagedColumnMigrationUndo {
+    pub(crate) old_comp_id: ComponentId,
+    pub(crate) new_comp_id: ComponentId,
+    pub(crate) old_size: usize,
+    pub(crate) chunks: Vec<StagedMigrationUndoChunk>,
+}
+
+/// Reverses staged `migrate_component_column` swaps in LIFO order, removing `new_comp_id` and
+/// restoring original `old_comp_id` POD payloads onto surviving entities before `ModRegistry` rollback.
+pub(crate) fn rollback_staged_column_migrations(
+    world: &mut World,
+    migrations: Vec<StagedColumnMigrationUndo>,
+) {
+    for undo in migrations.into_iter().rev() {
+        for chunk in undo.chunks {
+            for (row, &entity) in chunk.entities.iter().enumerate().rev() {
+                if let Ok(mut ent_mut) = world.get_entity_mut(entity) {
+                    ent_mut.remove_by_id(undo.new_comp_id);
+                    let row_ptr = if undo.old_size == 0 {
+                        chunk.old_buf.non_null()
+                    } else {
+                        // SAFETY: `row < chunk.entities.len()` and `chunk.old_buf` holds
+                        // `chunk.entities.len() * undo.old_size` bytes aligned to `old_align`.
+                        unsafe {
+                            NonNull::new_unchecked(
+                                chunk.old_buf.as_mut_ptr().add(row * undo.old_size),
+                            )
+                        }
+                    };
+                    // SAFETY: `row_ptr` holds `undo.old_size` initialized pre-migration POD bytes;
+                    // `insert_by_id` copies out without freeing `chunk.old_buf`.
+                    let owning = unsafe { OwningPtr::new(row_ptr) };
+                    // SAFETY: `undo.old_comp_id` remains registered in `world` with `(old_size, old_align)`.
+                    unsafe {
+                        ent_mut.insert_by_id(undo.old_comp_id, owning);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Migrates all live entities carrying dynamic `AbiPod` component `component` from its active
@@ -576,13 +650,16 @@ pub(crate) unsafe fn migrate_component_column_ffi(
 
     let old_comp_id = old_entry.component_id;
     let old_size = old_entry.size;
+    let old_align = old_entry.align.max(1);
     let new_size = new_desc.size;
     let new_align = new_desc.align.max(1);
     let old_is_sparse = old_entry.is_sparse_set();
+    let capture_undo = ctx.staged_migrations.is_some();
 
-    let new_comp_id = {
+    let (new_comp_id, undo_chunks) = {
         let world = ctx.world_mut();
         let mut chunks: Vec<MigratedChunk> = Vec::new();
+        let mut undo_chunks: Vec<StagedMigrationUndoChunk> = Vec::new();
 
         if old_is_sparse {
             let mut sparse_entities: Vec<Entity> = Vec::new();
@@ -610,6 +687,27 @@ pub(crate) unsafe fn migrate_component_column_ffi(
                 let dst_buf = AlignedBuf::from_layout_zeroed(dst_col_layout);
                 let dst_base = dst_buf.as_mut_ptr();
 
+                let mut undo_state = if capture_undo {
+                    let Some(old_total_bytes) = row_count.checked_mul(old_size) else {
+                        ctx.host_ctx.set_last_error(
+                            "migrate_component_column undo buffer byte count overflowed usize",
+                        );
+                        return FfiResult::CAPACITY_EXCEEDED;
+                    };
+                    let Ok(old_col_layout) = Layout::from_size_align(old_total_bytes, old_align)
+                    else {
+                        ctx.host_ctx
+                            .set_last_error("migrate_component_column undo buffer layout invalid");
+                        return FfiResult::CAPACITY_EXCEEDED;
+                    };
+                    Some((
+                        Vec::with_capacity(row_count),
+                        AlignedBuf::from_layout_zeroed(old_col_layout),
+                    ))
+                } else {
+                    None
+                };
+
                 for (row, &entity) in sparse_entities.iter().enumerate() {
                     let Some(src_ptr) = sparse_set.get(entity) else {
                         continue;
@@ -636,6 +734,29 @@ pub(crate) unsafe fn migrate_component_column_ffi(
                         ));
                         return rc;
                     }
+                    if let Some((ref mut undo_entities, ref undo_buf)) = undo_state {
+                        let undo_row = undo_entities.len();
+                        if old_size > 0 {
+                            // SAFETY: `src_ptr` holds `old_size` initialized POD bytes and
+                            // `undo_buf` has capacity for `row_count * old_size` non-overlapping bytes.
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    src_ptr.as_ptr(),
+                                    undo_buf.as_mut_ptr().add(undo_row * old_size),
+                                    old_size,
+                                );
+                            }
+                        }
+                        undo_entities.push(entity);
+                    }
+                }
+                if let Some((undo_entities, old_buf)) = undo_state
+                    && !undo_entities.is_empty()
+                {
+                    undo_chunks.push(StagedMigrationUndoChunk {
+                        entities: undo_entities,
+                        old_buf,
+                    });
                 }
                 chunks.push(MigratedChunk {
                     entities: sparse_entities,
@@ -704,8 +825,30 @@ pub(crate) unsafe fn migrate_component_column_ffi(
                     }
                 }
 
+                let table_entities = table.entities().to_vec();
+                if capture_undo {
+                    let Some(old_total_bytes) = row_count.checked_mul(old_size) else {
+                        ctx.host_ctx.set_last_error(
+                            "migrate_component_column undo buffer byte count overflowed usize",
+                        );
+                        return FfiResult::CAPACITY_EXCEEDED;
+                    };
+                    // SAFETY: `src_base` holds `row_count * old_size` contiguous initialized POD bytes.
+                    let Ok(old_buf) =
+                        (unsafe { AlignedBuf::copy_from(src_base, old_total_bytes, old_align) })
+                    else {
+                        ctx.host_ctx
+                            .set_last_error("migrate_component_column undo buffer layout invalid");
+                        return FfiResult::CAPACITY_EXCEEDED;
+                    };
+                    undo_chunks.push(StagedMigrationUndoChunk {
+                        entities: table_entities.clone(),
+                        old_buf,
+                    });
+                }
+
                 chunks.push(MigratedChunk {
-                    entities: table.entities().to_vec(),
+                    entities: table_entities,
                     dst_buf,
                 });
             }
@@ -759,8 +902,19 @@ pub(crate) unsafe fn migrate_component_column_ffi(
             }
         }
 
-        new_id
+        (new_id, undo_chunks)
     };
+
+    if let Some(ref staged_log) = ctx.staged_migrations
+        && !undo_chunks.is_empty()
+    {
+        lock_unpoison(staged_log).push(StagedColumnMigrationUndo {
+            old_comp_id,
+            new_comp_id,
+            old_size,
+            chunks: undo_chunks,
+        });
+    }
 
     ctx.record_fresh_dynamic_comp_id(new_comp_id);
     if let Err(err) = ctx
@@ -862,14 +1016,16 @@ fn construct_migrated_buffer(
             } else {
                 FfiSlice::from_slice(&field.bytes)
             };
-            // SAFETY: `dst_ptr` holds an initialized `T`, `StrView`s borrow valid UTF-8, and
-            // `slice` borrows `field.bytes` for this synchronous call.
+            let name_view = StrView::from_str(&field.field_name);
+            let tag_view = StrView::from_str(&field.type_tag);
+            // SAFETY: `dst_ptr` holds an initialized `T`, and stack `name_view`, `tag_view`, and
+            // `slice` borrow valid memory for this synchronous call.
             let rc = unsafe {
                 import_fn(
                     dst_ptr,
-                    StrView::from_str(&field.field_name),
-                    StrView::from_str(&field.type_tag),
-                    slice,
+                    &raw const name_view,
+                    &raw const tag_view,
+                    &raw const slice,
                 )
             };
             if rc == FfiResult::OK || rc == FfiResult::NOT_FOUND {

@@ -525,6 +525,7 @@ fn sequence_vs_sequence_weak_edges_and_concurrent_unrelated_siblings() {
                 after_sets: vec![],
                 before_weak: false,
                 after_weak: false,
+                ..ScheduleSetConfig::default()
             })
             .unwrap();
         let s1 = ModNamedSystemSet::new("native", "r1");
@@ -548,6 +549,7 @@ fn sequence_vs_sequence_weak_edges_and_concurrent_unrelated_siblings() {
                 after_sets: vec![],
                 before_weak: false,
                 after_weak: false,
+                ..ScheduleSetConfig::default()
             })
             .unwrap();
         let w1 = ModNamedSystemSet::new("native", "w1");
@@ -575,6 +577,7 @@ fn sequence_vs_sequence_weak_edges_and_concurrent_unrelated_siblings() {
                 after_sets: vec![],
                 before_weak: false,
                 after_weak: false,
+                ..ScheduleSetConfig::default()
             })
             .unwrap();
         let nc1 = ModNamedSystemSet::new("native", "nc1");
@@ -689,6 +692,7 @@ fn sequence_vs_sequence_weak_edges_and_concurrent_unrelated_siblings() {
                 after_sets: vec![],
                 before_weak: false,
                 after_weak: false,
+                ..ScheduleSetConfig::default()
             })
             .unwrap();
         let s1 = ModNamedSystemSet::new("probe", "a");
@@ -1371,8 +1375,9 @@ unsafe extern "C" fn fault_scenario_cb(
     if let Some(msg) = scenario.report_msg {
         // SAFETY: Active `HostSystemCtx` returns valid `BamHostCtx`.
         let host_ctx = unsafe { host_sys_host_ctx(sys_ctx) };
-        // SAFETY: Valid `host_ctx` and UTF-8 `StrView`.
-        let _ = unsafe { host_report_guest_fault(host_ctx, StrView::from_str(msg)) };
+        let msg_view = StrView::from_str(msg);
+        // SAFETY: Valid `host_ctx` and UTF-8 `StrView` pointer.
+        let _ = unsafe { host_report_guest_fault(host_ctx, &raw const msg_view) };
     }
 
     scenario.return_code

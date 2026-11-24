@@ -1,24 +1,42 @@
 //! Schedule mapping (`ModScheduleMap`), system sets, decoupled ABI `0.3` schedule set registry
 //! (`ModScheduleSetRegistry`), fast schedule-only hot-rewiring, and startup tracking.
 
+use crate::handle_header::HostContext;
 use crate::loader::{ModHost, ModId};
-use crate::system::GuestSystem;
+use crate::registry::{ModRegistry, RegistrySnapshot};
+use crate::sync_ptr::{GuestFnPtr, GuestUserData};
+use crate::system::access_builder::initialize_query_groups_in_world_with_base_idx;
+use crate::system::guest_system::{
+    HostSystemCtx, RandomQueryView, build_query_slot_iters_bucketed,
+};
+use crate::system::query_group::CachedQueryGroup;
+use crate::system::{BamQuerySpecOwned, GuestSystem};
 use bamabi_sys::{
     BAM_SCHEDULE_SET_FLAG_PARALLEL, BAM_SCHEDULE_SET_FLAG_SEQUENCE,
-    BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BamSystemSet, FfiResult, ScheduleId,
+    BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BamIter, BamSystemFn, BamSystemSet, FfiResult, ScheduleId,
 };
 use bevy_app::{FixedUpdate, Last, PostUpdate, PreUpdate, Startup, Update};
+use bevy_ecs::change_detection::{CheckChangeTicks, Tick};
 use bevy_ecs::prelude::Resource;
-use bevy_ecs::schedule::graph::Direction;
+use bevy_ecs::schedule::graph::{
+    Dag, DagCrossDependencyError, DagOverlappingGroupError, DagRedundancyError,
+    DiGraphToposortError, Direction, GraphNodeId,
+};
 use bevy_ecs::schedule::passes::AutoInsertApplyDeferredPass;
 use bevy_ecs::schedule::{
-    FlattenedDependencies, InternedScheduleLabel, InternedSystemSet, IntoScheduleConfigs, NodeId,
-    Schedule, ScheduleBuildError, ScheduleBuildMetadata, ScheduleBuildPass, ScheduleConfigs,
-    ScheduleGraph, ScheduleLabel, Schedules, SystemKey, SystemSet, SystemSetKey,
+    FlattenedDependencies, InternedScheduleLabel, InternedSystemSet, IntoScheduleConfigs, LogLevel,
+    NodeId, Schedule, ScheduleBuildError, ScheduleBuildMetadata, ScheduleBuildPass,
+    ScheduleBuildWarning, ScheduleConfigs, ScheduleGraph, ScheduleLabel, Schedules, SystemKey,
+    SystemSet, SystemSetKey,
 };
-use bevy_ecs::system::{ScheduleSystem, SystemAccess, SystemStateFlags};
-use bevy_ecs::world::World;
+use bevy_ecs::system::{
+    ReadOnlySystem, RunSystemError, ScheduleSystem, System, SystemAccess, SystemIn,
+    SystemStateFlags,
+};
+use bevy_ecs::utils::DebugName;
+use bevy_ecs::world::{DeferredWorld, World, unsafe_world_cell::UnsafeWorldCell};
 use bevy_platform::collections::{HashMap, HashSet};
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -82,17 +100,23 @@ impl ModNamedSystemSet {
     }
 
     /// Parses an ordering target string (`"sys"` -> `(default_mod_name, "sys")`,
-    /// `"other_mod::sys"` -> `("other_mod", "sys")`) at generation `0`.
+    /// `"other_mod::sys"` -> `("other_mod", "sys")`, or multi-segment
+    /// `"game::physics::step"` -> `("game", "physics::step")` or `("game::physics", "step")`
+    /// when matching `default_mod_name`) at generation `0`.
     ///
-    /// Returns `None` if either segment is empty or if multiple `"::"` separators appear.
+    /// Returns `None` if `raw` is empty or contains empty `"::"` segments.
     pub fn parse_target(raw: &str, default_mod_name: &str) -> Option<Self> {
-        if raw.is_empty() {
+        if raw.is_empty() || raw.split("::").any(str::is_empty) {
             return None;
         }
+        if !default_mod_name.is_empty()
+            && let Some(rest) = raw
+                .strip_prefix(default_mod_name)
+                .and_then(|s| s.strip_prefix("::"))
+        {
+            return Some(Self::new(default_mod_name, rest));
+        }
         if let Some((mod_part, sys_part)) = raw.split_once("::") {
-            if mod_part.is_empty() || sys_part.is_empty() || sys_part.contains("::") {
-                return None;
-            }
             Some(Self::new(mod_part, sys_part))
         } else {
             Some(Self::new(default_mod_name, raw))
@@ -263,7 +287,7 @@ impl ScheduleSetMode {
 
 /// Metadata for a decoupled [`BamSystemSet`] container configured via
 /// `host_configure_schedule_set`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ConfiguredScheduleSet {
     /// Monotonic handle allocated by [`ModScheduleSetRegistry`] (`0, 1, ...`).
     pub handle: BamSystemSet,
@@ -291,11 +315,43 @@ pub struct ConfiguredScheduleSet {
     pub before_weak: bool,
     /// When `true`, `after_sets` edges apply Bevy `.after_weak(...)` instead of `.after(...)`.
     pub after_weak: bool,
+    /// Optional context-aware C-ABI run condition (`BamScheduleSetDesc::run_if_ctx`).
+    pub run_if_ctx: Option<BamSystemFn>,
+    /// Optional read-only query clause passed to `run_if_ctx` (`BamScheduleSetDesc::run_if_query`).
+    pub run_if_query: Option<BamQuerySpecOwned>,
+    /// Opaque user context pointer forwarded to `run_if_ctx`.
+    pub run_if_ctx_user_data: GuestUserData,
+    /// Canonical parent set names (`in_set`) from `BamScheduleSetDesc::parent_sets`.
+    pub parent_sets: Vec<String>,
     /// Ordered list of mounted member systems (their scoped [`ModNamedSystemSet`]s in mount order).
     pub mounted_systems: Vec<ModNamedSystemSet>,
     /// Pre-interned handles mirroring [`Self::mounted_systems`] for lock-free hot-rewiring.
     mounted_interned: Vec<InternedSystemSet>,
 }
+
+impl PartialEq for ConfiguredScheduleSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.handle == other.handle
+            && self.mod_id == other.mod_id
+            && self.mod_name == other.mod_name
+            && self.set_name == other.set_name
+            && self.generation == other.generation
+            && self.named_set == other.named_set
+            && self.schedule == other.schedule
+            && self.mode == other.mode
+            && self.before_sets == other.before_sets
+            && self.after_sets == other.after_sets
+            && self.before_weak == other.before_weak
+            && self.after_weak == other.after_weak
+            && self.run_if_ctx.map(|f| f as usize) == other.run_if_ctx.map(|f| f as usize)
+            && self.run_if_query == other.run_if_query
+            && self.run_if_ctx_user_data == other.run_if_ctx_user_data
+            && self.parent_sets == other.parent_sets
+            && self.mounted_systems == other.mounted_systems
+    }
+}
+
+impl Eq for ConfiguredScheduleSet {}
 
 impl ConfiguredScheduleSet {
     /// Returns the canonical `"<mod_name>::<set_name>"` target string for `GuestSystem::in_sets`.
@@ -329,6 +385,35 @@ pub struct ScheduleSetConfig {
     pub before_weak: bool,
     /// When `true`, `after_sets` edges use weak ordering.
     pub after_weak: bool,
+    /// Optional context-aware run condition callback (`BamScheduleSetDesc::run_if_ctx`).
+    pub run_if_ctx: Option<BamSystemFn>,
+    /// Optional read-only query clause passed to `run_if_ctx`.
+    pub run_if_query: Option<BamQuerySpecOwned>,
+    /// Opaque user context pointer forwarded to `run_if_ctx`.
+    pub run_if_ctx_user_data: GuestUserData,
+    /// Optional parent system sets (`in_set`) from `BamScheduleSetDesc::parent_sets`.
+    pub parent_sets: Vec<String>,
+}
+
+impl Default for ScheduleSetConfig {
+    fn default() -> Self {
+        Self {
+            mod_id: None,
+            mod_name: Arc::from("unscoped"),
+            set_name: Arc::from("default"),
+            generation: 0,
+            schedule: ScheduleId::UPDATE,
+            mode: ScheduleSetMode::Parallel,
+            before_sets: Vec::new(),
+            after_sets: Vec::new(),
+            before_weak: false,
+            after_weak: false,
+            run_if_ctx: None,
+            run_if_query: None,
+            run_if_ctx_user_data: GuestUserData::NULL,
+            parent_sets: Vec::new(),
+        }
+    }
 }
 
 /// World resource tracking all dynamically configured ABI `0.3` [`BamSystemSet`] containers,
@@ -420,6 +505,10 @@ impl ModScheduleSetRegistry {
             after_sets,
             before_weak,
             after_weak,
+            run_if_ctx,
+            run_if_query,
+            run_if_ctx_user_data,
+            parent_sets,
         } = cfg;
         if self.next_handle == u32::MAX {
             return Err((
@@ -458,6 +547,21 @@ impl ModScheduleSetRegistry {
                 ),
             ));
         }
+        if self.new_node_parent_sets_would_create_cycle(
+            schedule,
+            mod_name.as_ref(),
+            set_name.as_ref(),
+            generation,
+            &parent_sets,
+        ) {
+            return Err((
+                FfiResult::CYCLE_DETECTED,
+                format!(
+                    "schedule set '{}::{}' parent_sets would create a hierarchy cycle in schedule {}",
+                    mod_name, set_name, schedule.0
+                ),
+            ));
+        }
 
         let handle = BamSystemSet::from_raw(self.next_handle);
         self.next_handle += 1;
@@ -477,6 +581,10 @@ impl ModScheduleSetRegistry {
             after_sets: dedup_after,
             before_weak,
             after_weak,
+            run_if_ctx,
+            run_if_query,
+            run_if_ctx_user_data,
+            parent_sets,
             mounted_systems: Vec::new(),
             mounted_interned: Vec::new(),
         };
@@ -539,6 +647,21 @@ impl ModScheduleSetRegistry {
                     } else {
                         i += 1;
                     }
+                }
+            }
+        }
+    }
+
+    /// Removes `system_set` from all configured sets across every schedule.
+    pub fn unmount_system_anywhere(&mut self, system_set: &ModNamedSystemSet) {
+        for entry in self.sets.iter_mut().flatten() {
+            let mut i = 0;
+            while i < entry.mounted_systems.len() {
+                if &entry.mounted_systems[i] == system_set {
+                    entry.mounted_systems.remove(i);
+                    entry.mounted_interned.remove(i);
+                } else {
+                    i += 1;
                 }
             }
         }
@@ -785,6 +908,210 @@ impl ModScheduleSetRegistry {
         }
         visited != indegree.len()
     }
+
+    /// Validates that all `parent_sets` hierarchy edges (`in_set`) among configured sets in
+    /// `schedule` are acyclic, rejecting self-parenting and multi-node cycles with
+    /// [`FfiResult::CYCLE_DETECTED`].
+    pub fn validate_parent_sets_in_schedule(
+        &self,
+        schedule: ScheduleId,
+    ) -> Result<(), (FfiResult, String)> {
+        let entries: Vec<&ConfiguredScheduleSet> = self.sets_for_schedule(schedule).collect();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let find_target_idx = |mod_name: &str, set_name: &str, prefer_gen: u64| -> Option<usize> {
+            entries
+                .iter()
+                .position(|cand| {
+                    cand.mod_name.as_ref() == mod_name
+                        && cand.set_name.as_ref() == set_name
+                        && cand.generation == prefer_gen
+                })
+                .or_else(|| {
+                    entries.iter().position(|cand| {
+                        cand.mod_name.as_ref() == mod_name && cand.set_name.as_ref() == set_name
+                    })
+                })
+        };
+
+        let n = entries.len();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut indegree: Vec<usize> = vec![0; n];
+        for (idx, entry) in entries.iter().enumerate() {
+            for parent_raw in &entry.parent_sets {
+                if parent_raw.starts_with("host::") {
+                    continue;
+                }
+                let Some(parsed) = ModNamedSystemSet::parse_target(parent_raw, &entry.mod_name)
+                else {
+                    continue;
+                };
+                let Some(parent_idx) = find_target_idx(
+                    parsed.mod_name.as_ref(),
+                    parsed.system_name.as_ref(),
+                    entry.generation,
+                ) else {
+                    continue;
+                };
+                if parent_idx == idx {
+                    return Err((
+                        FfiResult::CYCLE_DETECTED,
+                        format!(
+                            "schedule set '{}::{}' cannot list itself in parent_sets in schedule {}",
+                            entry.mod_name, entry.set_name, schedule.0
+                        ),
+                    ));
+                }
+                if !adj[parent_idx].contains(&idx) {
+                    adj[parent_idx].push(idx);
+                    indegree[idx] += 1;
+                }
+            }
+        }
+
+        let mut queue: VecDeque<usize> = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &deg)| (deg == 0).then_some(i))
+            .collect();
+        let mut visited = 0usize;
+        while let Some(cur) = queue.pop_front() {
+            visited += 1;
+            for &dst in &adj[cur] {
+                indegree[dst] -= 1;
+                if indegree[dst] == 0 {
+                    queue.push_back(dst);
+                }
+            }
+        }
+        if visited != n {
+            return Err((
+                FfiResult::CYCLE_DETECTED,
+                format!(
+                    "parent_sets hierarchy contains a cycle in schedule {}",
+                    schedule.0
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns `true` if `parent_sets` hierarchy edges among configured sets in `schedule` form
+    /// any self-loop or multi-node cycle.
+    #[inline]
+    pub fn has_parent_hierarchy_cycle(&self, schedule: ScheduleId) -> bool {
+        self.validate_parent_sets_in_schedule(schedule).is_err()
+    }
+
+    fn new_node_parent_sets_would_create_cycle(
+        &self,
+        schedule: ScheduleId,
+        mod_name: &str,
+        set_name: &str,
+        generation: u64,
+        parent_sets: &[String],
+    ) -> bool {
+        for parent_raw in parent_sets {
+            if parent_raw.starts_with("host::") {
+                continue;
+            }
+            if let Some(parsed) = ModNamedSystemSet::parse_target(parent_raw, mod_name)
+                && parsed.mod_name.as_ref() == mod_name
+                && parsed.system_name.as_ref() == set_name
+            {
+                return true;
+            }
+        }
+
+        let existing: Vec<&ConfiguredScheduleSet> = self.sets_for_schedule(schedule).collect();
+        let new_idx = existing.len();
+        let n = new_idx + 1;
+        let find_idx = |m: &str, s: &str, prefer_gen: u64| -> Option<usize> {
+            if m == mod_name && s == set_name {
+                return Some(new_idx);
+            }
+            existing
+                .iter()
+                .position(|cand| {
+                    cand.mod_name.as_ref() == m
+                        && cand.set_name.as_ref() == s
+                        && cand.generation == prefer_gen
+                })
+                .or_else(|| {
+                    existing
+                        .iter()
+                        .position(|cand| cand.mod_name.as_ref() == m && cand.set_name.as_ref() == s)
+                })
+        };
+
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut indegree: Vec<usize> = vec![0; n];
+        for (idx, entry) in existing.iter().enumerate() {
+            for parent_raw in &entry.parent_sets {
+                if parent_raw.starts_with("host::") {
+                    continue;
+                }
+                let Some(parsed) = ModNamedSystemSet::parse_target(parent_raw, &entry.mod_name)
+                else {
+                    continue;
+                };
+                let Some(parent_idx) = find_idx(
+                    parsed.mod_name.as_ref(),
+                    parsed.system_name.as_ref(),
+                    entry.generation,
+                ) else {
+                    continue;
+                };
+                if parent_idx == idx {
+                    return true;
+                }
+                if !adj[parent_idx].contains(&idx) {
+                    adj[parent_idx].push(idx);
+                    indegree[idx] += 1;
+                }
+            }
+        }
+        for parent_raw in parent_sets {
+            if parent_raw.starts_with("host::") {
+                continue;
+            }
+            let Some(parsed) = ModNamedSystemSet::parse_target(parent_raw, mod_name) else {
+                continue;
+            };
+            let Some(parent_idx) = find_idx(
+                parsed.mod_name.as_ref(),
+                parsed.system_name.as_ref(),
+                generation,
+            ) else {
+                continue;
+            };
+            if parent_idx == new_idx {
+                return true;
+            }
+            if !adj[parent_idx].contains(&new_idx) {
+                adj[parent_idx].push(new_idx);
+                indegree[new_idx] += 1;
+            }
+        }
+
+        let mut queue: VecDeque<usize> = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &deg)| (deg == 0).then_some(i))
+            .collect();
+        let mut visited = 0usize;
+        while let Some(cur) = queue.pop_front() {
+            visited += 1;
+            for &dst in &adj[cur] {
+                indegree[dst] -= 1;
+                if indegree[dst] == 0 {
+                    queue.push_back(dst);
+                }
+            }
+        }
+        visited != n
+    }
 }
 
 /// Resolves a built-in (`0..=5`) or custom (`>= 1024`) [`ScheduleId`] against `world`'s
@@ -812,6 +1139,23 @@ pub fn apply_mod_schedule_sets_to_schedule(
 ) {
     for entry in registry.sets_for_schedule(schedule_id) {
         schedule.configure_sets(entry.named_set.clone());
+
+        for parent_raw in &entry.parent_sets {
+            if let Some(parsed) = ModNamedSystemSet::parse_target(parent_raw, &entry.mod_name) {
+                let parent_gen = registry
+                    .sets_for_schedule(schedule_id)
+                    .find(|cand| {
+                        cand.mod_name == parsed.mod_name && cand.set_name == parsed.system_name
+                    })
+                    .map_or(entry.generation, |cand| cand.generation);
+                schedule.configure_sets(
+                    entry
+                        .named_set
+                        .clone()
+                        .in_set(parsed.at_generation(parent_gen)),
+                );
+            }
+        }
 
         for &target_h in &entry.before_sets {
             if let Some(target) = registry.get(target_h) {
@@ -866,6 +1210,766 @@ struct ModSchedulePassMarker(ScheduleId);
 /// `ScheduleGraph` dirty without adding or re-initializing any systems.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ModScheduleRewireMarker(ScheduleId);
+
+/// Marker set guarding idempotent `run_if_ctx` condition attachment on a dynamic [`BamSystemSet`].
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ModScheduleSetConditionMarker(BamSystemSet, u64);
+
+/// Marker set guarding idempotent `in_set` parent-set linkage on a dynamic [`BamSystemSet`].
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+struct ModScheduleSetParentMarker(BamSystemSet, u64, String);
+
+/// Read-only Bevy condition [`System`] evaluating a configured [`ScheduleSetConfig::run_if_ctx`]
+/// C-ABI predicate against an optional read-only query clause.
+struct ScheduleSetRunIfCtxCondition {
+    mod_id: Option<ModId>,
+    mod_name: Arc<str>,
+    debug_name: DebugName,
+    callback: GuestFnPtr<BamSystemFn>,
+    query_spec: Option<BamQuerySpecOwned>,
+    query_group: Option<CachedQueryGroup>,
+    user_data: GuestUserData,
+    snapshot: Arc<RegistrySnapshot>,
+    is_active: Arc<AtomicBool>,
+    access: SystemAccess,
+    last_run: Tick,
+    this_run: Tick,
+    init_error: bool,
+    last_error_buf: String,
+}
+
+impl ScheduleSetRunIfCtxCondition {
+    fn new(entry: &ConfiguredScheduleSet, callback: BamSystemFn) -> Self {
+        let debug_name = DebugName::owned(format!(
+            "bam_set_run_if_ctx({}::{})",
+            entry.mod_name, entry.set_name
+        ));
+        Self {
+            mod_id: entry.mod_id,
+            mod_name: Arc::clone(&entry.mod_name),
+            debug_name,
+            callback: GuestFnPtr(callback),
+            query_spec: entry.run_if_query.clone(),
+            query_group: entry.run_if_query.clone().map(CachedQueryGroup::new),
+            user_data: entry.run_if_ctx_user_data,
+            snapshot: Arc::new(RegistrySnapshot::default()),
+            is_active: Arc::new(AtomicBool::new(true)),
+            access: SystemAccess::None,
+            last_run: Tick::new(0),
+            this_run: Tick::new(0),
+            init_error: false,
+            last_error_buf: String::new(),
+        }
+    }
+}
+
+impl System for ScheduleSetRunIfCtxCondition {
+    type In = ();
+    type Out = bool;
+
+    fn name(&self) -> DebugName {
+        self.debug_name.clone()
+    }
+
+    fn flags(&self) -> SystemStateFlags {
+        SystemStateFlags::empty()
+    }
+
+    fn default_system_sets(&self) -> Vec<InternedSystemSet> {
+        Vec::new()
+    }
+
+    fn initialize(&mut self, world: &mut World) -> SystemAccess {
+        self.this_run = world.change_tick();
+        self.last_run = Tick::new(world.change_tick().get().wrapping_sub(Tick::MAX.get()));
+        self.init_error = false;
+        self.access = SystemAccess::None;
+
+        if let Some(world_reg) = world.get_resource::<ModRegistry>() {
+            self.snapshot = world_reg.snapshot_arc();
+        }
+        if let Some(mod_id) = self.mod_id {
+            let active = world
+                .get_resource::<ModHost>()
+                .and_then(|h| h.get_mod(mod_id))
+                .map(crate::loader::LoadedMod::is_active_flag)
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+            self.is_active = active;
+        }
+
+        if let Some(ref spec) = self.query_spec {
+            if spec.terms.iter().any(|term| term.mode.is_mutable()) {
+                self.init_error = true;
+                return self.access.clone();
+            }
+            let mut group = self
+                .query_group
+                .take()
+                .unwrap_or_else(|| CachedQueryGroup::new(spec.clone()));
+            match initialize_query_groups_in_world_with_base_idx(
+                world,
+                &self.snapshot,
+                core::slice::from_mut(&mut group),
+                usize::MAX,
+            ) {
+                Ok(access_set) => {
+                    group.update_archetypes(world.as_unsafe_world_cell());
+                    self.query_group = Some(group);
+                    self.access = SystemAccess::Shared(access_set);
+                }
+                Err(_) => {
+                    self.init_error = true;
+                    self.query_group = None;
+                }
+            }
+        }
+        self.access.clone()
+    }
+
+    /// Evaluates this schedule-set `run_if_ctx` predicate over scheduler-verified read-only
+    /// `UnsafeWorldCell` borrows.
+    ///
+    /// # Safety
+    /// Caller (Bevy's schedule executor) must ensure `world` grants all read accesses declared in
+    /// `self.access` returned by `System::initialize`, and that `run_unsafe` is not invoked
+    /// concurrently with overlapping mutable accesses to the same `ScheduleSetRunIfCtxCondition`
+    /// instance or the world data it reads.
+    unsafe fn run_unsafe(
+        &mut self,
+        _input: SystemIn<'_, Self>,
+        world: UnsafeWorldCell,
+    ) -> Result<Self::Out, RunSystemError> {
+        if self.init_error || !self.is_active.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+
+        let current_tick = world.change_tick();
+        self.this_run = current_tick;
+        let last_run = self.last_run;
+
+        let cond_gen = crate::handle_header::next_non_zero_generation();
+        let mut iter_storage = if let Some(ref mut group) = self.query_group {
+            group.update_archetypes(world);
+            // SAFETY: Scheduler guarantees read-only access declared in `self.access`.
+            let (count, mut iters, views) = unsafe {
+                build_query_slot_iters_bucketed::<1>(
+                    world,
+                    core::slice::from_mut(group),
+                    last_run,
+                    current_tick,
+                    cond_gen,
+                )
+            };
+            Some((count, iters[0].take(), views))
+        } else {
+            None
+        };
+
+        let mut iter_ptrs: [*mut BamIter; 1] = [core::ptr::null_mut(); 1];
+        let mut query_views: [Option<RandomQueryView<'_>>; 1] = [None; 1];
+        let mut cond_query_count = 0usize;
+        if let Some((count, ref mut first_iter, views)) = iter_storage {
+            cond_query_count = count;
+            if let Some(it) = first_iter.as_mut() {
+                iter_ptrs[0] = it.as_ffi_ptr();
+            }
+            query_views = views;
+        }
+
+        let err_buf = core::mem::take(&mut self.last_error_buf);
+        let host_ctx = HostContext::with_error_buffer(Arc::clone(&self.snapshot), err_buf)
+            .with_namespace(Some(Arc::clone(&self.mod_name)));
+        let mut sys_ctx = HostSystemCtx::new_reused_full(
+            host_ctx,
+            cond_gen,
+            &iter_ptrs[..cond_query_count],
+            &query_views[..cond_query_count],
+            core::ptr::null_mut(),
+            (world, last_run, current_tick),
+            (&[], Vec::new(), Vec::new()),
+        );
+        let sys_ctx_ptr = sys_ctx.as_ffi_ptr();
+        let GuestFnPtr(cond_fn) = self.callback;
+        // SAFETY: Invoking read-only C-ABI `run_if_ctx` predicate with stack-scoped
+        // `HostSystemCtx` (`commands_ptr = null`) while `self.is_active` is armed.
+        let status = unsafe { cond_fn(sys_ctx_ptr, self.user_data.as_ptr()) };
+        self.last_error_buf = sys_ctx.reclaim_error_buffer();
+        self.last_run = current_tick;
+
+        Ok(status.is_ok())
+    }
+
+    fn apply_deferred(&mut self, _world: &mut World) {}
+
+    fn queue_deferred(&mut self, _world: DeferredWorld) {}
+
+    fn check_change_tick(&mut self, check: CheckChangeTicks) {
+        self.last_run.check_tick(check);
+        self.this_run.check_tick(check);
+    }
+
+    fn get_last_run(&self) -> Tick {
+        self.last_run
+    }
+
+    fn set_last_run(&mut self, last_run: Tick) {
+        self.last_run = last_run;
+    }
+}
+
+// SAFETY: `ScheduleSetRunIfCtxCondition` validates all terms are non-mutable in `initialize()`,
+// provides no `BamCommands` handle (`commands_ptr = null`), and only performs read-only queries.
+unsafe impl ReadOnlySystem for ScheduleSetRunIfCtxCondition {}
+
+type PendingParentEdge = (
+    ModNamedSystemSet,
+    InternedSystemSet,
+    InternedSystemSet,
+    ModScheduleSetParentMarker,
+);
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+enum SimSetId {
+    Existing(SystemSetKey),
+    Pending(usize),
+}
+
+impl GraphNodeId for SimSetId {
+    type Adjacent = (SimSetId, Direction);
+    type Edge = (SimSetId, SimSetId);
+
+    fn kind(&self) -> &'static str {
+        "system set"
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+enum SimNodeId {
+    System(SystemKey),
+    Set(SimSetId),
+}
+
+impl GraphNodeId for SimNodeId {
+    type Adjacent = (SimNodeId, Direction);
+    type Edge = (SimNodeId, SimNodeId);
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::System(_) => "system",
+            Self::Set(_) => "system set",
+        }
+    }
+}
+
+impl From<SimSetId> for SimNodeId {
+    #[inline]
+    fn from(value: SimSetId) -> Self {
+        Self::Set(value)
+    }
+}
+
+impl From<SystemKey> for SimNodeId {
+    #[inline]
+    fn from(value: SystemKey) -> Self {
+        Self::System(value)
+    }
+}
+
+impl TryFrom<SimNodeId> for SimSetId {
+    type Error = SystemKey;
+
+    #[inline]
+    fn try_from(value: SimNodeId) -> Result<Self, Self::Error> {
+        match value {
+            SimNodeId::Set(s) => Ok(s),
+            SimNodeId::System(sys) => Err(sys),
+        }
+    }
+}
+
+impl TryFrom<SimNodeId> for SystemKey {
+    type Error = SimSetId;
+
+    #[inline]
+    fn try_from(value: SimNodeId) -> Result<Self, Self::Error> {
+        match value {
+            SimNodeId::System(sys) => Ok(sys),
+            SimNodeId::Set(s) => Err(s),
+        }
+    }
+}
+
+fn collect_pending_parent_sets(
+    world: &World,
+    registry: &ModScheduleSetRegistry,
+    schedule_id: ScheduleId,
+    schedule: &Schedule,
+) -> Vec<PendingParentEdge> {
+    let visible_sets = world.get_resource::<ModVisibleSets>();
+    let mod_host = world.get_resource::<ModHost>();
+    let system_sets = &schedule.graph().system_sets;
+    let mut pending_parents = Vec::new();
+
+    for entry in registry.sets_for_schedule(schedule_id) {
+        for parent_raw in &entry.parent_sets {
+            let parent_marker =
+                ModScheduleSetParentMarker(entry.handle, entry.generation, parent_raw.clone());
+            if system_sets.contains(parent_marker.clone()) {
+                continue;
+            }
+            let parent_interned = if let Some(stripped) = parent_raw.strip_prefix("host::") {
+                visible_sets.and_then(|sets| sets.resolve(stripped))
+            } else if let Some(parsed) =
+                ModNamedSystemSet::parse_target(parent_raw, &entry.mod_name)
+            {
+                let target_gen = if parsed.mod_name == entry.mod_name {
+                    registry
+                        .sets_for_schedule(schedule_id)
+                        .find(|cand| {
+                            cand.mod_name == parsed.mod_name && cand.set_name == parsed.system_name
+                        })
+                        .map_or(entry.generation, |cand| cand.generation)
+                } else {
+                    mod_host
+                        .map(|h| h.mod_generation(parsed.mod_name.as_ref()))
+                        .unwrap_or(0)
+                };
+                Some(parsed.at_generation(target_gen).intern())
+            } else {
+                None
+            };
+            if let Some(parent) = parent_interned {
+                pending_parents.push((
+                    entry.named_set.clone(),
+                    entry.interned_set,
+                    parent,
+                    parent_marker,
+                ));
+            }
+        }
+    }
+    pending_parents
+}
+
+fn prevalidate_mod_schedule_set_rewire_inner(
+    world: &World,
+    registry: &ModScheduleSetRegistry,
+    schedule_id: ScheduleId,
+    schedule: &Schedule,
+    pending_parents: &[PendingParentEdge],
+) -> Result<(), ScheduleBuildError> {
+    if registry.has_parent_hierarchy_cycle(schedule_id) {
+        return Err(ScheduleBuildError::HierarchySort(
+            DiGraphToposortError::Cycle(Vec::new()),
+        ));
+    }
+
+    let graph = schedule.graph();
+    let mod_host = world.get_resource::<ModHost>();
+
+    let mut pending_interned_map: HashMap<InternedSystemSet, SimSetId> = HashMap::default();
+    let mut next_pending_idx = 0usize;
+    let mut ensure_sim_set = |interned: InternedSystemSet| -> SimSetId {
+        if let Some(key) = graph.system_sets.get_key(interned)
+            && graph.system_sets.get(key).is_some()
+        {
+            return SimSetId::Existing(key);
+        }
+        *pending_interned_map.entry(interned).or_insert_with(|| {
+            let id = SimSetId::Pending(next_pending_idx);
+            next_pending_idx += 1;
+            id
+        })
+    };
+
+    let to_sim_node = |node: NodeId| -> SimNodeId {
+        match node {
+            NodeId::System(k) => SimNodeId::System(k),
+            NodeId::Set(k) => SimNodeId::Set(SimSetId::Existing(k)),
+        }
+    };
+    let to_node_id = |node: SimNodeId| -> Option<NodeId> {
+        match node {
+            SimNodeId::System(k) => Some(NodeId::System(k)),
+            SimNodeId::Set(SimSetId::Existing(k)) => Some(NodeId::Set(k)),
+            SimNodeId::Set(SimSetId::Pending(_)) => None,
+        }
+    };
+
+    let mut sim_hierarchy: Dag<SimNodeId> = Dag::new();
+    for n in graph.hierarchy().graph().nodes() {
+        sim_hierarchy.add_node(to_sim_node(n));
+    }
+    for (a, b) in graph.hierarchy().graph().all_edges() {
+        sim_hierarchy.add_edge(to_sim_node(a), to_sim_node(b));
+    }
+
+    let mut sim_dependency: Dag<SimNodeId> = Dag::new();
+    for n in graph.dependency().graph().nodes() {
+        let sn = to_sim_node(n);
+        sim_hierarchy.add_node(sn);
+        sim_dependency.add_node(sn);
+    }
+    for (a, b) in graph.dependency().graph().all_edges() {
+        sim_dependency.add_edge(to_sim_node(a), to_sim_node(b));
+    }
+
+    for entry in registry.sets_for_schedule(schedule_id) {
+        let sim_set = ensure_sim_set(entry.interned_set);
+        sim_hierarchy.add_node(SimNodeId::Set(sim_set));
+        sim_dependency.add_node(SimNodeId::Set(sim_set));
+    }
+    for (_, child_interned, parent_interned, _) in pending_parents {
+        let child_sim = ensure_sim_set(*child_interned);
+        let parent_sim = ensure_sim_set(*parent_interned);
+        sim_hierarchy.add_edge(SimNodeId::Set(parent_sim), SimNodeId::Set(child_sim));
+        sim_dependency.add_node(SimNodeId::Set(parent_sim));
+        sim_dependency.add_node(SimNodeId::Set(child_sim));
+    }
+
+    let map_toposort_err = |err: DiGraphToposortError<SimNodeId>| -> DiGraphToposortError<NodeId> {
+        match err {
+            DiGraphToposortError::Loop(n) => to_node_id(n).map_or_else(
+                || DiGraphToposortError::Cycle(Vec::new()),
+                DiGraphToposortError::Loop,
+            ),
+            DiGraphToposortError::Cycle(cycles) => {
+                let mapped: Vec<Vec<NodeId>> = cycles
+                    .into_iter()
+                    .filter_map(|cycle| {
+                        let nodes: Vec<NodeId> = cycle.into_iter().filter_map(to_node_id).collect();
+                        (!nodes.is_empty()).then_some(nodes)
+                    })
+                    .collect();
+                DiGraphToposortError::Cycle(mapped)
+            }
+        }
+    };
+
+    let hierarchy_analysis = sim_hierarchy
+        .analyze()
+        .map_err(|err| ScheduleBuildError::HierarchySort(map_toposort_err(err)))?;
+
+    if schedule.get_build_settings().hierarchy_detection == LogLevel::Error
+        && let Err(e) = hierarchy_analysis.check_for_redundant_edges()
+    {
+        let mapped_edges: Vec<(NodeId, NodeId)> =
+            e.0.into_iter()
+                .filter_map(|(a, b)| Some((to_node_id(a)?, to_node_id(b)?)))
+                .collect();
+        return Err(
+            ScheduleBuildWarning::HierarchyRedundancy(DagRedundancyError(mapped_edges)).into(),
+        );
+    }
+    sim_hierarchy.remove_redundant_edges(&hierarchy_analysis);
+
+    let dependency_analysis = sim_dependency
+        .analyze()
+        .map_err(|err| ScheduleBuildError::DependencySort(map_toposort_err(err)))?;
+
+    if let Err(DagCrossDependencyError(a, b)) =
+        dependency_analysis.check_for_cross_dependencies(&hierarchy_analysis)
+    {
+        if let (Some(na), Some(nb)) = (to_node_id(a), to_node_id(b)) {
+            return Err(ScheduleBuildError::CrossDependency(
+                DagCrossDependencyError(na, nb),
+            ));
+        }
+        return Err(ScheduleBuildError::HierarchySort(
+            DiGraphToposortError::Cycle(Vec::new()),
+        ));
+    }
+
+    let set_systems = sim_hierarchy
+        .group_by_key::<SimSetId, SystemKey>(graph.system_sets.len() + next_pending_idx)
+        .map_err(|err| ScheduleBuildError::HierarchySort(map_toposort_err(err)))?;
+
+    if let Err(DagOverlappingGroupError(a, b)) =
+        dependency_analysis.check_for_overlapping_groups(&set_systems)
+    {
+        if let (SimSetId::Existing(ka), SimSetId::Existing(kb)) = (a, b) {
+            return Err(ScheduleBuildError::SetsHaveOrderButIntersect(
+                DagOverlappingGroupError(ka, kb),
+            ));
+        }
+        return Err(ScheduleBuildError::HierarchySort(
+            DiGraphToposortError::Cycle(Vec::new()),
+        ));
+    }
+
+    let mut flat_dependency = set_systems.flatten(sim_dependency, |_, _, _, _| {});
+
+    let resolve_sim_set_key =
+        |set: &ModNamedSystemSet, interned: InternedSystemSet| -> Option<SimSetId> {
+            if let Some(key) = graph.system_sets.get_key(interned)
+                && graph.system_sets.get(key).is_some()
+            {
+                return Some(SimSetId::Existing(key));
+            }
+            if let Some(&sim_key) = pending_interned_map.get(&interned) {
+                return Some(sim_key);
+            }
+            if let Some(host) = mod_host {
+                let live_gen = host.mod_generation(set.mod_name.as_ref());
+                if live_gen != set.generation {
+                    let alt = set.clone().at_generation(live_gen);
+                    let alt_interned = alt.intern();
+                    if let Some(key) = graph.system_sets.get_key(alt_interned)
+                        && graph.system_sets.get(key).is_some()
+                    {
+                        return Some(SimSetId::Existing(key));
+                    }
+                    if let Some(&sim_key) = pending_interned_map.get(&alt_interned) {
+                        return Some(sim_key);
+                    }
+                }
+            }
+            None
+        };
+
+    let systems_in_sim_set = |sim_key: SimSetId| -> Vec<SystemKey> {
+        set_systems
+            .get(&sim_key)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    };
+
+    let mut strict_edges: Vec<(SystemKey, SystemKey)> = Vec::new();
+    let mut weak_edges: Vec<(SystemKey, SystemKey)> = Vec::new();
+
+    for entry in registry.sets_for_schedule(schedule_id) {
+        let own_systems: Vec<SystemKey> = resolve_sim_set_key(&entry.named_set, entry.interned_set)
+            .map(systems_in_sim_set)
+            .unwrap_or_default();
+
+        if !own_systems.is_empty() {
+            for &target_h in &entry.before_sets {
+                let Some(target) = registry.get(target_h) else {
+                    continue;
+                };
+                let Some(target_key) = resolve_sim_set_key(&target.named_set, target.interned_set)
+                else {
+                    continue;
+                };
+                let target_systems = systems_in_sim_set(target_key);
+                let bucket = if entry.before_weak {
+                    &mut weak_edges
+                } else {
+                    &mut strict_edges
+                };
+                for &src in &own_systems {
+                    for &dst in &target_systems {
+                        if src != dst {
+                            bucket.push((src, dst));
+                        }
+                    }
+                }
+            }
+
+            for &target_h in &entry.after_sets {
+                let Some(target) = registry.get(target_h) else {
+                    continue;
+                };
+                let Some(target_key) = resolve_sim_set_key(&target.named_set, target.interned_set)
+                else {
+                    continue;
+                };
+                let target_systems = systems_in_sim_set(target_key);
+                let bucket = if entry.after_weak {
+                    &mut weak_edges
+                } else {
+                    &mut strict_edges
+                };
+                for &prev in &target_systems {
+                    for &dst in &own_systems {
+                        if prev != dst {
+                            bucket.push((prev, dst));
+                        }
+                    }
+                }
+            }
+        }
+
+        match entry.mode {
+            ScheduleSetMode::Parallel => {}
+            ScheduleSetMode::Sequence | ScheduleSetMode::SequenceWeak => {
+                let resolved_members: Vec<Vec<SystemKey>> = entry
+                    .mounted_systems
+                    .iter()
+                    .zip(entry.mounted_interned.iter().copied())
+                    .filter_map(|(member_set, member_interned)| {
+                        let key = resolve_sim_set_key(member_set, member_interned)?;
+                        let systems = systems_in_sim_set(key);
+                        (!systems.is_empty()).then_some(systems)
+                    })
+                    .collect();
+                let bucket = if entry.mode == ScheduleSetMode::SequenceWeak {
+                    &mut weak_edges
+                } else {
+                    &mut strict_edges
+                };
+                for pair in resolved_members.windows(2) {
+                    for &src in &pair[0] {
+                        for &dst in &pair[1] {
+                            if src != dst {
+                                bucket.push((src, dst));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (from, to) in strict_edges {
+        flat_dependency.add_edge(from, to);
+    }
+    for (from, to) in weak_edges {
+        flat_dependency.add_edge(from, to);
+    }
+
+    flat_dependency
+        .analyze()
+        .map_err(ScheduleBuildError::FlatDependencySort)?;
+
+    Ok(())
+}
+
+/// Performs non-mutating pre-validation of `registry`'s `parent_sets` (`in_set`) and
+/// [`ModScheduleSetRewirePass`] edges for `schedule_id` against `schedule`'s existing
+/// `ScheduleGraph` without calling `schedule.configure_sets(...)`.
+pub fn prevalidate_mod_schedule_set_rewire_in_schedule(
+    world: &World,
+    registry: &ModScheduleSetRegistry,
+    schedule_id: ScheduleId,
+    schedule: &Schedule,
+) -> Result<(), ScheduleBuildError> {
+    let pending_parents = collect_pending_parent_sets(world, registry, schedule_id, schedule);
+    prevalidate_mod_schedule_set_rewire_inner(
+        world,
+        registry,
+        schedule_id,
+        schedule,
+        &pending_parents,
+    )
+}
+
+/// Performs non-mutating pre-validation of `registry`'s `parent_sets` (`in_set`) and
+/// [`ModScheduleSetRewirePass`] edges for `schedule_id` against the matching [`Schedule`] in
+/// `world`'s [`Schedules`] resource (or a temporary empty schedule if absent) without mutating
+/// `world` or any live [`ScheduleGraph`].
+pub fn prevalidate_mod_schedule_set_rewire_in_world(
+    world: &World,
+    registry: &ModScheduleSetRegistry,
+    schedule_id: ScheduleId,
+) -> Result<(), ScheduleBuildError> {
+    let Some(label) = resolve_schedule_id_in_world(world, schedule_id) else {
+        return Ok(());
+    };
+    if let Some(schedules) = world.get_resource::<Schedules>()
+        && let Some(schedule) = schedules.get(label)
+    {
+        return prevalidate_mod_schedule_set_rewire_in_schedule(
+            world,
+            registry,
+            schedule_id,
+            schedule,
+        );
+    }
+    let empty_schedule = Schedule::new(label);
+    prevalidate_mod_schedule_set_rewire_in_schedule(world, registry, schedule_id, &empty_schedule)
+}
+
+/// Validates and synchronizes `parent_sets` (`in_set`) and `run_if_ctx` conditions from
+/// [`ModScheduleSetRegistry`] onto `schedule` prior to [`Schedule::initialize`], refusing to
+/// mutate `schedule` if `parent_sets` or projected [`ModScheduleSetRewirePass`] edges fail
+/// validation (`HierarchySort`, `CrossDependency`, `SetsHaveOrderButIntersect`, or
+/// `FlatDependencySort`).
+pub fn try_sync_mod_schedule_set_configs_to_schedule(
+    world: &World,
+    schedule_id: ScheduleId,
+    schedule: &mut Schedule,
+) -> Result<(), ScheduleBuildError> {
+    let Some(registry) = world.get_resource::<ModScheduleSetRegistry>() else {
+        return Ok(());
+    };
+    if registry.has_parent_hierarchy_cycle(schedule_id) {
+        return Err(ScheduleBuildError::HierarchySort(
+            DiGraphToposortError::Cycle(Vec::new()),
+        ));
+    }
+
+    let pending_parents = collect_pending_parent_sets(world, registry, schedule_id, schedule);
+    let mut has_unregistered_set = false;
+    let mut has_pending_condition = false;
+    {
+        let system_sets = &schedule.graph().system_sets;
+        for entry in registry.sets_for_schedule(schedule_id) {
+            let is_present = system_sets
+                .get_key(entry.interned_set)
+                .is_some_and(|key| system_sets.get(key).is_some());
+            if !is_present {
+                has_unregistered_set = true;
+            }
+            if entry.run_if_ctx.is_some()
+                && !system_sets.contains(ModScheduleSetConditionMarker(
+                    entry.handle,
+                    entry.generation,
+                ))
+            {
+                has_pending_condition = true;
+            }
+        }
+    }
+
+    if !pending_parents.is_empty() || has_unregistered_set || has_pending_condition {
+        prevalidate_mod_schedule_set_rewire_inner(
+            world,
+            registry,
+            schedule_id,
+            schedule,
+            &pending_parents,
+        )?;
+    }
+
+    for entry in registry.sets_for_schedule(schedule_id) {
+        let is_present = schedule
+            .graph()
+            .system_sets
+            .get_key(entry.interned_set)
+            .is_some_and(|key| schedule.graph().system_sets.get(key).is_some());
+        if !is_present {
+            schedule.configure_sets(entry.named_set.clone());
+        }
+        if let Some(cond_fn) = entry.run_if_ctx {
+            let cond_marker = ModScheduleSetConditionMarker(entry.handle, entry.generation);
+            if !schedule.graph().system_sets.contains(cond_marker) {
+                let cond = ScheduleSetRunIfCtxCondition::new(entry, cond_fn);
+                schedule.configure_sets((entry.named_set.clone().run_if(cond), cond_marker));
+            }
+        }
+    }
+    for (named_set, _, parent, parent_marker) in pending_parents {
+        schedule.configure_sets((named_set.in_set(parent), parent_marker));
+    }
+    Ok(())
+}
+
+/// Synchronizes `parent_sets` (`in_set`) and `run_if_ctx` conditions from
+/// [`ModScheduleSetRegistry`] onto `schedule` prior to [`Schedule::initialize`].
+pub fn sync_mod_schedule_set_configs_to_schedule(
+    world: &World,
+    schedule_id: ScheduleId,
+    schedule: &mut Schedule,
+) {
+    if let Err(err) = try_sync_mod_schedule_set_configs_to_schedule(world, schedule_id, schedule) {
+        tracing::error!(
+            schedule_id = schedule_id.0,
+            error = ?err,
+            "refusing to apply cyclic parent_sets onto ScheduleGraph"
+        );
+    }
+}
 
 /// Bevy `0.20` [`ScheduleBuildPass`] that materializes [`ModScheduleSetRegistry`] inter-set edges
 /// (`before`/`before_weak`/`after`/`after_weak`) and intra-set ordering modes (`SEQUENCE` /
@@ -1365,7 +2469,12 @@ pub fn mount_mod_systems_in_world(
             .and_then(|mut s| s.remove_temporarily(label));
         if let Some(mut schedule) = removed {
             install_mod_schedule_set_pass(&mut schedule, sched_id);
-            let res = schedule.initialize(world);
+            let res =
+                match try_sync_mod_schedule_set_configs_to_schedule(world, sched_id, &mut schedule)
+                {
+                    Ok(()) => schedule.initialize(world),
+                    Err(err) => Err(err),
+                };
             if let Some(mut schedules) = world.get_resource_mut::<Schedules>() {
                 schedules.reinsert(schedule);
             }
@@ -1383,6 +2492,7 @@ pub fn rewire_mod_schedule_sets_in_schedule(
     schedule_id: ScheduleId,
     schedule: &mut Schedule,
 ) -> Result<Option<ScheduleBuildMetadata>, ScheduleBuildError> {
+    try_sync_mod_schedule_set_configs_to_schedule(world, schedule_id, schedule)?;
     install_mod_schedule_set_pass(schedule, schedule_id);
     // Touching an empty sentinel set flips `ScheduleGraph::changed = true` in O(1) while leaving
     // `ScheduleGraph::systems.uninit` empty so zero `GuestSystem::initialize` calls occur.

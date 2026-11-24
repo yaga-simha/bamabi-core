@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "asymmetric_rust_mod"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bamabi_guest",
  "bamabi_sys",
@@ -12,8 +12,8 @@ dependencies = [
 
 [[package]]
 name = "bamabi_guest"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#23053a118f530112e729fa6252a9070cf9f169a9"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#215fc46f213d760c5f167d3f7841d69a55697ab3"
 dependencies = [
  "bamabi_guest_sys",
  "bamabi_macros",
@@ -22,17 +22,18 @@ dependencies = [
 
 [[package]]
 name = "bamabi_guest_sys"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#23053a118f530112e729fa6252a9070cf9f169a9"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#215fc46f213d760c5f167d3f7841d69a55697ab3"
 dependencies = [
  "bamabi_sys",
 ]
 
 [[package]]
 name = "bamabi_macros"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#23053a118f530112e729fa6252a9070cf9f169a9"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#215fc46f213d760c5f167d3f7841d69a55697ab3"
 dependencies = [
+ "bamabi_schema",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -40,9 +41,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamabi_schema"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#215fc46f213d760c5f167d3f7841d69a55697ab3"
+
+[[package]]
 name = "bamabi_sys"
-version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#23053a118f530112e729fa6252a9070cf9f169a9"
+version = "0.4.0"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#215fc46f213d760c5f167d3f7841d69a55697ab3"
+dependencies = [
+ "bamabi_schema",
+]
 
 [[package]]
 name = "equivalent"
@@ -52,9 +61,9 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "hashbrown"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 
 [[package]]
 name = "indexmap"
@@ -152,9 +161,9 @@ dependencies = [
 
 [[package]]
 name = "toml_edit"
-version = "0.25.19+spec-1.1.0"
+version = "0.25.20+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd43688c4858d7264ae1cf9a9f874a67c3feb74a883b1cd7bebd6a4ea8307218"
+checksum = "e76360e201d6dbd6583e17795ba71a88f47365a9139c8450a7979c32303b8e73"
 dependencies = [
  "indexmap",
  "toml_datetime",
@@ -164,9 +173,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.5+spec-1.1.0"
+version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
+checksum = "e6769c452d71ba30696c6b37770c439a9cc9110f47f7d5cdbeda79840ef5ea31"
 dependencies = [
  "winnow",
 ]

@@ -137,7 +137,7 @@ fn asset_and_scene_guard_branches_and_backends() {
             host_asset_load(
                 ctx_no.as_ffi_ptr(),
                 asset_h,
-                StrView::from_str("a.png"),
+                &StrView::from_str("a.png"),
                 null_mut()
             ),
             FfiResult::NULL_POINTER
@@ -146,7 +146,7 @@ fn asset_and_scene_guard_branches_and_backends() {
             host_asset_load(
                 ctx_no.as_ffi_ptr(),
                 asset_h,
-                StrView::from_str("a.png"),
+                &StrView::from_str("a.png"),
                 unaligned_u8.cast::<FfiAssetHandle>(),
             ),
             FfiResult::INVALID_ARGUMENT
@@ -155,29 +155,42 @@ fn asset_and_scene_guard_branches_and_backends() {
             host_asset_load(
                 null(),
                 asset_h,
-                StrView::from_str("a.png"),
+                &StrView::from_str("a.png"),
                 &raw mut out_handle
             ),
             FfiResult::NULL_POINTER
         );
         assert_eq!(
+            host_asset_load(ctx_no.as_ffi_ptr(), asset_h, null(), &raw mut out_handle),
+            FfiResult::NULL_POINTER
+        );
+        assert_eq!(
+            host_asset_load(
+                ctx_no.as_ffi_ptr(),
+                asset_h,
+                unaligned_u8.cast::<StrView>(),
+                &raw mut out_handle
+            ),
+            FfiResult::INVALID_ARGUMENT
+        );
+        assert_eq!(
             host_asset_load(
                 poisoned_ptr,
                 asset_h,
-                StrView::from_str("a.png"),
+                &StrView::from_str("a.png"),
                 &raw mut out_handle
             ),
             FfiResult::INVALID_STATE
         );
         assert_eq!(
-            host_asset_load(ctx_no.as_ffi_ptr(), asset_h, bad_utf8, &raw mut out_handle),
+            host_asset_load(ctx_no.as_ffi_ptr(), asset_h, &bad_utf8, &raw mut out_handle),
             FfiResult::INVALID_UTF8
         );
         assert_eq!(
             host_asset_load(
                 ctx_no.as_ffi_ptr(),
                 asset_h,
-                StrView::from_str(""),
+                &StrView::from_str(""),
                 &raw mut out_handle
             ),
             FfiResult::INVALID_ARGUMENT
@@ -186,7 +199,7 @@ fn asset_and_scene_guard_branches_and_backends() {
             host_asset_load(
                 ctx_no.as_ffi_ptr(),
                 asset_h,
-                StrView::from_str("a.png"),
+                &StrView::from_str("a.png"),
                 &raw mut out_handle
             ),
             FfiResult::UNSUPPORTED
@@ -275,7 +288,7 @@ fn asset_and_scene_guard_branches_and_backends() {
             host_asset_load(
                 ctx_fail.as_ffi_ptr(),
                 asset_h,
-                StrView::from_str("missing.png"),
+                &StrView::from_str("missing.png"),
                 &raw mut out_handle
             ),
             FfiResult::NOT_FOUND
@@ -294,7 +307,7 @@ fn asset_and_scene_guard_branches_and_backends() {
             host_asset_load(
                 ctx_ok.as_ffi_ptr(),
                 asset_h,
-                StrView::from_str("ok.png"),
+                &StrView::from_str("ok.png"),
                 &raw mut out_handle
             ),
             FfiResult::OK

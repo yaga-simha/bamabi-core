@@ -9,6 +9,11 @@ use bamabi_host_sys::{
     BudgetWatchdogAction, CommandQuotaLimits, GuestSystemRunMetrics, ModBudgetHook,
     ModBudgetRuntime, ModId, ModQuarantine,
 };
+use bamabi_sys::{
+    SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC, ScheduleId, SystemTelemetryDigest64,
+    TELEMETRY_FLAG_BUDGET_BREACHED, TELEMETRY_FLAG_QUARANTINED, TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE,
+    fnv1a_64_hash_system,
+};
 use bevy_app::App;
 use bevy_ecs::change_detection::DetectChanges;
 use bevy_ecs::message::{Message, Messages};
@@ -17,7 +22,7 @@ use bevy_ecs::system::{Res, ResMut};
 use bevy_ecs::world::World;
 use bevy_platform::collections::HashMap;
 use core::fmt;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -361,6 +366,57 @@ pub struct ModBudgetSnapshot {
     pub quarantined: bool,
 }
 
+impl ModBudgetSnapshot {
+    /// Encodes this snapshot into a canonical 64-byte `"BAMT"` telemetry digest frame.
+    #[must_use]
+    pub fn to_telemetry_digest64(
+        &self,
+        mod_name: &str,
+        system_name: &str,
+        schedule_id: ScheduleId,
+        flags: u16,
+    ) -> SystemTelemetryDigest64 {
+        let _ = schedule_id;
+        let effective_mod = if mod_name.is_empty() {
+            self.mod_name.as_str()
+        } else {
+            mod_name
+        };
+        let effective_sys = if system_name.is_empty() {
+            self.system_name.as_str()
+        } else {
+            system_name
+        };
+        let mut combined_flags = flags;
+        if self.quarantined {
+            combined_flags |= TELEMETRY_FLAG_QUARANTINED;
+        }
+        if self.skipped_summary_tick_tables > 0 {
+            combined_flags |= TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE;
+        }
+        if self.breach_count > 0 {
+            combined_flags |= TELEMETRY_FLAG_BUDGET_BREACHED;
+        }
+        SystemTelemetryDigest64 {
+            magic: SYSTEM_TELEMETRY_MAGIC,
+            version: SYSTEM_TELEMETRY_DIGEST_VERSION,
+            flags: combined_flags,
+            mod_id: self.mod_id.map_or(0, |id| id.0),
+            system_hash: fnv1a_64_hash_system(effective_mod, effective_sys),
+            frame_seq: 0,
+            matched_entities: u32::try_from(self.matched_entities).unwrap_or(u32::MAX),
+            matched_tables: u32::try_from(self.matched_tables).unwrap_or(u32::MAX),
+            skipped_summary_tick_tables: u32::try_from(self.skipped_summary_tick_tables)
+                .unwrap_or(u32::MAX),
+            chunks: u32::try_from(self.chunks_yielded).unwrap_or(u32::MAX),
+            p50_us: u32::try_from(self.p50_us).unwrap_or(u32::MAX),
+            p99_us: u32::try_from(self.p99_us).unwrap_or(u32::MAX),
+            commands_queued: u32::try_from(self.commands_queued).unwrap_or(u32::MAX),
+            reserved: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SystemBudgetKey {
     mod_id: Option<ModId>,
@@ -436,16 +492,34 @@ impl LatencyWindow {
         if n == 0 {
             return (0, 0);
         }
+        if n == 1 {
+            let v = self.samples[0];
+            return (v, v);
+        }
         self.scratch.clear();
         self.scratch.extend_from_slice(&self.samples);
-        self.scratch.sort_unstable();
         let p50_idx = (n.saturating_mul(50).div_ceil(100))
             .saturating_sub(1)
             .min(n - 1);
         let p99_idx = (n.saturating_mul(99).div_ceil(100))
             .saturating_sub(1)
             .min(n - 1);
-        (self.scratch[p50_idx], self.scratch[p99_idx])
+        if n <= 8 {
+            self.scratch.sort_unstable();
+            (self.scratch[p50_idx], self.scratch[p99_idx])
+        } else {
+            let p99_val = {
+                let (_, median, _) = self.scratch.select_nth_unstable(p99_idx);
+                *median
+            };
+            let p50_val = if p50_idx < p99_idx {
+                let (_, median, _) = self.scratch[..p99_idx].select_nth_unstable(p50_idx);
+                *median
+            } else {
+                p99_val
+            };
+            (p50_val, p99_val)
+        }
     }
 }
 
@@ -498,26 +572,131 @@ impl SystemBudgetEntry {
     }
 }
 
+const SYSTEM_SHARDS: usize = 16;
+
+#[inline]
+fn system_shard_index(mod_id: Option<ModId>, system_name: &str) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ mod_id.map_or(0, |id| id.0);
+    for &b in system_name.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    (h as usize) & (SYSTEM_SHARDS - 1)
+}
+
+#[inline]
+fn policy_has_limits(policy: &ModBudgetPolicy) -> bool {
+    policy.max_arena_bytes_per_system.is_some()
+        || policy.max_spawns_per_frame.is_some()
+        || policy.max_p99_system_micros.is_some()
+        || !policy.per_mod_overrides.is_empty()
+        || !policy.per_name_overrides.is_empty()
+}
+
 struct BudgetRuntimeState {
+    active_or_observing: AtomicBool,
+    observing: AtomicBool,
+    has_overrides: AtomicBool,
+    global_has_arena: AtomicBool,
+    global_arena_bytes: AtomicUsize,
+    global_has_spawns: AtomicBool,
+    global_spawns_per_frame: AtomicUsize,
+    global_has_p99: AtomicBool,
+    global_p99_micros: AtomicU64,
+    global_window_size: AtomicUsize,
+    global_max_breaches: AtomicUsize,
     policy: RwLock<ModBudgetPolicy>,
     spawn_counters_by_mod: RwLock<HashMap<ModId, Arc<AtomicUsize>>>,
     spawn_counters_by_ns: RwLock<HashMap<Arc<str>, Arc<AtomicUsize>>>,
-    systems: Mutex<HashMap<SystemBudgetKey, SystemBudgetEntry>>,
+    systems: [Mutex<HashMap<SystemBudgetKey, SystemBudgetEntry>>; SYSTEM_SHARDS],
     pending_breaches: Mutex<Vec<ModBudgetBreach>>,
 }
 
 impl BudgetRuntimeState {
     fn new(initial_policy: ModBudgetPolicy) -> Self {
+        let active = policy_has_limits(&initial_policy);
+        let has_overrides = !initial_policy.per_mod_overrides.is_empty()
+            || !initial_policy.per_name_overrides.is_empty();
+        let limits = initial_policy.default_limits();
         Self {
+            active_or_observing: AtomicBool::new(active),
+            observing: AtomicBool::new(false),
+            has_overrides: AtomicBool::new(has_overrides),
+            global_has_arena: AtomicBool::new(limits.max_arena_bytes_per_system.is_some()),
+            global_arena_bytes: AtomicUsize::new(limits.max_arena_bytes_per_system.unwrap_or(0)),
+            global_has_spawns: AtomicBool::new(limits.max_spawns_per_frame.is_some()),
+            global_spawns_per_frame: AtomicUsize::new(limits.max_spawns_per_frame.unwrap_or(0)),
+            global_has_p99: AtomicBool::new(limits.max_p99_system_micros.is_some()),
+            global_p99_micros: AtomicU64::new(limits.max_p99_system_micros.unwrap_or(0)),
+            global_window_size: AtomicUsize::new(limits.effective_window_size()),
+            global_max_breaches: AtomicUsize::new(
+                limits.effective_max_consecutive_breaches() as usize
+            ),
             policy: RwLock::new(initial_policy),
             spawn_counters_by_mod: RwLock::new(HashMap::default()),
             spawn_counters_by_ns: RwLock::new(HashMap::default()),
-            systems: Mutex::new(HashMap::default()),
+            systems: core::array::from_fn(|_| Mutex::new(HashMap::default())),
             pending_breaches: Mutex::new(Vec::new()),
         }
     }
 
+    fn apply_policy_atomics(&self, policy: &ModBudgetPolicy) {
+        let has_overrides =
+            !policy.per_mod_overrides.is_empty() || !policy.per_name_overrides.is_empty();
+        let limits = policy.default_limits();
+        self.global_has_arena.store(
+            limits.max_arena_bytes_per_system.is_some(),
+            Ordering::Release,
+        );
+        self.global_arena_bytes.store(
+            limits.max_arena_bytes_per_system.unwrap_or(0),
+            Ordering::Release,
+        );
+        self.global_has_spawns
+            .store(limits.max_spawns_per_frame.is_some(), Ordering::Release);
+        self.global_spawns_per_frame
+            .store(limits.max_spawns_per_frame.unwrap_or(0), Ordering::Release);
+        self.global_has_p99
+            .store(limits.max_p99_system_micros.is_some(), Ordering::Release);
+        self.global_p99_micros
+            .store(limits.max_p99_system_micros.unwrap_or(0), Ordering::Release);
+        self.global_window_size
+            .store(limits.effective_window_size(), Ordering::Release);
+        self.global_max_breaches.store(
+            limits.effective_max_consecutive_breaches() as usize,
+            Ordering::Release,
+        );
+        self.has_overrides.store(has_overrides, Ordering::Release);
+        let active = policy_has_limits(policy) || self.observing.load(Ordering::Acquire);
+        self.active_or_observing.store(active, Ordering::Release);
+    }
+
+    fn set_observing(&self, observing: bool) {
+        self.observing.store(observing, Ordering::Release);
+        let policy = read_unpoison(&self.policy);
+        let active = policy_has_limits(&policy) || observing;
+        self.active_or_observing.store(active, Ordering::Release);
+    }
+
     fn effective_limits(&self, mod_id: Option<ModId>, mod_name: &str) -> ModBudgetLimits {
+        if !self.has_overrides.load(Ordering::Acquire) {
+            return ModBudgetLimits {
+                max_arena_bytes_per_system: self
+                    .global_has_arena
+                    .load(Ordering::Acquire)
+                    .then(|| self.global_arena_bytes.load(Ordering::Acquire)),
+                max_spawns_per_frame: self
+                    .global_has_spawns
+                    .load(Ordering::Acquire)
+                    .then(|| self.global_spawns_per_frame.load(Ordering::Acquire)),
+                max_p99_system_micros: self
+                    .global_has_p99
+                    .load(Ordering::Acquire)
+                    .then(|| self.global_p99_micros.load(Ordering::Acquire)),
+                window_size: self.global_window_size.load(Ordering::Acquire),
+                max_consecutive_breaches: self.global_max_breaches.load(Ordering::Acquire) as u32,
+            };
+        }
         read_unpoison(&self.policy).effective_limits(mod_id, Some(mod_name))
     }
 
@@ -584,19 +763,26 @@ fn make_breach(
 }
 
 impl ModBudgetHook for BudgetRuntimeState {
+    #[inline]
+    fn is_active_or_observing(&self) -> bool {
+        self.active_or_observing.load(Ordering::Relaxed)
+    }
+
     fn prepare_system_quotas(
         &self,
         mod_id: Option<ModId>,
         mod_name: &str,
     ) -> (CommandQuotaLimits, Option<Arc<AtomicUsize>>) {
         let limits = self.effective_limits(mod_id, mod_name);
-        let counter = self.get_or_create_spawn_counter(mod_id, mod_name);
+        let counter = limits
+            .max_spawns_per_frame
+            .map(|_| self.get_or_create_spawn_counter(mod_id, mod_name));
         (
             CommandQuotaLimits {
                 max_arena_bytes: limits.max_arena_bytes_per_system,
                 max_spawns_per_frame: limits.max_spawns_per_frame,
             },
-            Some(counter),
+            counter,
         )
     }
 
@@ -604,6 +790,7 @@ impl ModBudgetHook for BudgetRuntimeState {
         let limits = self.effective_limits(metrics.mod_id, &metrics.mod_name);
         let window_size = limits.effective_window_size();
         let max_consecutive = limits.effective_max_consecutive_breaches();
+        let shard = system_shard_index(metrics.mod_id, &metrics.system_name);
 
         let key = SystemBudgetKey {
             mod_id: metrics.mod_id,
@@ -615,7 +802,7 @@ impl ModBudgetHook for BudgetRuntimeState {
         let mut action = BudgetWatchdogAction::default();
 
         {
-            let mut systems = lock_unpoison(&self.systems);
+            let mut systems = lock_unpoison(&self.systems[shard]);
             let entry = systems
                 .entry(key)
                 .or_insert_with(|| SystemBudgetEntry::new(window_size));
@@ -745,8 +932,23 @@ impl ModBudgetTelemetry {
         Self { state }
     }
 
+    /// Enables or disables detailed per-system telemetry collection when no [`ModBudgetPolicy`]
+    /// quotas or watchdog ceilings are active.
+    #[inline]
+    pub fn set_observing(&self, observing: bool) {
+        self.state.set_observing(observing);
+    }
+
+    /// Returns `true` when telemetry collection is explicitly enabled or any [`ModBudgetPolicy`]
+    /// limit/override is active.
+    #[inline]
+    pub fn is_observing(&self) -> bool {
+        self.state.active_or_observing.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn sync_policy(&self, policy: &ModBudgetPolicy) {
         *write_unpoison(&self.state.policy) = policy.clone();
+        self.state.apply_policy_atomics(policy);
     }
 
     pub(crate) fn drain_pending_breaches(&self) -> Vec<ModBudgetBreach> {
@@ -754,17 +956,19 @@ impl ModBudgetTelemetry {
     }
 
     pub(crate) fn end_frame(&self, quarantine: Option<&ModQuarantine>) {
-        for (key, entry) in lock_unpoison(&self.state.systems).iter_mut() {
-            entry.spawns_last_frame = entry.spawns_this_frame;
-            entry.spawns_this_frame = 0;
-            if entry.quarantined
-                && let Some(q) = quarantine
-                && let Some(mod_id) = key.mod_id
-                && !q.is_quarantined(mod_id, &key.system_name)
-            {
-                entry.quarantined = false;
-                entry.window.clear();
-                entry.consecutive_p99_breaches = 0;
+        for shard in &self.state.systems {
+            for (key, entry) in lock_unpoison(shard).iter_mut() {
+                entry.spawns_last_frame = entry.spawns_this_frame;
+                entry.spawns_this_frame = 0;
+                if entry.quarantined
+                    && let Some(q) = quarantine
+                    && let Some(mod_id) = key.mod_id
+                    && !q.is_quarantined(mod_id, &key.system_name)
+                {
+                    entry.quarantined = false;
+                    entry.window.clear();
+                    entry.consecutive_p99_breaches = 0;
+                }
             }
         }
         for counter in read_unpoison(&self.state.spawn_counters_by_mod).values() {
@@ -777,16 +981,20 @@ impl ModBudgetTelemetry {
 
     pub(crate) fn cleanup_mod(&self, mod_id: ModId) {
         write_unpoison(&self.state.spawn_counters_by_mod).remove(&mod_id);
-        lock_unpoison(&self.state.systems).retain(|key, _| key.mod_id != Some(mod_id));
+        for shard in &self.state.systems {
+            lock_unpoison(shard).retain(|key, _| key.mod_id != Some(mod_id));
+        }
     }
 
     /// Returns a deterministically sorted snapshot of every tracked guest system's budget and
     /// execution metrics.
     pub fn system_budget_snapshots(&self) -> Vec<ModBudgetSnapshot> {
-        let mut out: Vec<ModBudgetSnapshot> = lock_unpoison(&self.state.systems)
-            .iter()
-            .map(|(key, entry)| entry.to_snapshot(key))
-            .collect();
+        let mut out = Vec::new();
+        for shard in &self.state.systems {
+            for (key, entry) in lock_unpoison(shard).iter() {
+                out.push(entry.to_snapshot(key));
+            }
+        }
         out.sort_by(|a, b| {
             a.mod_id
                 .cmp(&b.mod_id)
@@ -802,7 +1010,8 @@ impl ModBudgetTelemetry {
         mod_id: Option<ModId>,
         system_name: &str,
     ) -> Option<ModBudgetSnapshot> {
-        lock_unpoison(&self.state.systems)
+        let shard = system_shard_index(mod_id, system_name);
+        lock_unpoison(&self.state.systems[shard])
             .iter()
             .find(|(key, _)| key.mod_id == mod_id && key.system_name.as_ref() == system_name)
             .map(|(key, entry)| entry.to_snapshot(key))
@@ -810,34 +1019,49 @@ impl ModBudgetTelemetry {
 
     /// Returns snapshots for all tracked guest systems belonging to `mod_id`.
     pub fn mod_snapshots(&self, mod_id: ModId) -> Vec<ModBudgetSnapshot> {
-        let mut out: Vec<ModBudgetSnapshot> = lock_unpoison(&self.state.systems)
-            .iter()
-            .filter(|(key, _)| key.mod_id == Some(mod_id))
-            .map(|(key, entry)| entry.to_snapshot(key))
-            .collect();
+        let mut out = Vec::new();
+        for shard in &self.state.systems {
+            for (key, entry) in lock_unpoison(shard).iter() {
+                if key.mod_id == Some(mod_id) {
+                    out.push(entry.to_snapshot(key));
+                }
+            }
+        }
         out.sort_by(|a, b| a.system_name.cmp(&b.system_name));
         out
     }
 
     /// Returns the aggregate deferred entity spawns queued by `mod_id` in the most recent frame.
     pub fn mod_spawns_last_frame(&self, mod_id: ModId) -> usize {
-        lock_unpoison(&self.state.systems)
-            .iter()
-            .filter(|(key, _)| key.mod_id == Some(mod_id))
-            .map(|(_, entry)| entry.spawns_last_frame)
-            .sum()
+        let mut total = 0usize;
+        for shard in &self.state.systems {
+            total += lock_unpoison(shard)
+                .iter()
+                .filter(|(key, _)| key.mod_id == Some(mod_id))
+                .map(|(_, entry)| entry.spawns_last_frame)
+                .sum::<usize>();
+        }
+        total
     }
 
     /// Returns the cumulative count of budget breaches across all tracked guest systems.
     pub fn total_breach_count(&self) -> u64 {
-        lock_unpoison(&self.state.systems)
-            .values()
-            .fold(0u64, |acc, e| acc.saturating_add(e.breach_count))
+        let mut total = 0u64;
+        for shard in &self.state.systems {
+            total = lock_unpoison(shard)
+                .values()
+                .fold(total, |acc, e| acc.saturating_add(e.breach_count));
+        }
+        total
     }
 
     /// Returns the number of tracked guest systems.
     pub fn len(&self) -> usize {
-        lock_unpoison(&self.state.systems).len()
+        self.state
+            .systems
+            .iter()
+            .map(|shard| lock_unpoison(shard).len())
+            .sum()
     }
 
     /// Returns `true` if no guest system executions have been recorded yet.

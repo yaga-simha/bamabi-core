@@ -153,7 +153,7 @@ fn mod_load_error_display_and_source_cover_pure_variants() {
     assert!(migration_failed.source().is_none());
 }
 
-#[cfg(not(miri))]
+#[cfg(all(not(miri), feature = "dynamic-loader"))]
 #[test]
 fn mod_load_error_dlopen_variants_format_and_expose_source() {
     // SAFETY: Loading a nonexistent library path deterministically returns `Err(libloading::Error)`.

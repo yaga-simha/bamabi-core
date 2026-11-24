@@ -16,10 +16,15 @@ workspace = true
 
 [features]
 default = []
+signature-verification = [
+    "bamabi_host_sys/signature-verification",
+    "bamabi_host/signature-verification",
+]
 
 [dependencies]
-bamabi_host_sys = { workspace = true }
-bamabi_host = { workspace = true }
+bamabi_host_sys = { workspace = true, features = ["dynamic-loader"] }
+bamabi_host = { workspace = true, features = ["dynamic-loader"] }
+bamabi_sys = { workspace = true }
 bevy_app = { workspace = true }
 bevy_ecs = { workspace = true }
 notify-debouncer-full = { workspace = true }

@@ -28,12 +28,44 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
+struct SharedTargetGuard(PathBuf);
+
+impl SharedTargetGuard {
+    fn new(tag: &str) -> Self {
+        static TARGET_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let id = TARGET_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "bam_schema_evo_target_{}_{}_{}",
+            tag,
+            std::process::id(),
+            id
+        ));
+        fs::create_dir_all(&dir).expect("create temp shared target dir");
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for SharedTargetGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 struct TempCdylibCrate {
     dir: PathBuf,
 }
 
 impl TempCdylibCrate {
-    fn build(tag: &str, crate_name: &str, lib_rs: &str) -> (Self, PathBuf) {
+    fn build(
+        tag: &str,
+        crate_name: &str,
+        lib_rs: &str,
+        target_dir: Option<&Path>,
+    ) -> (Self, PathBuf) {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let id = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
@@ -44,6 +76,7 @@ impl TempCdylibCrate {
         ));
         let src_dir = dir.join("src");
         fs::create_dir_all(&src_dir).expect("create temp guest crate src dir");
+        let guard = Self { dir: dir.clone() };
 
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = manifest_dir
@@ -108,15 +141,15 @@ crate-type = ["cdylib"]
         fs::write(dir.join("Cargo.toml"), cargo_toml).expect("write temp Cargo.toml");
         fs::write(src_dir.join("lib.rs"), lib_rs).expect("write temp src/lib.rs");
 
-        let shared_target_dir =
-            std::env::temp_dir().join(format!("bam_schema_evo_target_{}", std::process::id()));
+        let fallback_target = dir.join("target");
+        let shared_target_dir = target_dir.unwrap_or(&fallback_target);
         // Guest fixtures are built uninstrumented, matching the nightly "Stage uninstrumented guest
         // fixtures before enabling TSan" step (avoids `-Zsanitizer=thread` ABI mismatch without `-Zbuild-std`).
         let output = Command::new(env!("CARGO"))
             .arg("build")
             .arg("--offline")
             .current_dir(&dir)
-            .env("CARGO_TARGET_DIR", &shared_target_dir)
+            .env("CARGO_TARGET_DIR", shared_target_dir)
             .env_remove("RUSTFLAGS")
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
             .output()
@@ -144,7 +177,7 @@ crate-type = ["cdylib"]
         fs::copy(&built_path, &dylib_path)
             .expect("copy compiled cdylib into unique temp crate dir");
 
-        (Self { dir }, dylib_path)
+        (guard, dylib_path)
     }
 }
 
@@ -376,7 +409,7 @@ bamabi_guest::export_mod!(name: c"dyn_profile_mod", version: c"0.1.0", logic::bu
 "#;
 
     let (_crate_guard, dylib_path) =
-        TempCdylibCrate::build("dyn_profile", "dyn_profile_mod", lib_rs);
+        TempCdylibCrate::build("dyn_profile", "dyn_profile_mod", lib_rs, None);
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
@@ -742,8 +775,19 @@ mod logic {
 bamabi_guest::export_mod!(name: c"unit_evo_mod", version: c"0.2.0", logic::build);
 "#;
 
-    let (_v1_guard, v1_dylib) = TempCdylibCrate::build("unit_evo_v1", "unit_evo_mod", v1_src);
-    let (_v2_guard, v2_dylib) = TempCdylibCrate::build("unit_evo_v2", "unit_evo_mod", v2_src);
+    let _shared_target_guard = SharedTargetGuard::new("unit_evo");
+    let (_v1_guard, v1_dylib) = TempCdylibCrate::build(
+        "unit_evo_v1",
+        "unit_evo_mod",
+        v1_src,
+        Some(_shared_target_guard.path()),
+    );
+    let (_v2_guard, v2_dylib) = TempCdylibCrate::build(
+        "unit_evo_v2",
+        "unit_evo_mod",
+        v2_src,
+        Some(_shared_target_guard.path()),
+    );
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
